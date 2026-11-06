@@ -26,6 +26,7 @@ struct PcConfig {
     char last_profile[32] = {}; // listed first on the profiles' screen
     int show_fps = 0;
     char language[16] = "ENGLISH";  // a key of pc_languages() (pclang.h)
+    bool ask_language = true;   // hp2.ini has no language yet: the very first start shows the game's own choice of language (pclang.cpp)
     int max_detail = 1;         // 1: scenery, cars and tyres at their best models whatever the size; 0: the game's choice by size
     int volume = 100;           // percent
     int key[PCB_COUNT][2] = {}; // virtual-key codes, 0 = none

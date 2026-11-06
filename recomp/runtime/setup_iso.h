@@ -62,12 +62,16 @@ inline std::string sha1_hex(const void *p, size_t n)
     return s.hex();
 }
 
-// the game's program on the discs the port knows
+// The discs the port knows, by the program SYSTEM.CNF boots and its SHA-1. The European v1.00 disc has the very program of the USA one (and
+// the same archive, but for the empty PAL.TAG that turns on the PAL video mode, left out by install.cpp): the code recompiled from the one
+// runs the other. Whatever the disc, the program goes to data\SLUS_203.62. Europe v2.00 (e8983ff7..., two reward screens with larger
+// stacks, 147 files changed) and Asia, Korea (SLPM, another build) are not among them yet.
 struct KnownDisc {
-    const char *elf_sha1, *name;
+    const char *elf_sha1, *boot, *name;
 };
 static const KnownDisc kKnownDiscs[] = {
-    {"6397d4425d55056678ed5a405cc81542f7d4d2ee", "Need for Speed: Hot Pursuit 2 (USA), SLUS-20362"},
+    {"6397d4425d55056678ed5a405cc81542f7d4d2ee", "SLUS_203.62", "Need for Speed: Hot Pursuit 2 (USA), SLUS-20362"},
+    {"6397d4425d55056678ed5a405cc81542f7d4d2ee", "SLES_507.31", "Need for Speed: Hot Pursuit 2 (Europe) v1.00, SLES-50731"},
 };
 
 inline uint32_t crc32_update(uint32_t crc, const void *p, size_t n)
@@ -150,6 +154,20 @@ struct Iso {
         for (const File &x : files)
             if (!_stricmp(x.path.c_str(), path)) return &x;
         return nullptr;
+    }
+
+    // the program the disc boots: SYSTEM.CNF's BOOT2 = cdrom0:\SLES_507.31;1
+    const File *boot(std::string &name)
+    {
+        const File *cnf = find("/SYSTEM.CNF");
+        if (!cnf || cnf->size > 4096) return nullptr;
+        std::string text((size_t)cnf->size, '\0');
+        if (!read_file(*cnf, 0, &text[0], text.size())) return nullptr;
+        size_t at = text.find("BOOT2"), slash = text.find('\\', at == std::string::npos ? 0 : at);
+        if (at == std::string::npos || slash == std::string::npos) return nullptr;
+        size_t end = text.find_first_of(";\r\n", slash);
+        name = text.substr(slash + 1, end == std::string::npos ? std::string::npos : end - slash - 1);
+        return find(("/" + name).c_str());
     }
 };
 #endif

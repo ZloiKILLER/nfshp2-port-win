@@ -188,3 +188,36 @@ void pc_language_apply()
     point_slot(l);
     pc_call(SetLanguage, TheLanguageManager, (u32)l.slot);
 }
+
+// The game's own choice of language, "Language Options Pre FE" between the title and the menus: the PAL discs show it on their first
+// boot (ShouldSeeLanguageSelectScreen 0x16f8c8: the first pass through the boot screens, gp-21132 == 1, nothing at 0x2effe0 skipping
+// them, GetVideoMode() == PAL). The port draws NTSC; it shows the screen on its own very first start, when hp2.ini has no language.
+static bool g_asking;
+
+void HOOK_ShouldSeeLanguageSelectScreen__Fv(Ctx &c, void (*orig)(Ctx &))
+{
+    const u32 gp = c.r[28].w[0];
+    orig(c);
+    if (!c.r[2].w[0] && g_cfg.ask_language && (s32)LW(gp - 21132) == 1 && !LW(0x2effe0)) c.r[2].d[0] = 1;
+    if (!c.r[2].w[0]) return;
+    g_asking = true;
+    g_cfg.ask_language = false;     // asked once: the language in use stays, unless the screen picks another (it need not set the same)
+    pc_config_save();
+}
+
+// what that screen chose goes to hp2.ini; the port's own switches (pc_language_choose, pc_language_apply) are already the one in use
+void HOOK_SetLanguage__15LanguageManager11e_Languages(Ctx &c, void (*orig)(Ctx &))
+{
+    const int slot = (s32)c.r[5].w[0];
+    orig(c);
+    if (!g_asking) return;
+    load();
+    if (g_langs[(size_t)g_current].slot == slot) return;
+    for (size_t i = 0; i < g_langs.size(); i++)
+        if (g_langs[i].slot == slot) {
+            g_current = (int)i;
+            snprintf(g_cfg.language, sizeof g_cfg.language, "%s", g_langs[i].key.c_str());
+            pc_config_save();
+            return;
+        }
+}

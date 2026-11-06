@@ -431,7 +431,7 @@ int main()
     // slack past the end: 64-bit and 128-bit accesses at the last address stay in bounds
     u32 entry;
     if (!load_elf(entry)) {
-        host_fatal("The game's program, data\\SLUS_203.62, is missing or is not the USA version's. Install the game again from the disc image.");
+        host_fatal("The game's program, data\\SLUS_203.62, is missing or is not one the port knows. Install the game again from the disc image.");
         return 1;
     }
     fprintf(g_log, "entry %08x\n", entry);

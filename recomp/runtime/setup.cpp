@@ -1,4 +1,4 @@
-// The first start (setup.h): a window asks for the .iso of Need for Speed: Hot Pursuit 2 (USA, SLUS-20362) and where to install, reads the image
+// The first start (setup.h): a window asks for the .iso of Need for Speed: Hot Pursuit 2 (a disc of kKnownDiscs) and where to install, reads the image
 // as ISO 9660 without mounting it, checks the game's program by its SHA-1, makes the folder nfshp2port with all the game needs (install.cpp),
 // puts this exe in it, and starts the game from there.
 #include "setup.h"
@@ -105,9 +105,10 @@ void check_iso()
     Iso iso;
     std::string why;
     if (!iso.open(g_ui.iso, why)) return set_status(widen(why));
-    const Iso::File *elf = iso.find("/SLUS_203.62");
+    std::string boot;
+    const Iso::File *elf = iso.boot(boot);
     if (!elf || !iso.find("/NFSHP2/ZZDATA.BIN") || !iso.find("/NFSHP2/ZDIR.BIN") || !iso.find("/NFSHP2/IRX253/STREAM.IRX"))
-        return set_status(L"This disc image is not Need for Speed: Hot Pursuit 2 (USA).");
+        return set_status(L"This disc image is not Need for Speed: Hot Pursuit 2.");
     set_status(L"Checking the disc image...");
     UpdateWindow(g_ui.status);
     std::vector<uint8_t> buf((size_t)elf->size);
@@ -115,8 +116,9 @@ void check_iso()
     const std::string hex = sha1_hex(buf.data(), buf.size());
     std::string name;
     for (const KnownDisc &k : kKnownDiscs)
-        if (hex == k.elf_sha1) name = k.name;
-    if (name.empty()) return set_status(L"This version of the game is not supported yet. The port needs the USA disc, SLUS-20362.");
+        if (hex == k.elf_sha1 && !_stricmp(boot.c_str(), k.boot)) name = k.name;
+    if (name.empty())
+        return set_status(L"This version of the game (" + widen(boot) + L") is not supported yet: the USA disc or the European v1.00 one.");
     ULARGE_INTEGER free_bytes = {};
     const std::wstring drive = g_ui.root.substr(0, 3);
     if (GetDiskFreeSpaceExW(drive.c_str(), &free_bytes, nullptr, nullptr) && free_bytes.QuadPart < kNeeded)
@@ -314,7 +316,7 @@ bool run_window(const fs::path &exe_dir)
     add(L"STATIC", L"Need for Speed: Hot Pursuit 2", 0, 84, 14, 490, 34, 0, g_ui.heading);
     add(L"STATIC", L"The first start: the game's files come from your own copy.", 0, 84, 50, 490, 20);
     add(L"STATIC",
-        L"Choose the disc image (.iso) of Need for Speed: Hot Pursuit 2 for PlayStation 2, USA version (SLUS-20362). "
+        L"Choose the disc image (.iso) of Need for Speed: Hot Pursuit 2 for PlayStation 2: USA (SLUS-20362) or Europe v1.00 (SLES-50731). "
         L"Its files are unpacked into the folder below; the disc image itself is only read.",
         0, 20, 90, W - 40, 60);
     add(L"STATIC", L"Disc image:", 0, 20, 158, 100, 20);

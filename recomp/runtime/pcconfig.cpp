@@ -288,6 +288,7 @@ static bool read_settings(const std::string &path, bool &old_controls)
         }
         else if (!strcmp(key, "language")) {
             snprintf(g_cfg.language, sizeof g_cfg.language, "%s", val);
+            g_cfg.ask_language = false;
             for (char *e = g_cfg.language + strlen(g_cfg.language); e > g_cfg.language && (unsigned char)e[-1] <= ' '; *--e = 0) {}
             for (char *e = g_cfg.language; *e; e++) *e = (char)toupper((unsigned char)*e);
         }

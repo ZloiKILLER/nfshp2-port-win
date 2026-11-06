@@ -795,7 +795,8 @@ bool install_game(Iso &iso, const std::wstring &root_dir, InstallSteps &steps)
     const fs::path root = root_dir, data = root / L"data";
     std::unordered_map<uint32_t, std::string> names;
     if (!load_names(names, steps.why)) return false;
-    const Iso::File *elf = iso.find("/SLUS_203.62"), *zdir_f = iso.find("/NFSHP2/ZDIR.BIN"), *zz = iso.find("/NFSHP2/ZZDATA.BIN"),
+    std::string boot;
+    const Iso::File *elf = iso.boot(boot), *zdir_f = iso.find("/NFSHP2/ZDIR.BIN"), *zz = iso.find("/NFSHP2/ZZDATA.BIN"),
                     *irx = iso.find("/NFSHP2/IRX253/STREAM.IRX");
     if (!elf || !zdir_f || !zz || !irx) return steps.why = "The disc image lacks the game's files.", false;
 
@@ -833,6 +834,9 @@ bool install_game(Iso &iso, const std::wstring &root_dir, InstallSteps &steps)
     uint64_t written = 0;
     for (const Entry &e : entries) {
         if (stopped(steps)) return steps.why = "Cancelled.", false;
+        // PAL.TAG, the European discs' one file more (empty): InitDisplaySystem 0x1007b8 sets the PAL video mode when it exists, the
+        // TV's 512 lines at 50 Hz. The port draws the NTSC picture, 448 lines at 60, so the European disc installs as the USA one.
+        if (e.hash == 0xbf0a6606) continue;
         std::vector<uint8_t> head(std::min<uint32_t>(e.size, 64));
         if (!head.empty() && !iso.read_file(*zz, (uint64_t)e.at * SECTOR, head.data(), head.size())) return steps.why = "The disc image cannot be read.", false;
         const std::string rel = place(e.hash, names, all_names, head);
