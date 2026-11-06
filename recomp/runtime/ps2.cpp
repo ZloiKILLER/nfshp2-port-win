@@ -19,10 +19,49 @@
 #include <condition_variable>
 #include <mutex>
 #include <vector>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#endif
 
 alignas(64) u8 g_ram[0x02000000 + 64];
 alignas(64) u8 g_spr[0x4000 + 64];
 alignas(64) u8 g_vumem[0x10000 + 64];
+u8 *g_ext;
+uint8_t g_ee_booth16[8192];     // eefloat.h
+EeDivEntry g_ee_div_cache[4096];
+EeSqrtEntry g_ee_sqrt_cache[4096];
+uint8_t g_ee_recip_up[1 << 20], g_ee_sqrt_up[1 << 21];
+std::atomic<bool> g_ee_tables;
+u32 g_ext_size;
+
+// the memory past 32 MB (ps2.h): the whole range reserved at the first call, then [off, off + bytes) committed (64 KB steps), never given
+// back. g_ext_size is where the range ends that host() takes as this memory.
+bool ext_commit(u32 off, u32 bytes)
+{
+    u32 from = off & ~0xFFFFu, to = (off + bytes + 0xFFFF) & ~0xFFFFu;
+    if (to > EXT_MAX || to <= from) return false;
+#ifdef _WIN32
+    if (!g_ext) g_ext = (u8 *)VirtualAlloc(nullptr, EXT_MAX, MEM_RESERVE, PAGE_NOACCESS);
+    if (!g_ext || !VirtualAlloc(g_ext + from, to - from, MEM_COMMIT, PAGE_READWRITE)) return false;
+#else
+    if (!g_ext) {
+        void *m = mmap(nullptr, EXT_MAX, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (m == MAP_FAILED) return false;
+        g_ext = (u8 *)m;
+    }
+    if (mprotect(g_ext + from, to - from, PROT_READ | PROT_WRITE)) return false;
+#endif
+    if (to > g_ext_size) g_ext_size = to;
+    return true;
+}
 
 static FILE *g_log = stderr;
 FILE *g_hle_log = stderr;
@@ -419,6 +458,8 @@ static void ee_float_mode()
 #endif
 }
 
+void ee_float_mode_here() { ee_float_mode(); }
+
 int main()
 {
     // the first start, or the game installed beside this exe: the game runs from its own folder
@@ -438,12 +479,23 @@ int main()
     profile_start();
     start_vblank_timer();
     pc_config_init();
-    if (!getenv("HP2_NOWINDOW")) window_start();
+    if (!getenv("HP2_NOWINDOW")) {
+        const int was = window_dpi_aware();
+        fprintf(g_log, "window: the process's DPI awareness was %d, now per monitor\n", was);
+        window_start();
+    }
     static Ctx c;
     g_ctx = &c;
     c.r[29].d[0] = 0x01FFFF00;
     c.vf[0].f[3] = 1.0f;
     ee_float_mode();
+    ee_float_init();
+    std::thread([] {
+        ee_float_mode();
+        const auto t0 = std::chrono::steady_clock::now();
+        ee_tables_build();
+        fprintf(g_log, "eefloat: the one-mantissa tables are ready, %.2f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    }).detach();
     F_00100008(c);
     fprintf(g_log, "_start returned\n");
     return 0;

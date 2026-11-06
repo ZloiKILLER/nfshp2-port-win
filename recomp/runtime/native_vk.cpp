@@ -1,6 +1,7 @@
 // The renderer, the Vulkan side: a picture of its own, blitted to the window through a swapchain (native.h). The picture's size has
 // nothing to do with the GS's: clip space is resolution-free.
 #include "native.h"
+#include <mutex>
 
 #include "hw.h"
 #include "pcconfig.h"
@@ -57,13 +58,17 @@ static const uint32_t kRestoreFrag[] =
 static const uint32_t kGradeFrag[] =
 #include "native_grade.frag.spv.h"
     ;
+static const uint32_t kOpaqueFrag[] =
+#include "native_opaque.frag.spv.h"
+    ;
 
 #define NV_INSTANCE(X)                                                                                     \
     X(vkEnumeratePhysicalDevices) X(vkGetPhysicalDeviceProperties) X(vkGetPhysicalDeviceQueueFamilyProperties) \
     X(vkGetPhysicalDeviceMemoryProperties) X(vkGetPhysicalDeviceFeatures) X(vkCreateDevice) X(vkGetDeviceProcAddr)     \
     X(vkGetPhysicalDeviceSurfaceSupportKHR) X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR)                              \
-    X(vkGetPhysicalDeviceSurfaceFormatsKHR) X(vkGetPhysicalDeviceSurfacePresentModesKHR)
-#define NV_DEVICE(X)                                                                                         \
+    X(vkGetPhysicalDeviceSurfaceFormatsKHR) X(vkGetPhysicalDeviceSurfacePresentModesKHR)                           \
+    X(vkEnumerateDeviceExtensionProperties) X(vkDestroySurfaceKHR)
+#define NV_DEVICE(X)                                                                                        \
     X(vkGetDeviceQueue) X(vkCreateBuffer) X(vkDestroyBuffer) X(vkGetBufferMemoryRequirements) X(vkAllocateMemory) \
     X(vkFreeMemory) X(vkBindBufferMemory) X(vkMapMemory) X(vkCreateImage) X(vkGetImageMemoryRequirements)        \
     X(vkBindImageMemory) X(vkCreateImageView) X(vkCreateRenderPass) X(vkCreateFramebuffer)                      \
@@ -97,6 +102,7 @@ struct VkTex {
     VkDeviceMemory mem;
     VkDescriptorSet set;
     uint32_t used;
+    uint32_t born;                          // the frame it was uploaded at
     NativeTexture *owner;
 };
 
@@ -120,6 +126,8 @@ struct PostPush {
     float pad;
     float scale[2];
     float origin[2];
+    float pad2[2];
+    float rect[4];
 };
 
 static struct {
@@ -153,6 +161,8 @@ static struct {
     VkPipeline grade_pipeline;              // brightness, contrast, gamma
     VkPipelineLayout grade_layout;
     VkDescriptorSet grade_set;
+    VkPipeline opaque_pipeline;             // the picture's alpha to 1, before the window
+    VkPipelineLayout opaque_layout;
     int aniso;                              // the setting's anisotropy if the GPU has it, 0: the GS's own sampling
     VkRenderPass pass;
     VkFramebuffer fb;
@@ -208,8 +218,17 @@ static struct {
     VkSurfaceKHR surface;
     VkSwapchainKHR swapchain;
     std::vector<VkImage> swap_images;
-    int swap_w, swap_h;
-    bool swap_stale;
+    int swap_w, swap_h;                     // the swapchain's images
+    int swap_cw, swap_ch;                   // the window's client size it was made for
+    bool swap_stale;                        // to be made again
+    bool swap_check;                        // "suboptimal" was said: made again only if the surface's size is no longer the swapchain's
+    VkSurfaceTransformFlagBitsKHR swap_transform;
+    int swap_streak;                        // frames in a row that made it again
+    uint32_t swap_made_frame;               // the last frame that made it
+    uint32_t swap_rest_until;               // after a streak: not before this frame
+    bool surface_lost;                      // the surface itself is to be made again first
+    bool swap_vsync;                        // made with the setting's VSync on
+    bool no_exclusive;                      // VK_EXT_full_screen_exclusive is there: the driver is told not to take the screen for itself
     VkSemaphore acquired, rendered;
     std::vector<VkSemaphore> present_sems;  // per swapchain image: what its present waits on (one for all may still be in use by the last)
     VkBuffer fps_buf;
@@ -419,9 +438,89 @@ static void free_texture(VkTex *t)
     delete t;
 }
 
-// a decoded texture into the GPU, with its levels made from the base (the GPU picks the level for now)
+// The levels the game does not have, down to one texel, for the setting's anisotropic filter. Most of the world's textures come with one
+// level (the grass, the walls, the cars' skins) or a few: the GS takes them at level 0 however far they are. The GPU's filter needs every
+// level, or it has nothing to filter with and the texture only shimmers the more for it. Each new level is the one above it halved.
+// A cut-out (a fence, leaves: alpha either side of the alpha test's 0x30, little in between) keeps the share of its texels that pass the
+// test, as the base has it, or its thin parts would average away with distance; its colours are averaged by alpha, so that what is cut out
+// does not darken the edges.
+static void more_levels(NativeTexture &tex)
+{
+    const int have = tex.levels;
+    int full = 1;
+    while ((std::max(tex.w, tex.h) >> full) > 0) full++;
+    if (have >= full || tex.w <= 0 || tex.h <= 0) return;
+    size_t texels = 0;
+    for (int l = 0; l < have; l++) texels += (size_t)std::max(tex.w >> l, 1) * std::max(tex.h >> l, 1);
+    size_t all = 0;
+    for (int l = 0; l < full; l++) all += (size_t)std::max(tex.w >> l, 1) * std::max(tex.h >> l, 1);
+    if (tex.px.size() == all) {             // made already, by an upload that found no room that frame
+        tex.gpu_levels = full;
+        return;
+    }
+    if (tex.px.size() != texels) return;    // not laid out as its levels say: left as it is
+    const size_t base_n = (size_t)tex.w * tex.h;
+    size_t low = 0, high = 0, pass = 0;
+    for (size_t i = 0; i < base_n; i++) {
+        const uint32_t a = tex.px[i] >> 24;
+        low += a <= 48;
+        high += a >= 96;
+        pass += a > 48;
+    }
+    const bool cutout = low * 50 >= base_n && high * 50 >= base_n && (low + high) * 100 >= base_n * 85;
+    const double coverage = (double)pass / (double)base_n;
+    size_t from = texels - (size_t)std::max(tex.w >> (have - 1), 1) * std::max(tex.h >> (have - 1), 1);
+    for (int l = have; l < full; l++) {
+        const int sw = std::max(tex.w >> (l - 1), 1), sh = std::max(tex.h >> (l - 1), 1), dw = std::max(tex.w >> l, 1), dh = std::max(tex.h >> l, 1);
+        const size_t to = tex.px.size();
+        tex.px.resize(to + (size_t)dw * dh);
+        const uint32_t *src = tex.px.data() + from;
+        uint32_t *dst = tex.px.data() + to;
+        for (int y = 0; y < dh; y++)
+            for (int x = 0; x < dw; x++) {
+                const int x0 = std::min(x * 2, sw - 1), x1 = std::min(x * 2 + 1, sw - 1), y0 = std::min(y * 2, sh - 1), y1 = std::min(y * 2 + 1, sh - 1);
+                const uint32_t p[4] = {src[(size_t)y0 * sw + x0], src[(size_t)y0 * sw + x1], src[(size_t)y1 * sw + x0], src[(size_t)y1 * sw + x1]};
+                uint32_t c[3] = {}, a = 0, plain[3] = {};
+                for (uint32_t t : p) {
+                    const uint32_t ta = t >> 24;
+                    a += ta;
+                    for (int k = 0; k < 3; k++) {
+                        c[k] += (t >> (8 * k) & 255) * ta;
+                        plain[k] += t >> (8 * k) & 255;
+                    }
+                }
+                uint32_t out = ((a + 2) / 4) << 24;
+                for (int k = 0; k < 3; k++) out |= (cutout && a ? (c[k] + a / 2) / a : (plain[k] + 2) / 4) << (8 * k);
+                dst[(size_t)y * dw + x] = out;
+            }
+        if (cutout) {
+            // the alpha's scale at which as many texels pass as in the base
+            const size_t n = (size_t)dw * dh;
+            double lo = 0.25, hi = 8.0;
+            for (int step = 0; step < 12; step++) {
+                const double s = (lo + hi) / 2;
+                size_t ok = 0;
+                for (size_t i = 0; i < n; i++) ok += (double)(dst[i] >> 24) * s > 48.0;
+                if ((double)ok / (double)n > coverage) hi = s; else lo = s;
+            }
+            const double s = (lo + hi) / 2;
+            for (size_t i = 0; i < n; i++) {
+                const uint32_t a = (uint32_t)std::min((double)(dst[i] >> 24) * s + 0.5, 255.0);
+                dst[i] = (dst[i] & 0xFFFFFFu) | a << 24;
+            }
+        }
+        from = to;
+    }
+    tex.gpu_levels = full;
+}
+
+// a decoded texture into the GPU, with the game's own levels; with the setting's anisotropic filter, the rest of them made here (more_levels)
 static void upload_texture(NativeTexture &tex, VkDeviceSize &at)
 {
+    // not for a texture that changes every few frames (a movie's, a screen's): it is 2D, and its levels would be made each time
+    const bool often = tex.vk && g.frame - ((VkTex *)tex.vk)->born < 120;
+    tex.gpu_levels = tex.levels;
+    if (g.aniso && !often) more_levels(tex);
     VkDeviceSize bytes = (VkDeviceSize)tex.px.size() * 4;
     if (at + bytes > kStaging) return;      // the next frame
     if (tex.vk) {
@@ -429,7 +528,7 @@ static void upload_texture(NativeTexture &tex, VkDeviceSize &at)
         g.textures.erase(std::find(g.textures.begin(), g.textures.end(), old));
         free_texture(old);
     }
-    uint32_t levels = (uint32_t)tex.levels;
+    uint32_t levels = (uint32_t)tex.gpu_levels;
     VkTex *t = new VkTex();
     VkImageCreateInfo ii = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     ii.imageType = VK_IMAGE_TYPE_2D;
@@ -458,7 +557,12 @@ static void upload_texture(NativeTexture &tex, VkDeviceSize &at)
     da.descriptorSetCount = 1;
     da.pSetLayouts = &g.set_layout;
     vkAllocateDescriptorSets(g.dev, &da, &t->set);
-    bind_view(t->set, t->view, g.sampler[(tex.repeat_s ? 1 : 0) | (tex.repeat_t ? 2 : 0) | (tex.mag_linear ? 4 : 0) | (tex.min_linear ? 8 : 0) | (tex.mip_linear ? 16 : 0)]);
+    // The sampler is the GPU's filter's (a draw with tex_mode's bit 32); the GS's own sampling fetches texels and does not ask it. With the
+    // setting's anisotropic filter every texture is taken linear between texels and levels when small: "nearest, mip linear", which most of
+    // the world's textures have, is the GS's way of saving time, and it is what kept the filter off them.
+    bind_view(t->set, t->view, g.sampler[(tex.repeat_s ? 1 : 0) | (tex.repeat_t ? 2 : 0) | (tex.mag_linear ? 4 : 0) | (tex.min_linear || g.aniso ? 8 : 0) |
+                                         (tex.mip_linear || g.aniso ? 16 : 0)]);
+    t->born = g.frame;
 
     memcpy((char *)g.staging_map + at, tex.px.data(), (size_t)bytes);
     image_barrier(t->image, 0, levels, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -542,41 +646,63 @@ static bool setup()
     app.apiVersion = VK_API_VERSION_1_2;    // what the depth's resolve needs; a GPU below it runs without multisampling
     VkInstanceCreateInfo ci = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     ci.pApplicationInfo = &app;
-    const char *instance_extensions[] = {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME};
-    ci.enabledExtensionCount = 2;
+    // VK_KHR_get_surface_capabilities2 where the loader has it: what VK_EXT_full_screen_exclusive asks for (make_swapchain)
+    bool caps2 = false;
+    if (auto list = (PFN_vkEnumerateInstanceExtensionProperties)gipa(nullptr, "vkEnumerateInstanceExtensionProperties")) {
+        uint32_t en = 0;
+        list(nullptr, &en, nullptr);
+        std::vector<VkExtensionProperties> ext(en);
+        if (en) list(nullptr, &en, ext.data());
+        for (uint32_t i = 0; i < en; i++)
+            if (!strcmp(ext[i].extensionName, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME)) caps2 = true;
+    }
+    const char *instance_extensions[] = {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_EXTENSION_NAME, VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME};
+    ci.enabledExtensionCount = caps2 ? 3 : 2;
     ci.ppEnabledExtensionNames = instance_extensions;
     VkInstance inst;
     if (!vkCreateInstance || vkCreateInstance(&ci, nullptr, &inst)) return false;
     g.instance = inst;
 #define NV_LOAD_I(name) name = (PFN_##name)gipa(inst, #name);
     NV_INSTANCE(NV_LOAD_I)
-    uint32_t n = 8;
-    VkPhysicalDevice pd[8], phys = VK_NULL_HANDLE;
-    vkEnumeratePhysicalDevices(inst, &n, pd);
-    for (uint32_t i = 0; i < n && !phys; i++) {
-        VkPhysicalDeviceProperties p;
-        vkGetPhysicalDeviceProperties(pd[i], &p);
-        if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) phys = pd[i];
-    }
-    if (!phys && n) phys = pd[0];
-    if (!phys) return false;
-    g.phys = phys;
-    vkGetPhysicalDeviceMemoryProperties(phys, &g.mem);
     auto make_surface = (PFN_vkCreateWin32SurfaceKHR)gipa(inst, "vkCreateWin32SurfaceKHR");
     VkWin32SurfaceCreateInfoKHR surf = {VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
     surf.hinstance = GetModuleHandleA(nullptr);
     surf.hwnd = (HWND)window_handle();
     if (!surf.hwnd || !make_surface || make_surface(inst, &surf, nullptr, &g.surface)) return false;
-    uint32_t qn = 16;
-    VkQueueFamilyProperties qp[16];
-    vkGetPhysicalDeviceQueueFamilyProperties(phys, &qn, qp);
+    // The GPU: the first that can show on the window, the discrete ones before the others. One that cannot (a second card with no screen of
+    // its own, on some systems) is passed over, not taken and then given up on.
+    uint32_t n = 8;
+    VkPhysicalDevice pd[8], phys = VK_NULL_HANDLE;
+    vkEnumeratePhysicalDevices(inst, &n, pd);
     uint32_t family = UINT32_MAX;
-    for (uint32_t i = 0; i < qn && family == UINT32_MAX; i++) {
-        VkBool32 shows = VK_FALSE;
-        vkGetPhysicalDeviceSurfaceSupportKHR(phys, i, g.surface, &shows);
-        if ((qp[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) && shows) family = i;
+    for (int want_discrete = 1; want_discrete >= 0 && !phys; want_discrete--)
+        for (uint32_t i = 0; i < n && !phys; i++) {
+            VkPhysicalDeviceProperties p;
+            vkGetPhysicalDeviceProperties(pd[i], &p);
+            if ((p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) != (want_discrete == 1)) continue;
+            uint32_t qn = 16;
+            VkQueueFamilyProperties qp[16];
+            vkGetPhysicalDeviceQueueFamilyProperties(pd[i], &qn, qp);
+            for (uint32_t q = 0; q < qn && !phys; q++) {
+                VkBool32 shows = VK_FALSE;
+                vkGetPhysicalDeviceSurfaceSupportKHR(pd[i], q, g.surface, &shows);
+                if ((qp[q].queueFlags & VK_QUEUE_GRAPHICS_BIT) && shows) phys = pd[i], family = q;
+            }
+            if (!phys) fprintf(g_hle_log, "native: %s cannot show on the window, passed over\n", p.deviceName);
+        }
+    if (!phys) return false;
+    g.phys = phys;
+    vkGetPhysicalDeviceMemoryProperties(phys, &g.mem);
+    bool exclusive_ext = false;
+    {
+        uint32_t en = 0;
+        vkEnumerateDeviceExtensionProperties(phys, nullptr, &en, nullptr);
+        std::vector<VkExtensionProperties> ext(en);
+        if (en) vkEnumerateDeviceExtensionProperties(phys, nullptr, &en, ext.data());
+        for (uint32_t i = 0; i < en; i++)
+            if (!strcmp(ext[i].extensionName, VK_EXT_FULL_SCREEN_EXCLUSIVE_EXTENSION_NAME)) exclusive_ext = true;
     }
-    if (family == UINT32_MAX) return false;
+    g.no_exclusive = caps2 && exclusive_ext && !getenv("HP2_EXCLUSIVE");    // HP2_EXCLUSIVE: the driver's own choice, as before, for comparing
     float prio = 1;
     VkDeviceQueueCreateInfo qi = {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qi.queueFamilyIndex = family;
@@ -595,10 +721,15 @@ static bool setup()
     g.depth_clamp = want.depthClamp;
     vkGetPhysicalDeviceProperties(phys, &g.props);
     di.pEnabledFeatures = &want;
-    const char *device_extensions[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
-    di.enabledExtensionCount = 1;
+    const char *device_extensions[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_EXT_FULL_SCREEN_EXCLUSIVE_EXTENSION_NAME};
+    di.enabledExtensionCount = g.no_exclusive ? 2 : 1;
     di.ppEnabledExtensionNames = device_extensions;
     if (vkCreateDevice(phys, &di, nullptr, &g.dev)) return false;
+    // who draws, for a report of a picture that is wrong on one kind of card
+    fprintf(g_hle_log, "native: %s, vendor %04x, driver %u.%u.%u (%08x), Vulkan %u.%u.%u; the screen %s\n", g.props.deviceName, g.props.vendorID,
+            VK_VERSION_MAJOR(g.props.driverVersion), VK_VERSION_MINOR(g.props.driverVersion), VK_VERSION_PATCH(g.props.driverVersion), g.props.driverVersion,
+            VK_VERSION_MAJOR(g.props.apiVersion), VK_VERSION_MINOR(g.props.apiVersion), VK_VERSION_PATCH(g.props.apiVersion),
+            g.no_exclusive ? "is never taken by the driver for itself (VK_EXT_full_screen_exclusive)" : "is the driver's to take: no VK_EXT_full_screen_exclusive");
 #define NV_LOAD_D(name) name = (PFN_##name)vkGetDeviceProcAddr(g.dev, #name);
     NV_DEVICE(NV_LOAD_D)
     vkGetDeviceQueue(g.dev, family, 0, &g.queue);
@@ -615,7 +746,24 @@ static bool setup()
 }
 
 // the picture's size, the multisampling, the filter: what the settings say
-static int settings_key() { return g_cfg.scale | g_cfg.aspect << 4 | g_cfg.aa << 8 | g_cfg.aniso << 16; }
+static int settings_key() { return g_cfg.scale | native_aspect() << 4 | g_cfg.aa << 8 | g_cfg.aniso << 16; }
+
+// what the menu may offer: the most samples the picture can have, the most anisotropy
+bool native_vk_limits(int &aa, int &aniso)
+{
+    if (!g.ready) return false;
+    aa = 0;
+    if (g.props.apiVersion >= VK_API_VERSION_1_2) {
+        const VkSampleCountFlags can = g.props.limits.framebufferColorSampleCounts & g.props.limits.framebufferDepthSampleCounts;
+        for (int s = 8; s >= 2 && !aa; s /= 2)
+            if (can & (VkSampleCountFlags)s) aa = s;
+    }
+    aniso = 0;
+    if (g.can_aniso)
+        for (int s = 16; s >= 2 && !aniso; s /= 2)
+            if ((float)s <= g.props.limits.maxSamplerAnisotropy) aniso = s;
+    return true;
+}
 
 static bool setup_resources()
 {
@@ -1156,6 +1304,22 @@ static bool setup_resources()
         if (vkCreateGraphicsPipelines(g.dev, VK_NULL_HANDLE, 1, &pi, nullptr, &g.grade_pipeline)) return false;
     }
 
+    // the picture's alpha to 1, before the window takes it (opaque_picture)
+    {
+        VkPipelineLayoutCreateInfo ol = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        if (vkCreatePipelineLayout(g.dev, &ol, nullptr, &g.opaque_layout)) return false;
+        st[0].module = shader(kPostVert, sizeof kPostVert);
+        st[1].module = shader(kOpaqueFrag, sizeof kOpaqueFrag);
+        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        ba.blendEnable = VK_FALSE;
+        ba.colorWriteMask = VK_COLOR_COMPONENT_A_BIT;
+        pi.pDepthStencilState = nullptr;
+        pi.layout = g.opaque_layout;
+        pi.renderPass = g.post_pass;
+        if (vkCreateGraphicsPipelines(g.dev, VK_NULL_HANDLE, 1, &pi, nullptr, &g.opaque_pipeline)) return false;
+        ba.colorWriteMask = 0xf;
+    }
+
     VkCommandPoolCreateInfo cp = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     cp.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     cp.queueFamilyIndex = family;
@@ -1227,6 +1391,26 @@ static void grade_picture(const NativeFrame &frame)
     vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.grade_layout, 0, 1, &g.grade_set, 0, nullptr);
     const float push[3] = {g_cfg.brightness / 100.0f, g_cfg.contrast / 100.0f, g_cfg.gamma / 100.0f};
     vkCmdPushConstants(g.cmd, g.grade_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof push, push);
+    vkCmdDraw(g.cmd, 3, 1, 0, 0);
+    vkCmdEndRenderPass(g.cmd);
+    all_barrier();
+}
+
+// The picture's alpha to 1, last of all and only for the window: the game's alpha (depth for the fog, the blends' masks) has been read by
+// whatever reads it (the next frame's copy, a screenshot), and the next frame clears the picture. The window's image is then opaque
+// everywhere, so nothing that shows it by its alpha (a display plane of a fullscreen window, a capture, an overlay) can darken it.
+static void opaque_picture()
+{
+    VkRenderPassBeginInfo rb = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    rb.renderPass = g.post_pass;
+    rb.framebuffer = g.post_fb;
+    rb.renderArea.extent = {(uint32_t)W, (uint32_t)H};
+    vkCmdBeginRenderPass(g.cmd, &rb, VK_SUBPASS_CONTENTS_INLINE);
+    VkViewport vp = {0, 0, (float)W, (float)H, 0, 1};
+    VkRect2D sc = {{0, 0}, {(uint32_t)W, (uint32_t)H}};
+    vkCmdSetViewport(g.cmd, 0, 1, &vp);
+    vkCmdSetScissor(g.cmd, 0, 1, &sc);
+    vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.opaque_pipeline);
     vkCmdDraw(g.cmd, 3, 1, 0, 0);
     vkCmdEndRenderPass(g.cmd);
     all_barrier();
@@ -1327,8 +1511,12 @@ static void draw_target(const NativeFrame &frame, int target, int vw, int vh, si
         // the pictures of this renderer: clamped and linear, as TEX1's 0xe0 has it at level 0
         p.tex_mode = which == 2 && env_tex ? tex_mode(*frame.env_override) | 64
                    : which == 2 || d.rt >= 0 || !d.tex ? 4 | 8 : which == 1 ? tex_mode(*frame.road_specular) : tex_mode(*d.tex);
-        // what VU1 transforms, the world; the setting's filter leaves the 2D and the envmap views to the GS's sampling
-        if (which == 0 && d.tex && d.rt < 0 && (d.tex->upscaled || (g.aniso && d.tex->min_linear && d.snap_x != 0 && target < 8))) p.tex_mode |= 32;
+        // what VU1 transforms, the world, whatever filter the game gave the texture; the setting's filter leaves the 2D and the envmap views
+        // to the GS's sampling. HP2_AFOLD: only the textures the game filters linear, as it was; HP2_AFFLIP: that and this by turns of
+        // 120 frames, for two pictures of one place
+        static const bool af_old = getenv("HP2_AFOLD") != nullptr, af_flip = getenv("HP2_AFFLIP") != nullptr;
+        const bool af_every = af_flip ? (g.frame / 120 & 1) != 0 : !af_old;
+        if (which == 0 && d.tex && d.rt < 0 && (d.tex->upscaled || (g.aniso && (af_every || d.tex->min_linear) && d.snap_x != 0 && target < 8))) p.tex_mode |= 32;
         if (pipeline != bound_pipeline) vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
         if (set != bound_set) vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.layout, 0, 1, &set, 0, nullptr);
         bound_pipeline = pipeline;
@@ -1624,10 +1812,12 @@ static void shot_this_frame()
     static const char *shot = getenv("HP2_NATIVESHOT");
     static const int every = getenv("HP2_NATIVESHOTN") ? atoi(getenv("HP2_NATIVESHOTN")) : 150;
     static int frames;
-    if (!shot || ++frames % every) return;
+    const bool forced = native_dumping_now();
+    if (!shot || (++frames % every && !forced)) return;
     vkWaitForFences(g.dev, 1, &g.fence, VK_TRUE, UINT64_MAX);
     char path[512];
-    snprintf(path, sizeof path, shot, frames / every);
+    static int presses;
+    snprintf(path, sizeof path, shot, forced ? 900 + presses++ : frames / every);     // F11: 900, 901 ...
     std::string name = path;
     size_t slash = name.find_last_of("\\/");
     size_t base = slash == std::string::npos ? 0 : slash + 1;
@@ -1642,31 +1832,95 @@ static void shot_this_frame()
 }
 
 // ---- the window ----------------------------------------------------------------------------------
+// The window's swapchain, for a client area of w x h. Everything a driver may choose its own way is chosen here, so that the window is shown
+// the same on every card:
+//  - its size is the surface's own (the process is DPI aware, window_dpi_aware: the client area in real pixels);
+//  - 8 bits a channel in sRGB, never a wide or HDR colour space a driver may list first;
+//  - the driver is told not to take the screen for itself when the window covers it (VK_EXT_full_screen_exclusive, "disallowed"): NVIDIA's
+//    and AMD's do by themselves otherwise, Intel's does not, and an exclusive screen has its own rules (its size is a display mode, it is
+//    lost on Alt+Tab, overlays and the driver's scaling take part);
+//  - opaque: the picture's alpha is 1 by then (opaque_picture).
+// It is made again when the window's size changes, or the driver says it is out of date; "suboptimal" alone only if the surface's size is no
+// longer the swapchain's (native_vk_draw): a driver that keeps saying it would have it made on every frame.
 static void make_swapchain(int w, int h)
 {
     vkDeviceWaitIdle(g.dev);
+    g.swap_cw = w, g.swap_ch = h;
+    g.swap_stale = g.swap_check = false;
+    auto drop = [] {
+        if (g.swapchain) vkDestroySwapchainKHR(g.dev, g.swapchain, nullptr);
+        g.swapchain = VK_NULL_HANDLE;
+        g.swap_images.clear();
+    };
+    static int told;
+    if (g.surface_lost) {
+        drop();
+        vkDestroySurfaceKHR(g.instance, g.surface, nullptr);
+        g.surface = VK_NULL_HANDLE;
+        auto make_surface = (PFN_vkCreateWin32SurfaceKHR)gipa(g.instance, "vkCreateWin32SurfaceKHR");
+        VkWin32SurfaceCreateInfoKHR surf = {VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
+        surf.hinstance = GetModuleHandleA(nullptr);
+        surf.hwnd = (HWND)window_handle();
+        if (!make_surface || make_surface(g.instance, &surf, nullptr, &g.surface)) {
+            g.surface = VK_NULL_HANDLE;
+            return;                             // lost still: the next try makes it
+        }
+        g.surface_lost = false;
+        VkBool32 shows = VK_FALSE;              // the spec's: asked of a surface before a swapchain is made on it
+        vkGetPhysicalDeviceSurfaceSupportKHR(g.phys, g.family, g.surface, &shows);
+        fprintf(g_hle_log, "native: the window's surface was lost and is made again\n");
+    }
     VkSurfaceCapabilitiesKHR caps;
-    vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g.phys, g.surface, &caps);
+    VkResult r = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g.phys, g.surface, &caps);
+    if (r) {
+        if (r == VK_ERROR_SURFACE_LOST_KHR) g.surface_lost = true;
+        if (told++ < 20) fprintf(g_hle_log, "native: the surface does not answer (%d)\n", (int)r);
+        drop();
+        return;
+    }
     uint32_t n = 64;
     VkSurfaceFormatKHR formats[64];
     vkGetPhysicalDeviceSurfaceFormatsKHR(g.phys, g.surface, &n, formats);
+    if (!n) {
+        drop();
+        return;
+    }
+    // BGRA as the picture is, else RGBA, else whatever is 8-bit sRGB's, else the first: the blit converts
     VkSurfaceFormatKHR format = formats[0];
-    for (uint32_t i = 0; i < n; i++)
-        if (formats[i].format == VK_FORMAT_B8G8R8A8_UNORM) format = formats[i];
+    int best = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (formats[i].colorSpace != VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) continue;
+        const int rank = formats[i].format == VK_FORMAT_B8G8R8A8_UNORM ? 3 : formats[i].format == VK_FORMAT_R8G8B8A8_UNORM ? 2 : 1;
+        if (rank > best) best = rank, format = formats[i];
+    }
     uint32_t m = 8;
     VkPresentModeKHR modes[8];
     vkGetPhysicalDeviceSurfacePresentModesKHR(g.phys, g.surface, &m, modes);
-    VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;   // always there; the game keeps its own time, so a mailbox is better
-    for (uint32_t i = 0; i < m; i++)
-        if (modes[i] == VK_PRESENT_MODE_MAILBOX_KHR) mode = modes[i];
+    // VSync (the setting): on, every driver's FIFO, the one mode they all have, a frame shown whole at the screen's refresh. Off, shown at
+    // once (it may tear), or by a mailbox where the driver has no such mode. The game keeps its own time either way: a frame that finds no
+    // image free is not shown, it does not wait.
+    g.swap_vsync = g_cfg.vsync != 0;
+    VkPresentModeKHR mode = VK_PRESENT_MODE_FIFO_KHR;
+    if (!g.swap_vsync) {
+        int best_mode = 0;
+        for (uint32_t i = 0; i < m; i++) {
+            const int rank = modes[i] == VK_PRESENT_MODE_IMMEDIATE_KHR ? 2 : modes[i] == VK_PRESENT_MODE_MAILBOX_KHR ? 1 : 0;
+            if (rank > best_mode) best_mode = rank, mode = modes[i];
+        }
+    }
     VkSwapchainCreateInfoKHR ci = {VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
+    VkSurfaceFullScreenExclusiveInfoEXT exclusive = {VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT};
+    exclusive.fullScreenExclusive = VK_FULL_SCREEN_EXCLUSIVE_DISALLOWED_EXT;
+    if (g.no_exclusive) ci.pNext = &exclusive;
     ci.surface = g.surface;
     ci.minImageCount = caps.minImageCount + 1;
     if (caps.maxImageCount && ci.minImageCount > caps.maxImageCount) ci.minImageCount = caps.maxImageCount;
     ci.imageFormat = format.format;
     ci.imageColorSpace = format.colorSpace;
     ci.imageExtent = caps.currentExtent;
-    if (ci.imageExtent.width == UINT32_MAX) ci.imageExtent = {(uint32_t)w, (uint32_t)h};
+    if (ci.imageExtent.width == UINT32_MAX)
+        ci.imageExtent = {std::clamp((uint32_t)w, caps.minImageExtent.width, caps.maxImageExtent.width),
+                          std::clamp((uint32_t)h, caps.minImageExtent.height, caps.maxImageExtent.height)};
     ci.imageArrayLayers = 1;
     ci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
@@ -1676,23 +1930,37 @@ static void make_swapchain(int w, int h)
     ci.presentMode = mode;
     ci.clipped = VK_TRUE;
     ci.oldSwapchain = g.swapchain;
+    if (!ci.imageExtent.width || !ci.imageExtent.height) {      // a window with no area: nothing to show till it has one
+        drop();
+        return;
+    }
+    if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
+        if (told++ < 20) fprintf(g_hle_log, "native: the window's images cannot be copied to (usage %08x)\n", (unsigned)caps.supportedUsageFlags);
+        drop();
+        return;
+    }
     VkSwapchainKHR made = VK_NULL_HANDLE;
-    VkResult r = vkCreateSwapchainKHR(g.dev, &ci, nullptr, &made);
-    if (g.swapchain) vkDestroySwapchainKHR(g.dev, g.swapchain, nullptr);
-    g.swapchain = VK_NULL_HANDLE;
-    g.swap_images.clear();
+    r = vkCreateSwapchainKHR(g.dev, &ci, nullptr, &made);
+    drop();
     if (r) {
-        fprintf(g_hle_log, "native: no swapchain (%d)\n", (int)r);
+        if (r == VK_ERROR_SURFACE_LOST_KHR) g.surface_lost = true;
+        if (told++ < 20) fprintf(g_hle_log, "native: no swapchain (%d)\n", (int)r);
         return;
     }
     g.swapchain = made;
     g.swap_w = (int)ci.imageExtent.width;
     g.swap_h = (int)ci.imageExtent.height;
+    g.swap_transform = ci.preTransform;
     uint32_t count = 0;
     vkGetSwapchainImagesKHR(g.dev, made, &count, nullptr);
     g.swap_images.resize(count);
     vkGetSwapchainImagesKHR(g.dev, made, &count, g.swap_images.data());
-    g.swap_stale = false;
+    // every one of them, in the log: a window that makes its swapchain again each frame shows here (the first 20, then each 100th)
+    static unsigned made_n;
+    if (++made_n <= 20 || made_n % 100 == 0)
+        fprintf(g_hle_log, "native: swapchain %u: %d x %d for a window of %d x %d, format %d in colour space %d of %u, %u images, present mode %d, "
+                           "alpha %x of %x, transform %x, at frame %u\n", made_n, g.swap_w, g.swap_h, w, h, (int)format.format, (int)format.colorSpace, n,
+                count, (int)mode, (unsigned)ci.compositeAlpha, (unsigned)caps.supportedCompositeAlpha, (unsigned)ci.preTransform, g.frame);
 }
 
 // the FPS counter: 5 x 7 digits, drawn as pixels straight on the window's image
@@ -1841,6 +2109,7 @@ static void blit_to_window(VkImage image, const NativeFrame &frame)
     image_barrier(image, 0, 1, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
                   VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
     VkClearColorValue black = {};
+    black.float32[3] = 1.0f;                // opaque, as the picture is (opaque_picture)
     VkImageSubresourceRange all = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     vkCmdClearColorImage(g.cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &all);
     // each write over the last waits for it: the clear, the picture, the counter and the word. Without, AMD's GPUs do them at once, by tiles
@@ -1985,7 +2254,14 @@ static void draw_fx(const NativeFrame &frame, const NativeFx &f, int row)
     vkCmdSetViewport(g.cmd, 0, 1, &vp);
     vkCmdSetScissor(g.cmd, 0, 1, &sc);
     PostPush p = {};
-    p.mode = f.kind == FX_FOG ? 0 : f.kind == FX_GREY ? 1 : 2;
+    // The depth of field: the port's own blur, the GS's amounts by depth (native_post.frag). HP2_NATIVEEXACT keeps the GS's half buffer;
+    // HP2_DOFSPLIT draws the left half of the picture the GS's way and the right half the port's, for comparing
+    static const bool dof_exact = getenv("HP2_NATIVEEXACT") != nullptr, dof_split = getenv("HP2_DOFSPLIT") != nullptr;
+    p.mode = f.kind == FX_FOG ? 0 : f.kind == FX_GREY ? 1 : dof_exact ? 2 : dof_split ? 4 : 3;
+    p.rect[0] = vp.x;
+    p.rect[1] = vp.y;
+    p.rect[2] = vp.x + vp.width;
+    p.rect[3] = vp.y + vp.height;
     p.row = row;
     p.size[0] = (float)W;
     p.size[1] = (float)H;
@@ -2025,7 +2301,7 @@ static void upload_palettes(const NativeFrame &frame, VkDeviceSize &at)
 
 // where the CPU's frame goes, for HP2_NATIVELOG's "cpu" line: the game between two frames, the wait for the GPU, the copy of the vertices,
 // the recording, the submit and present
-static double g_cpu_sum[5];
+static double g_cpu_sum[6];
 static int g_cpu_n;
 static LARGE_INTEGER g_cpu_mark, g_cpu_freq;
 static double cpu_lap()
@@ -2044,6 +2320,7 @@ bool native_vk_draw(const NativeFrame &frame)
     const double game_ms = cpu_lap();
     if (!g.ready) {
         if (!window_handle()) return false;     // not there yet
+        window_dpi_thread();
         if (!setup()) {
             g.failed = true;
             fprintf(g_hle_log, "native: no Vulkan device\n");
@@ -2287,8 +2564,49 @@ bool native_vk_draw(const NativeFrame &frame)
     int cw = client.right, ch = client.bottom;
     bool on_screen = false;
     uint32_t image = 0;
+    // what the driver said of the swapchain, by acquire or present: out of date (or lost) and it is made again; suboptimal and its size is
+    // looked at first; "nothing free now" is no news
+    auto swap_said = [](VkResult r, const char *where) {
+        if (r == VK_SUCCESS || r == VK_NOT_READY || r == VK_TIMEOUT) return;
+        if (r == VK_SUBOPTIMAL_KHR) {
+            g.swap_check = true;
+            return;
+        }
+        g.swap_stale = true;
+        if (r == VK_ERROR_SURFACE_LOST_KHR) g.surface_lost = true;
+        static int told;
+        if (r != VK_ERROR_OUT_OF_DATE_KHR && told++ < 20) fprintf(g_hle_log, "native: %s: %d at frame %u\n", where, (int)r, g.frame);
+    };
     if (cw > 0 && ch > 0) {
-        if (!g.swapchain || g.swap_stale || cw != g.swap_w || ch != g.swap_h) {
+        // The surface's size is what counts, and the window's client size only says when to look: the two are read at different moments
+        // of a window that is changing, and where Windows scales a window they are not the same numbers at all. A swapchain the surface's
+        // size still fits stays, whatever the client size has become.
+        bool resized = cw != g.swap_cw || ch != g.swap_ch;
+        bool again = !g.swapchain || g.swap_stale || g.swap_vsync != (g_cfg.vsync != 0);
+        if (!again && (resized || g.swap_check)) {
+            g.swap_check = false;
+            VkSurfaceCapabilitiesKHR caps;
+            const VkResult cr = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(g.phys, g.surface, &caps);
+            if (cr == VK_SUCCESS && caps.currentExtent.width != UINT32_MAX) {
+                again = caps.currentTransform != g.swap_transform || (int)caps.currentExtent.width != g.swap_w || (int)caps.currentExtent.height != g.swap_h;
+                if (!again) g.swap_cw = cw, g.swap_ch = ch;
+            } else {
+                again = resized || cr != VK_SUCCESS;        // a surface with no size of its own takes the window's
+            }
+            resized = again;
+        }
+        // made on each of several frames in a row, it does not hold (a driver's state, a window in between two sizes): it is left alone for
+        // half a second at a time, and the frames go to the one there is, or to none, rather than the device waiting on every frame
+        if (again && !resized && g.frame < g.swap_rest_until) again = false;
+        if (again) {
+            g.swap_streak = g.frame - g.swap_made_frame <= 1 ? g.swap_streak + 1 : 1;
+            g.swap_made_frame = g.frame;
+            if (g.swap_streak >= 4) {
+                static int told;
+                if (told++ < 10) fprintf(g_hle_log, "native: the swapchain was made on %d frames in a row, left alone for 30 frames\n", g.swap_streak);
+                g.swap_rest_until = g.frame + 30;
+                g.swap_streak = 0;
+            }
             vkEndCommandBuffer(g.cmd);          // nothing is waiting on it: make_swapchain waits for the device
             VkSubmitInfo before = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
             before.commandBufferCount = 1;
@@ -2301,10 +2619,13 @@ bool native_vk_draw(const NativeFrame &frame)
         if (g.swapchain) {
             VkResult r = vkAcquireNextImageKHR(g.dev, g.swapchain, 0, g.acquired, VK_NULL_HANDLE, &image);
             if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) on_screen = true;
-            else if (r == VK_ERROR_OUT_OF_DATE_KHR) g.swap_stale = true;
+            swap_said(r, "no image of the window's");
         }
     }
-    if (on_screen) blit_to_window(g.swap_images[image], frame);
+    if (on_screen) {
+        opaque_picture();
+        blit_to_window(g.swap_images[image], frame);
+    }
     // the semaphore the present waits on: the image's own
     VkSemaphore present_wait = g.rendered;
     if (on_screen) {
@@ -2340,7 +2661,7 @@ bool native_vk_draw(const NativeFrame &frame)
         pi.pImageIndices = &image;
         VkResult r = vkQueuePresentKHR(g.queue, &pi);
         if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) g.presented++;
-        if (r == VK_SUBOPTIMAL_KHR || r == VK_ERROR_OUT_OF_DATE_KHR) g.swap_stale = true;
+        swap_said(r, "the frame was not shown");
     }
     g.waiting = true;
     const double submit_ms = cpu_lap();
@@ -2362,6 +2683,7 @@ bool native_vk_draw(const NativeFrame &frame)
     g_cpu_sum[2] += copy_ms;
     g_cpu_sum[3] += record_ms;
     g_cpu_sum[4] += submit_ms;
+    g_cpu_sum[5] += frame.list_ms;
     g_cpu_n++;
     // the game's own frames, whatever the window got to see
     uint64_t now = GetTickCount64();
@@ -2389,8 +2711,8 @@ bool native_vk_draw(const NativeFrame &frame)
                         g_gpu_sum[3] / g_gpu_frames, (double)g_fx_count / g_gpu_frames, frame.indices.size() + frame.vertices.size(), frame.draws.size());
             fprintf(g_hle_log, "\n");
             if (g_cpu_n)
-                fprintf(g_hle_log, "native: cpu a frame: game %.2f ms, wait for the gpu %.2f, vertices %.2f, recording %.2f, submit and present %.2f\n",
-                        g_cpu_sum[0] / g_cpu_n, g_cpu_sum[1] / g_cpu_n, g_cpu_sum[2] / g_cpu_n, g_cpu_sum[3] / g_cpu_n, g_cpu_sum[4] / g_cpu_n);
+                fprintf(g_hle_log, "native: cpu a frame: game %.2f ms (lists %.2f), wait for the gpu %.2f, vertices %.2f, recording %.2f, submit and present %.2f\n",
+                        g_cpu_sum[0] / g_cpu_n, g_cpu_sum[5] / g_cpu_n, g_cpu_sum[1] / g_cpu_n, g_cpu_sum[2] / g_cpu_n, g_cpu_sum[3] / g_cpu_n, g_cpu_sum[4] / g_cpu_n);
             memset(g_cpu_sum, 0, sizeof g_cpu_sum);
             g_cpu_n = 0;
             if (g_copy_n[0])

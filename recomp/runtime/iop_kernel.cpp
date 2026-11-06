@@ -20,6 +20,17 @@
 #include <map>
 #include <mutex>
 #include <thread>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <timeapi.h>
+#pragma comment(lib, "winmm.lib")
+#endif
 
 extern FILE *g_hle_log;
 extern u32 g_iop_hle_index;
@@ -729,6 +740,13 @@ static Thread *pick()
 
 static void iop_main()
 {
+#ifdef _WIN32
+    // The sound driver keeps its streams fed on its timer (every 16.7 ms) and sleeps between. Windows' sleeps go by the system's tick, 15.6 ms
+    // unless asked: a tick late, a stream of speech could run dry and stop. A 1 ms tick for the process, and this thread ahead of the
+    // game's, as the IOP is its own processor on the PS2.
+    timeBeginPeriod(1);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+#endif
     std::unique_lock<std::mutex> lock(g_mtx);
     for (;;) {
         // requests from the EE

@@ -544,3 +544,231 @@ void pc_paint_buttons()
         pc_call(UpdateAllText);
     }
 }
+
+// ---- TEMP diagnostics (HP2_DIAG=1): the attract demo's idle timer and the speech library's own messages ----------------------------
+extern FILE *g_hle_log;
+static bool diag_on()
+{
+    static const bool on = getenv("HP2_DIAG") != nullptr;
+    return on;
+}
+
+// ConsiderStartDemoMode(Timer &last_active_time): the demo starts when (RealTimer - last) * k > BeginDemoModeTimeout
+void HOOK_ConsiderStartDemoMode__FR5Timer(Ctx &c, void (*orig)(Ctx &))
+{
+    if (diag_on()) {
+        const u32 gp = c.r[28].w[0], timer = c.r[4].w[0];
+        static u32 calls, last_value;
+        const u32 now = LW(gp - 19608), last = LW(timer);
+        float k, timeout;
+        u32 kw = LW(gp - 30500), tw = LW(gp - 23100);
+        memcpy(&k, &kw, 4);
+        memcpy(&timeout, &tw, 4);
+        if (last != last_value || ++calls % 120 == 0) {
+            fprintf(g_hle_log, "demo: timer %08x now %u last %u%s idle %.2f s of %.2f, attract mgr %08x replay state %u %u\n", timer, now, last,
+                    last != last_value ? " (reset)" : "", (float)(s32)(now - last) * k, timeout, LW(0x2f0000 - 32), LW(0x2f0000 + 2400 + 4),
+                    LW(0x2f0000 + 2400 + 8));
+            fflush(g_hle_log);
+            last_value = last;
+        }
+    }
+    orig(c);
+}
+
+void HOOK_StartDemoMode__Fv(Ctx &c, void (*orig)(Ctx &))
+{
+    if (diag_on()) fprintf(g_hle_log, "demo: StartDemoMode\n"), fflush(g_hle_log);
+    orig(c);
+    if (diag_on()) fprintf(g_hle_log, "demo: StartDemoMode returned\n"), fflush(g_hle_log);
+}
+
+static void spch_string(const char *what, u32 s)
+{
+    char buf[300];
+    int i = 0;
+    for (; i < 299 && s; i++) {
+        char ch = (char)LB(s + (u32)i);
+        if (!ch) break;
+        buf[i] = ch == '\n' ? ' ' : ch;
+    }
+    buf[i] = 0;
+    fprintf(g_hle_log, "spch: %s %s\n", what, buf);
+    fflush(g_hle_log);
+}
+
+void HOOK_S_AbortMessage__9cSEDWedgePce(Ctx &c, void (*orig)(Ctx &))
+{
+    if (diag_on()) spch_string("abort", c.r[4].w[0]);
+    orig(c);
+}
+
+void HOOK_SPCHLOG_SaveMessage(Ctx &c, void (*orig)(Ctx &))
+{
+    if (diag_on()) spch_string("message", c.r[4].w[0]);
+    orig(c);
+}
+
+// SPCH_AddEvent(event *): the event's first u16 is its ID
+void HOOK_SPCH_AddEvent(Ctx &c, void (*orig)(Ctx &))
+{
+    const u32 ev = c.r[4].w[0];
+    const u32 id = diag_on() ? LH(ev) : 0, gp = c.r[28].w[0];
+    orig(c);
+    if (diag_on()) {
+        float ms;
+        u32 w = LW(gp - 16548);
+        memcpy(&ms, &w, 4);
+        fprintf(g_hle_log, "spch: AddEvent %u (%04x %04x %04x %04x) -> %d, clock %.0f ms, frames %u\n", id, LH(ev + 2), LH(ev + 4), LH(ev + 6), LH(ev + 8),
+                (int)c.r[2].w[0], ms, LW(gp - 19600));
+        fflush(g_hle_log);
+    }
+}
+
+void HOOK_PlaySentence__9cSEDWedgeif(Ctx &c, void (*orig)(Ctx &))
+{
+    const u32 self = c.r[4].w[0];
+    const u32 parts = LW(self + 108), state = LW(self + 120);
+    orig(c);
+    if (diag_on()) fprintf(g_hle_log, "spch: PlaySentence parts %u state %u -> %u, played %d\n", parts, state, LW(self + 120), (int)c.r[2].w[0]), fflush(g_hle_log);
+}
+
+void HOOK_ChangeGameFlow__F13GameFlowStateT0(Ctx &c, void (*orig)(Ctx &))
+{
+    if (diag_on()) fprintf(g_hle_log, "flow: ChangeGameFlow %u %u (ra %08x)\n", c.r[4].w[0], c.r[5].w[0], c.r[31].w[0]), fflush(g_hle_log);
+    orig(c);
+}
+
+void HOOK_SetEndReason__15DemoDiscManager17DemoDiscEndReason(Ctx &c, void (*orig)(Ctx &))
+{
+    if (diag_on()) fprintf(g_hle_log, "demo: SetEndReason %u (ra %08x)\n", c.r[5].w[0], c.r[31].w[0]), fflush(g_hle_log);
+    orig(c);
+}
+
+void HOOK_RCStateNoneCallback__15RaceCoordinator9RCMessagei(Ctx &c, void (*orig)(Ctx &))
+{
+    if (diag_on() && c.r[5].w[0] != 3) fprintf(g_hle_log, "rc: None msg %u param %u (ra %08x)\n", c.r[5].w[0], c.r[6].w[0], c.r[31].w[0]), fflush(g_hle_log);
+    orig(c);
+}
+
+void HOOK_RCStateAIDemoModeCallback__15RaceCoordinator9RCMessagei(Ctx &c, void (*orig)(Ctx &))
+{
+    if (diag_on() && c.r[5].w[0] != 3) fprintf(g_hle_log, "rc: AIDemo msg %u param %u (ra %08x)\n", c.r[5].w[0], c.r[6].w[0], c.r[31].w[0]), fflush(g_hle_log);
+    orig(c);
+}
+
+void HOOK_PostMessage__15RaceCoordinator9RCMessagei(Ctx &c, void (*orig)(Ctx &))
+{
+    extern bool g_in_verify;
+    if (diag_on() && !(c.r[5].w[0] == 11 && g_in_verify)) fprintf(g_hle_log, "rc: PostMessage %u %u (ra %08x)%s\n", c.r[5].w[0], c.r[6].w[0], c.r[31].w[0], g_in_verify ? " dropped" : ""), fflush(g_hle_log);
+    if (c.r[5].w[0] == 11 && g_in_verify) return;           // RC_SKIP_REPLAY from VerifyDebugChecksums: see there
+    orig(c);
+}
+
+static u32 g_replay_steps, g_replay_diffs;
+ULONG64 g_replay_cycles_at;
+void HOOK_ChangeState__15RaceCoordinator7RCState(Ctx &c, void (*orig)(Ctx &))
+{
+    const u32 state = c.r[5].w[0];
+    // TEMP (HP2_DIAG): the game thread's cycles over a replay, the measure of its work that the clock's speed and the waits do not change
+    ULONG64 &cycles_at = g_replay_cycles_at;
+    static u32 rc_state = 0;
+    if (diag_on() && (rc_state == 9 || rc_state == 4 || rc_state == 5) && state != rc_state) {
+        ULONG64 now = 0;
+        QueryThreadCycleTime(GetCurrentThread(), &now);
+        fprintf(g_hle_log, "replay: done, %u steps, %.1f million cycles of the game's thread, %.3f million a step\n", g_replay_steps,
+                (now - cycles_at) / 1e6, g_replay_steps ? (now - cycles_at) / 1e6 / g_replay_steps : 0.0);
+    }
+    if (state == 4 || state == 5 || state == 9) {
+        g_replay_steps = g_replay_diffs = 0;                // a replay starts
+        QueryThreadCycleTime(GetCurrentThread(), &cycles_at);
+    }
+    rc_state = state;
+    if (diag_on()) fprintf(g_hle_log, "rc: ChangeState %u (ra %08x)\n", c.r[5].w[0], c.r[31].w[0]), fflush(g_hle_log);
+    orig(c);
+}
+
+// ---- replays: the world's checksum -------------------------------------------------------------------------------------------------
+// A replay (the attract demo's REPLAY\ files, the instant and auto replays) stores, each world step, a byte of a checksum of the world:
+// WorldTimer and each car's (x + y) * 65536 (World::CalculateDebugChecksum). VerifyDebugChecksums compares it while replaying and on any
+// difference posts RC_SKIP_REPLAY. The PC's floats are not the EE's to the last bit, so the attract demo, recorded on a PS2, differed
+// at its first step and was skipped at once: the menu came back every 30 seconds and the music started over. The check still reads its
+// byte (the replay's data stays in step); a difference only counts here.
+// Each replay's steps are counted, and the first that differs goes to the log: how far the PC's world keeps to the PS2's (HP2_DIAG).
+bool g_in_verify;
+
+void HOOK_VerifyDebugChecksums__5World(Ctx &c, void (*orig)(Ctx &))
+{
+    const u32 gp = c.r[28].w[0], rm = LW(gp - 22440);      // pReplayManager: +0 playing, +4 recording
+    const u32 flag = rm ? LW(rm + 12) : 0;
+    const bool playing = rm && LW(rm) && !LW(rm + 4);
+    g_in_verify = true;
+    orig(c);
+    g_in_verify = false;
+    if (!playing) return;
+    g_replay_steps++;
+    if (g_replay_steps == 1500 && diag_on()) {             // TEMP: the work of a replay's first 1500 steps, in the game thread's cycles
+        extern ULONG64 g_replay_cycles_at;
+        ULONG64 now = 0;
+        QueryThreadCycleTime(GetCurrentThread(), &now);
+        fprintf(g_hle_log, "replay: 1500 steps took %.1f million cycles of the game's thread\n", (now - g_replay_cycles_at) / 1e6);
+        fflush(g_hle_log);
+    }
+    if (LW(rm + 12) != flag) {                             // a difference: the game set this and posted the skip, which went nowhere
+        SW(rm + 12, flag);
+        if (!g_replay_diffs++ && diag_on())
+            fprintf(g_hle_log, "replay: first difference at step %u (world loop %u, timer %u)\n", g_replay_steps, LW(gp - 19552), LW(gp - 19576)),
+                fflush(g_hle_log);
+    }
+    if (g_replay_steps % 300 == 0 && diag_on())
+        fprintf(g_hle_log, "replay: %u steps, %u differ%s\n", g_replay_steps, g_replay_diffs, g_replay_diffs ? "" : " (in step with the recording)"),
+            fflush(g_hle_log);
+}
+
+
+// TEMP (HP2_DIAG): where a frame's CPU goes in a replay: GetTimestep (which waits for real time while a replay plays) and the world's step
+static double g_t_gettimestep, g_t_dotimestep;
+static u32 g_t_steps;
+static double now_ms()
+{
+    static LARGE_INTEGER f;
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return (double)t.QuadPart * 1000.0 / (double)f.QuadPart;
+}
+static bool g_in_gettimestep;
+void HOOK_GetTimestep__5World(Ctx &c, void (*orig)(Ctx &))
+{
+    const double t0 = now_ms();
+    g_in_gettimestep = true;
+    orig(c);
+    g_in_gettimestep = false;
+    g_t_gettimestep += now_ms() - t0;
+}
+// HP2_REPLAYNOWAIT: a replay does not wait for real time (GetTimestep spins on the ticker until its step is due): the demo as fast as it goes,
+// its steps the same, for timing and profiles
+void HOOK_bGetTickerDifference__FUiUi(Ctx &c, void (*orig)(Ctx &))
+{
+    static const bool nowait = getenv("HP2_REPLAYNOWAIT") != nullptr;
+    orig(c);
+    if (nowait && g_in_gettimestep) c.f[0].f = 1e9f;
+}
+void HOOK_DoTimestep__5Worldf(Ctx &c, void (*orig)(Ctx &))
+{
+    const double t0 = now_ms();
+    orig(c);
+    g_t_dotimestep += now_ms() - t0;
+    if (++g_t_steps % 300 == 0 && diag_on()) {
+        fprintf(g_hle_log, "timing: %u steps: GetTimestep %.2f ms a step, DoTimestep %.2f ms a step\n", g_t_steps, g_t_gettimestep / 300, g_t_dotimestep / 300);
+        fflush(g_hle_log);
+        g_t_gettimestep = g_t_dotimestep = 0;
+    }
+}
+
+// TEMP: HP2_DEMOREPLAY=<1..5>, the attract demo plays that recording (DemoModeReplay +36, which ConsiderLaunching takes over its random one)
+void HOOK_ConsiderLaunching__14DemoModeReplay(Ctx &c, void (*orig)(Ctx &))
+{
+    static const int which = getenv("HP2_DEMOREPLAY") ? atoi(getenv("HP2_DEMOREPLAY")) : -1;
+    if (which >= 1 && which <= 5) SW(c.r[4].w[0] + 36, (u32)which);
+    orig(c);
+}

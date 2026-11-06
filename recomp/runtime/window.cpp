@@ -66,6 +66,29 @@ void window_set_size(int w, int h)
 
 void *window_handle() { return g_hwnd; }
 
+void window_screen_size(int &w, int &h)
+{
+    MONITORINFO mi = {sizeof mi};
+    HMONITOR mon = g_hwnd ? MonitorFromWindow(g_hwnd, MONITOR_DEFAULTTONEAREST) : MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY);
+    if (GetMonitorInfoA(mon, &mi)) {
+        w = mi.rcMonitor.right - mi.rcMonitor.left;
+        h = mi.rcMonitor.bottom - mi.rcMonitor.top;
+    } else {
+        w = GetSystemMetrics(SM_CXSCREEN);
+        h = GetSystemMetrics(SM_CYSCREEN);
+    }
+}
+
+void window_view_size(int &w, int &h)
+{
+    if (g_cfg.fullscreen) {
+        window_screen_size(w, h);
+    } else {
+        w = g_cfg.win_w;
+        h = g_cfg.win_h;
+    }
+}
+
 void window_relaunch(const std::string &profile)
 {
     char path[MAX_PATH];
@@ -89,7 +112,7 @@ void window_quit()
 }
 
 // the pointer shows in the menus; data\ui\cursor.cur or cursor.ani (beside the program, or under HP2_DATA) replaces the arrow
-static std::atomic<bool> g_cursor_on{true};
+static std::atomic<bool> g_cursor_on{false};    // not till a screen asks for it and the mouse moves (window_pad)
 static HCURSOR menu_cursor()
 {
     static HCURSOR c = [] {
@@ -194,13 +217,17 @@ int window_wheel()
 
 static std::atomic<int> g_input_kind;       // 0 the keyboard and mouse, 1 a gamepad
 int window_input_kind() { return g_input_kind; }
+// When the mouse last moved or clicked, by GetTickCount64; 0: not yet, or a key or a pad button since. The pointer shows for 3 seconds after
+// it (window_pad), so it is there for whoever uses the mouse and gone for whoever does not.
+static std::atomic<unsigned long long> g_mouse_at;
+static void mouse_used() { g_mouse_at = GetTickCount64() | 1; }
 
 static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp)
 {
     switch (m) {
     // Any new press on the keyboard or the mouse says the player has moved to them (a repeat says nothing, nor do the system's Alt and Win).
     case WM_KEYDOWN:
-        if (!(lp & 1 << 30) && wp != VK_LWIN && wp != VK_RWIN) g_input_kind = 0;
+        if (!(lp & 1 << 30) && wp != VK_LWIN && wp != VK_RWIN) g_input_kind = 0, g_mouse_at = 0;
         if (g_text_on)
             if (const int ch = text_char((int)wp, (GetKeyState(VK_SHIFT) & 0x8000) != 0))
                 if ((ch != 13 || g_text_enter_free) && (ch != 27 || g_text_esc_free)) text_push(ch);
@@ -209,8 +236,18 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         if (wp == VK_RETURN) g_text_enter_free = true;
         if (wp == VK_ESCAPE) g_text_esc_free = true;
         break;
+    case WM_MOUSEMOVE: {
+        // Windows sends one when a window comes up under a pointer that stands still: only a new place is a move
+        static LPARAM last = -1;
+        if (lp != last) {
+            if (last != -1) mouse_used();
+            last = lp;
+        }
+        break;
+    }
     case WM_MOUSEWHEEL:
         g_input_kind = 0;
+        mouse_used();
         g_wheel += GET_WHEEL_DELTA_WPARAM(wp) > 0 ? 1 : -1;
         if (g_wheel > 4) g_wheel = 4;
         if (g_wheel < -4) g_wheel = -4;
@@ -219,6 +256,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp)
     case WM_RBUTTONDOWN:
     case WM_MBUTTONDOWN:
         g_input_kind = 0;
+        mouse_used();
         break;
     case WM_SYSKEYDOWN:
         if (wp == VK_RETURN && !(lp & 1 << 30)) {                   // Alt+Enter
@@ -449,8 +487,36 @@ static void capture_step()
     }
 }
 
+// The pointer: where a screen takes the mouse (pc_cursor_wanted), and only while the mouse is in use. Once for every frame drawn
+// (native_end_frame) as well as for every read of the pad: the game does not read the pad all the time (through the logos and the opening
+// film it does not), and a pointer left showing by the screen before would stay through them.
+// The difference is taken as a signed number: the window's thread may stamp the mouse a millisecond after this one read the clock, and
+// unsigned that is a huge time ago; the pointer went out for a frame at a time while the mouse moved.
+void window_cursor_frame()
+{
+    if (!g_hwnd) return;
+    const unsigned long long mouse_at = g_mouse_at;
+    const bool cursor = pc_cursor_wanted() && mouse_at && (long long)(GetTickCount64() - mouse_at) < 3000;
+    static const bool log = getenv("HP2_NATIVELOG") != nullptr;
+    if (g_cursor_on != cursor) {
+        g_cursor_on = cursor;
+        PostMessageA(g_hwnd, WM_CURSORSTATE, 0, 0);
+        if (log) fprintf(stderr, "pointer: %s at %.1f s\n", cursor ? "wanted" : "not wanted", GetTickCount64() % 1000000 / 1000.0);
+    }
+}
+
 u16 window_pad(u8 sticks[4], u8 pressure[12])
 {
+    {   // HP2_NATIVELOG: when the game reads the pad, a line a second (through all of the start it may not)
+        static const bool log = getenv("HP2_NATIVELOG") != nullptr;
+        static unsigned long long last;
+        static unsigned reads;
+        reads++;
+        if (log && GetTickCount64() / 1000 != last) {
+            last = GetTickCount64() / 1000;
+            fprintf(stderr, "pad: read %u at %.1f s\n", reads, GetTickCount64() % 1000000 / 1000.0);
+        }
+    }
     sticks[0] = sticks[1] = sticks[2] = sticks[3] = 0x80;
     memset(pressure, 0, 12);
     // HP2_AUTOPRESS=<start s>,<interval s>: tap cross (and start) on a timer, for
@@ -543,12 +609,17 @@ u16 window_pad(u8 sticks[4], u8 pressure[12])
         }
         f10_held = f10;
     }
+    // TEMP: HP2_F11DUMP, F11 dumps the next frame's draws and pictures (native_dump_next)
+    static const bool f11_key = getenv("HP2_F11DUMP") != nullptr;
+    static bool f11_held;
+    if (f11_key) {
+        const bool f11 = key(VK_F11);
+        if (f11 && !f11_held) native_dump_next();
+        f11_held = f11;
+    }
     bool alt = key(VK_MENU);                // Alt+Enter is the window's
     bool driving = pc_car_input();
-    if (g_cursor_on != pc_cursor_wanted()) {
-        g_cursor_on = !g_cursor_on;
-        PostMessageA(g_hwnd, WM_CURSORSTATE, 0, 0);
-    }
+    window_cursor_frame();
     auto key_on = [&](int vk) {
         if (!key(vk) || (alt && vk == VK_RETURN)) return false;
         if (g_key_script_on) g_input_kind = 0;      // the real keyboard says so in wndproc
@@ -608,7 +679,7 @@ u16 window_pad(u8 sticks[4], u8 pressure[12])
         // or a pedal kept down must not hold the hints against the keyboard.
         static int pad_held;
         static bool stick_held;
-        if (ps.mask & ~pad_held) g_input_kind = 1;
+        if (ps.mask & ~pad_held) g_input_kind = 1, g_mouse_at = 0;
         pad_held = ps.mask;
         for (int b = 0; b < PCB_COUNT; b++) {
             int m = (driving ? g_cfg.pad[b] : pc_menu_pad(b)) & ps.mask;
@@ -625,7 +696,7 @@ u16 window_pad(u8 sticks[4], u8 pressure[12])
                 sticks[i] = ps.sticks[i];
                 if (ps.sticks[i] < 0x40 || ps.sticks[i] > 0xC0) pushed = true;
             }
-        if (pushed && !stick_held) g_input_kind = 1;
+        if (pushed && !stick_held) g_input_kind = 1, g_mouse_at = 0;
         stick_held = pushed;
     } else if (g_input_kind == 1) {
         g_input_kind = 0;       // the pad is gone
@@ -681,9 +752,41 @@ u16 window_pad2(u8 sticks[4], u8 pressure[12])
     return buttons;
 }
 
+// The process takes the screen's real pixels, whatever the screen's scaling: the window's client size is then the swapchain's on every
+// driver, and the fullscreen window is the monitor's own size. Said here and not left to what else is in the process (a driver, an overlay,
+// the system's compatibility settings): a window Windows scales by itself is drawn at another size than it has, and each driver takes that
+// its own way. The functions by name: they are Windows 10's.
+int window_dpi_aware()
+{
+    HMODULE user = GetModuleHandleA("user32.dll");
+    typedef void *(WINAPI *GetContext)();
+    typedef int (WINAPI *FromContext)(void *);
+    typedef BOOL (WINAPI *SetContext)(void *);
+    const auto get = (GetContext)(void *)GetProcAddress(user, "GetThreadDpiAwarenessContext");
+    const auto from = (FromContext)(void *)GetProcAddress(user, "GetAwarenessFromDpiAwarenessContext");
+    const auto set = (SetContext)(void *)GetProcAddress(user, "SetProcessDpiAwarenessContext");
+    const int was = get && from ? from(get()) : -1;
+    if (!set || !set((void *)(INT_PTR)-4))                  // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+        if (was < 1) SetProcessDPIAware();
+    return was;
+}
+
+// HP2_DPI=0 | 1, for tests: the window's thread and the renderer's as in a process Windows scales (unaware, or aware of the system's scaling
+// only), which is what the port was on a scaled screen before it declared itself. Called at the start of each of the two threads.
+void window_dpi_thread()
+{
+    const char *e = getenv("HP2_DPI");
+    if (!e) return;
+    typedef void *(WINAPI *SetThreadContext)(void *);
+    if (const auto set = (SetThreadContext)(void *)GetProcAddress(GetModuleHandleA("user32.dll"), "SetThreadDpiAwarenessContext"))
+        set((void *)(INT_PTR)(atoi(e) == 1 ? -2 : -1));
+}
+
 void window_start()
 {
     std::thread([] {
+        window_dpi_thread();
+        if (getenv("HP2_CURSORSTART")) g_cursor_on = true, mouse_used();    // for tests: as if the mouse had just been used on a screen before
         WNDCLASSA wc = {};
         wc.lpfnWndProc = wndproc;
         wc.hInstance = GetModuleHandleA(nullptr);

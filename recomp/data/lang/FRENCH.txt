@@ -75,7 +75,10 @@ Window	Fenêtre
 Window or borderless fullscreen. Alt+Enter switches too.	Fenêtre ou plein écran sans bordure. Alt+Entrée bascule aussi.
 The size of the window. Fullscreen fills the monitor.	La taille de la fenêtre. Le plein écran remplit le moniteur.
 Aspect Ratio	Format d'image
-The race's picture; the menus stay 4:3.	L'image de la course ; les menus restent en 4:3.
+The race's picture, no wider than the window. The menus stay 4:3.	L'image de la course, pas plus large que la fenêtre. Les menus restent en 4:3.
+A 4:3 window shows the race in 4:3. A wider one has the wider pictures.	Une fenêtre 4:3 montre la course en 4:3. Une plus large a les images plus larges.
+Fullscreen is the monitor's own resolution. Windowed has the sizes.	Le plein écran a la résolution du moniteur. Le mode fenêtré a les tailles.
+On: each frame waits for the screen, no tearing. Off: shown at once.	Oui : chaque image attend l'écran, sans déchirure. Non : affichée aussitôt.
 Render Scale	Échelle du rendu
 The picture's detail, times the PS2's 512 x 448.	La finesse de l'image, en multiples du 512 x 448 de la PS2.
 Scaling	Mise à l'échelle
@@ -83,7 +86,9 @@ How the picture is scaled to the window.	Comment l'image est adaptée à la fen�
 Anti-Aliasing	Anticrénelage
 Smoother edges.	Des bords plus lisses.
 Anisotropic Filtering	Filtrage anisotrope
-Sharper textures far away.	Des textures plus nettes au loin.
+Sharper textures far away, on everything in the world.	Des textures plus nettes au loin, sur tout le décor.
+This graphics card has no anti-aliasing for the game.	Cette carte graphique n'a pas d'anticrénelage pour le jeu.
+This graphics card has no anisotropic filtering.	Cette carte graphique n'a pas de filtrage anisotrope.
 Brightness	Luminosité
 Lighter or darker, all over.	Plus clair ou plus sombre, partout.
 Contrast	Contraste

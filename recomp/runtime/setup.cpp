@@ -118,7 +118,7 @@ void check_iso()
     for (const KnownDisc &k : kKnownDiscs)
         if (hex == k.elf_sha1 && !_stricmp(boot.c_str(), k.boot)) name = k.name;
     if (name.empty())
-        return set_status(L"This version of the game (" + widen(boot) + L") is not supported yet: the USA disc or the European v1.00 one.");
+        return set_status(L"This disc is not supported yet.");
     ULARGE_INTEGER free_bytes = {};
     const std::wstring drive = g_ui.root.substr(0, 3);
     if (GetDiskFreeSpaceExW(drive.c_str(), &free_bytes, nullptr, nullptr) && free_bytes.QuadPart < kNeeded)

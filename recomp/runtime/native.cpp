@@ -6,6 +6,7 @@
 #include "pcconfig.h"
 #include "pcmenu.h"
 
+#include <atomic>
 #include <chrono>
 #include <algorithm>
 #include <cstdio>
@@ -321,23 +322,46 @@ static void trim_mirror(u32 first)
 // The 3D is widened by the game's own view (HOOK_CreateViewMatricies): the target keeps its 512 pixels across, and the picture
 // shows them wider, so what the game places in those pixels in 2D would come out stretched. So 2D is narrowed again, as a whole:
 // the HUD's panels keep to the screen's left and right edges, the rest to its middle, nothing changes shape.
+// The race's aspect for the frame being made: the setting's, no wider than the window (pc_aspect). Taken once a frame, as the last one is
+// handed over: the window goes fullscreen and back on its own thread, and a frame's lists and its picture must have one aspect.
+static int g_aspect_now = -1;
+int native_aspect()
+{
+    if (g_aspect_now < 0) g_aspect_now = pc_aspect();
+    return g_aspect_now;
+}
+
 float native_narrow()
 {
     static const bool exact = getenv("HP2_NATIVEEXACT") != nullptr;
     if (exact) return 1.0f;
-    const float f = [] {
-        return g_cfg.aspect == 2 ? (4.0f / 3.0f) / (16.0f / 9.0f) : g_cfg.aspect == 1 ? (4.0f / 3.0f) / (16.0f / 10.0f) : 1.0f;
-    }();
-    return f;
+    const int aspect = native_aspect();
+    return aspect == 2 ? (4.0f / 3.0f) / (16.0f / 9.0f) : aspect == 1 ? (4.0f / 3.0f) / (16.0f / 10.0f) : 1.0f;
 }
 
 // The packets of a Flailer object and its pieces: a text goes as one thing, not glyph by glyph. One object can hold pieces far apart
 // that share a texture (the last lights under the mirror and the panel by the right edge), and each of them goes on its own.
 struct StripSpan {
-    float x0, x1;
+    float x0, x1, whole;                                    // whole: the middle of the line of text the span is part of
 };
 static std::unordered_map<u32, std::vector<StripSpan>> g_packet_spans;
 static std::vector<StripSpan> g_strip_spans;
+
+// The 2D of a wide frame. The game lays it out for 4:3; on a wider picture every piece is narrowed by the same factor, and what matters is
+// where: the HUD's left part keeps to the left edge, its right part to the right edge, the middle (the mirror and its lights, 160..351, and
+// the messages) to the middle. A piece is placed by the middle of the line it belongs to, never by its own: letters of one line placed one
+// by one come apart where the line crosses from one part to the next ("Led          a lap").
+//
+// The lines are found from what was drawn, at the frame's end (resolve_wide_2d), not from the game's objects: a message that slides or grows
+// in is drawn by its animation, outside the objects' own lists, and the lines made from those lists (find_lines) never saw it. Until then the
+// layer's quads are only written down.
+struct Wide2D {
+    u32 first, count;                                       // into g_frame.vertices
+    float x0, x1, y0, y1, ox;                               // x without the target's offset
+    u32 packet, mark;                                       // the packet (its strip's spans), and what the quad shows: its texture and corner
+    bool edges;
+};
+static std::vector<Wide2D> g_wide_2d;
 
 static void unstretch_2d(u32 first, u32 data, float ox)
 {
@@ -346,7 +370,6 @@ static void unstretch_2d(u32 first, u32 data, float ox)
     if (id == 7 || id >= 8) return;
     size_t n = g_frame.vertices.size() - first;
     if (!n) return;
-    auto spans = g_packet_spans.find(data);
     bool layer = id == 0 || id == 3;
     u32 radial = LW(g_pc_ctx->r[28].w[0] - 25124);          // pTextureInfoRadialBlur
     if (!layer && g_texture && (g_texture == radial || g_texture == g_prev_texture)) return;    // the whole view, cut in four
@@ -354,22 +377,123 @@ static void unstretch_2d(u32 first, u32 data, float ox)
     size_t group = n % 6 ? n : 6;
     for (size_t at = 0; at < n; at += group) {
         NativeVertex *v = &g_frame.vertices[first + at];
-        float x0 = v[0].x, x1 = v[0].x;
-        for (size_t i = 1; i < group; i++) x0 = std::min(x0, v[i].x), x1 = std::max(x1, v[i].x);
+        float x0 = v[0].x, x1 = v[0].x, y0 = v[0].y, y1 = v[0].y;
+        for (size_t i = 1; i < group; i++) {
+            x0 = std::min(x0, v[i].x), x1 = std::max(x1, v[i].x);
+            y0 = std::min(y0, v[i].y), y1 = std::max(y1, v[i].y);
+        }
         x0 -= ox, x1 -= ox;
         // across the whole screen: a plain colour (a fade, a letterbox, a line) stays across the wide screen too; a picture keeps its shape
         if (x1 - x0 >= 400 && (!g_texture || LH(g_texture + 0x24) <= 64)) continue;
-        float mid = (x0 + x1) / 2;
-        float anchor = mid;                                 // in the view (the sun, a spark): narrowed where it is
         if (layer) {
-            float whole = mid;
-            if (spans != g_packet_spans.end())
-                for (const StripSpan &s : spans->second)
-                    if (mid >= s.x0 && mid <= s.x1) whole = (s.x0 + s.x1) / 2;
-            anchor = !edges ? 256 : whole < 150 ? 0 : whole > 352 ? 512 : 256;  // the mirror and its lights are 160..351
+            u32 st[2];
+            memcpy(st, &v[0].s, 8);
+            g_wide_2d.push_back({(u32)(first + at), (u32)group, x0, x1, y0, y1, ox, data, g_texture ^ st[0] * 31 ^ st[1] * 131, edges});
+            continue;
         }
-        for (size_t i = 0; i < group; i++) v[i].x = ox + anchor + (v[i].x - ox - anchor) * f;
+        float mid = (x0 + x1) / 2;                          // in the view (the sun, a spark): narrowed where it is
+        for (size_t i = 0; i < group; i++) v[i].x = ox + mid + (v[i].x - ox - mid) * f;
     }
+}
+
+// Where the middle of a line goes. Standing still, by the part of the screen it is in. A line that moves (a message sliding in from an
+// edge) would jump as its middle passes from one part to the next, so while it moves the two parts' places are blended over 64 pixels.
+static float wide_place(float m, bool edges, bool moving, float f)
+{
+    const float centre = 256 + (m - 256) * f;
+    if (!edges) return centre;
+    const float left = m * f, right = 512 - (512 - m) * f;
+    if (!moving) return m < 150 ? left : m > 352 ? right : centre;
+    if (m < 118) return left;
+    if (m < 182) return left + (centre - left) * (m - 118) / 64;
+    if (m <= 320) return centre;
+    if (m <= 384) return centre + (right - centre) * (m - 320) / 64;
+    return right;
+}
+
+static bool dumping();
+static void resolve_wide_2d()
+{
+    if (g_wide_2d.empty()) return;
+    const float f = native_narrow();
+    const size_t n = g_wide_2d.size();
+    // a letter's quad: the HUD's fonts are under 40 pixels a glyph, a message growing in can be larger for a moment
+    auto letter = [](const Wide2D &q) { return q.x1 - q.x0 <= 64 && q.y1 - q.y0 <= 64; };
+    std::vector<int> order(n), up(n);
+    for (size_t i = 0; i < n; i++) order[i] = up[i] = (int)i;
+    std::sort(order.begin(), order.end(), [](int a, int b) { return g_wide_2d[a].x0 < g_wide_2d[b].x0; });
+    auto root = [&](int i) {
+        while (up[i] != i) i = up[i] = up[up[i]];
+        return i;
+    };
+    // letters within a word's gap of each other across, and on the same line (or touching the next): one line. The gap goes by the letters'
+    // height, so that a large font's wider spaces are still spaces. Only letters make a line: a panel or a bar is no word of one.
+    for (size_t a = 0; a < n; a++) {
+        const Wide2D &i = g_wide_2d[order[a]];
+        if (!letter(i)) continue;
+        for (size_t b = a + 1; b < n; b++) {
+            const Wide2D &j = g_wide_2d[order[b]];
+            if (j.x0 - i.x1 >= 64) break;
+            if (!letter(j) || j.y0 > i.y1 + 4 || i.y0 > j.y1 + 4) continue;
+            if (j.x0 - i.x1 >= std::max(32.0f, 0.9f * std::max(i.y1 - i.y0, j.y1 - j.y0))) continue;
+            up[root(order[b])] = root(order[a]);
+        }
+    }
+    struct Line {
+        float lo = 1e9f, hi = -1e9f, top = 1e9f;
+        int count = 0;
+        u32 mark = 0;
+        float mark_x = 1e9f;
+        bool moving = false;
+    };
+    std::vector<Line> lines(n);
+    for (size_t i = 0; i < n; i++) {
+        const Wide2D &q = g_wide_2d[i];
+        Line &l = lines[root((int)i)];
+        l.lo = std::min(l.lo, q.x0), l.hi = std::max(l.hi, q.x1), l.top = std::min(l.top, q.y0);
+        l.count++;
+        if (q.x0 < l.mark_x) l.mark_x = q.x0, l.mark = q.mark;          // the line's first letter
+    }
+    // Does the line move? It is known from one frame to the next by its first letter, its length and its row; once seen moving it is a
+    // moving line for as long as it is there, so that it does not jump where it comes to rest either.
+    struct Seen {
+        float mid;
+        bool moving;
+    };
+    static std::unordered_map<u64, Seen> seen, now;
+    now.clear();
+    for (size_t i = 0; i < n; i++) {
+        Line &l = lines[i];
+        if (l.count < 2 || root((int)i) != (int)i) continue;
+        const u64 key = (u64)l.mark << 32 | (u32)l.count << 8 | ((u32)(l.top / 64) & 255);
+        const float mid = (l.lo + l.hi) / 2;
+        auto was = seen.find(key);
+        l.moving = was != seen.end() && (was->second.moving || std::fabs(was->second.mid - mid) > 0.25f);
+        now[key] = {mid, l.moving};
+    }
+    seen.swap(now);
+    for (size_t i = 0; i < n; i++) {
+        const Wide2D &q = g_wide_2d[i];
+        const Line &l = lines[root((int)i)];
+        const float mid = (q.x0 + q.x1) / 2;
+        float whole = mid;
+        if (l.count >= 2) {
+            whole = (l.lo + l.hi) / 2;
+        } else {
+            // a piece on its own: its strip's span, as the game's objects have it (a panel in several parts)
+            auto spans = g_packet_spans.find(q.packet);
+            if (spans != g_packet_spans.end())
+                for (const StripSpan &sp : spans->second)
+                    if (mid >= sp.x0 && mid <= sp.x1) whole = sp.whole;
+        }
+        const float place = wide_place(whole, q.edges, l.moving, f);
+        NativeVertex *v = &g_frame.vertices[q.first];
+        for (u32 k = 0; k < q.count; k++) v[k].x = q.ox + place + (v[k].x - q.ox - whole) * f;
+        if (dumping())
+            fprintf(g_hle_log, "dump 2D quad %zu x %.1f..%.1f y %.1f..%.1f %s line %d of %d, %.1f..%.1f%s -> middle %.1f at %.1f\n", i, q.x0, q.x1, q.y0, q.y1,
+                    letter(q) ? "letter" : "piece", root((int)i), l.count, l.lo, l.hi, l.moving ? " moving" : "", whole, place);
+    }
+    g_wide_2d.clear();
 }
 
 static s8 lod_k(u32 v)
@@ -422,7 +546,6 @@ static void cache_flush()
     g_cache_flushes++;
 }
 
-static bool dumping();
 static void add_strip(u32 data, u32 qwords, u32 flags)
 {
     const bool caching = g_cache_cap && !g_cache_off;
@@ -500,9 +623,10 @@ static void add_strip(u32 data, u32 qwords, u32 flags)
         d.indexed = true;
         set_draw_state(d);
         if (dumping())
-            fprintf(g_hle_log, "dump draw %zu target %u tex %s flags %x blend %d fix %g tfx %d atest %d zw %d light %d mode %u a %d\n", g_frame.draws.size(),
-                    g_draw_target, g_texture ? (const char *)host(g_texture + 8) : "-", flags, d.blend, d.blend_fix, d.tfx, d.alpha_test, d.depth_write,
-                    g_light, g_mode, tri_n ? tri[0].a : -1);
+            fprintf(g_hle_log, "dump draw %zu target %u tex %s flags %x blend %d fix %g tfx %d atest %d zw %d light %d mode %u a %d mmag %d mmin %d levels %d\n",
+                    g_frame.draws.size(), g_draw_target, g_texture ? (const char *)host(g_texture + 8) : "-", flags, d.blend, d.blend_fix, d.tfx, d.alpha_test,
+                    d.depth_write, g_light, g_mode, tri_n ? tri[0].a : -1, g_texture ? LB(g_texture + 0x6f) : -1, g_texture ? LB(g_texture + 0x70) : -1,
+                    d.tex ? d.tex->levels : 0);
         d.snap_x = (float)(LW(g_target_ptr + 0x1c) / 2);
         d.snap_y = (float)(LW(g_target_ptr + 0x20) / 2);
         g_frame.draws.push_back(d);
@@ -576,10 +700,17 @@ static void target_offset(u32 target, u32 mode, float &ox, float &oy)
 }
 
 // HP2_NATIVEDUMP=<frame>: that frame's 2D packets and POLY3D, for what does not line up with the old path
+static std::atomic<u32> g_dump_at{~0u};
+void native_dump_next()
+{
+    g_dump_at = g_frame_no + 2;
+    fprintf(g_hle_log, "native: F11, dumping frame %u\n", g_frame_no + 2);
+}
+bool native_dumping_now() { return g_dump_at == g_frame_no; }
 static bool dumping()
 {
     static const int at = getenv("HP2_NATIVEDUMP") ? atoi(getenv("HP2_NATIVEDUMP")) : -1;
-    return at >= 0 && (int)g_frame_no == at;
+    return (at >= 0 && (int)g_frame_no == at) || g_dump_at == g_frame_no;
 }
 
 static void add_direct(u32 data, u32 qwords)
@@ -819,6 +950,27 @@ static void add_direct(u32 data, u32 qwords)
         if (g_texture && g_texture == g_rvm_texture && LW(g_target) != 7) trim_mirror(first_vertex);
     }
     if (g_frame.wide) unstretch_2d(first_vertex, data, ox);
+    {   // TEMP: HP2_MIRRORFXLOG=1, the particles in the mirror
+        static const bool on = getenv("HP2_MIRRORFXLOG") != nullptr;
+        if ((on || dumping()) && LW(g_target) == 7 && g_texture && strncmp((const char *)host(g_texture + 8), "RVM", 3)) {
+            size_t n = g_frame.vertices.size() - first_vertex;
+            float best = 0, z0 = 1e30f, z1 = -1e30f, cover = 0;
+            for (size_t at = 0; at + 6 <= n; at += 6) {
+                const NativeVertex *v = &g_frame.vertices[first_vertex + at];
+                float x0 = v[0].x, x1 = v[0].x, y0 = v[0].y, y1 = v[0].y;
+                for (int i = 0; i < 6; i++) {
+                    x0 = std::min(x0, v[i].x), x1 = std::max(x1, v[i].x), y0 = std::min(y0, v[i].y), y1 = std::max(y1, v[i].y);
+                    z0 = std::min(z0, v[i].z), z1 = std::max(z1, v[i].z);
+                }
+                float cx0 = std::max(x0 - ox, 0.0f), cx1 = std::min(x1 - ox, w), cy0 = std::max(y0 - oy, 0.0f), cy1 = std::min(y1 - oy, h);
+                float f = cx1 > cx0 && cy1 > cy0 ? (cx1 - cx0) * (cy1 - cy0) / (w * h) : 0;
+                best = std::max(best, f);
+                cover += f;
+            }
+            fprintf(g_hle_log, "mfx: frame %u %s sprites %zu biggest %.2f of the mirror, sum %.2f, z %g..%g, alpha %d\n", g_frame_no,
+                    (const char *)host(g_texture + 8), n / 6, best, cover, z0, z1, n ? g_frame.vertices[first_vertex].a : -1);
+        }
+    }
     g_clip_new = true;
 }
 
@@ -980,7 +1132,10 @@ void native_end_frame()
             n[0] = n[1] = 0;
         }
     }
+    resolve_wide_2d();
+    window_cursor_frame();
     native_vk_draw(g_frame);
+    g_aspect_now = pc_aspect();
     g_frame.list_ms = 0;
     if (!g_frame.uploaded) cache_flush();
     // the next frame's cache: emptied before it can fill up within a frame
@@ -1006,6 +1161,7 @@ void native_end_frame()
     g_frame.lights.clear();
     g_frame.fx.clear();
     g_packet_spans.clear();
+    g_wide_2d.clear();
     g_light_ctx = g_light_mat = 0;
     g_light = -1;
     g_target = g_pack = g_local = g_mode = g_texture = 0;
@@ -1149,27 +1305,109 @@ void HOOK_FetchVRAM__FP12eRenderStage(Ctx &c, void (*orig)(Ctx &))
     }
 }
 
+// A Flailer poly's box: the polys are a list at +36 of a strip, their vertices' x and y at +0x10 and +0x14 of each 16 bytes
+struct PolyBox {
+    u32 poly;
+    float x0, x1, y0, y1;
+};
+static PolyBox poly_box(u32 p)
+{
+    PolyBox b = {p, 1e9f, -1e9f, 1e9f, -1e9f};
+    for (int i = 0; i < 4; i++) {
+        float x, y;
+        memcpy(&x, host(p + 0x10 + i * 16), 4);
+        memcpy(&y, host(p + 0x14 + i * 16), 4);
+        b.x0 = std::min(b.x0, x), b.x1 = std::max(b.x1, x);
+        b.y0 = std::min(b.y0, y), b.y1 = std::max(b.y1, y);
+    }
+    return b;
+}
+
+// The lines of text on the screen: one message is often several objects, a word each ("LED" "A LAP" "+1000"), and each is a strip of
+// its own. Narrowed one by one, the words of a line sat at different anchors (the screen's middle and its right edge) and came apart. So
+// the polys of all strips, of every layer, are put together into lines first, as a frame's first RenderLayer comes: polys within
+// 32 pixels across and touching up and down are one line, and every poly gets the middle of its line.
+static std::unordered_map<u32, float> g_poly_line;
+
+// a letter's quad: the HUD's fonts are well under 40 pixels a glyph
+static bool glyph(const PolyBox &b) { return b.x1 - b.x0 <= 40 && b.y1 - b.y0 <= 40; }
+static u32 g_lines_frame = ~0u;
+
+static void find_lines(u32 manager)
+{
+    std::vector<PolyBox> boxes;
+    for (int layer = 0; layer < 29; layer++) {
+        u32 head = manager + layer * 8;
+        int strips = 0;
+        for (u32 st = LW(head); st != head && st && strips < 4096; st = LW(st), strips++) {
+            u32 polys = st + 36;
+            int n = 0;
+            for (u32 p = LW(polys); p != polys && p && n < 4096; p = LW(p), n++) boxes.push_back(poly_box(p));
+        }
+    }
+    // union-find over the boxes, sorted by x so that only neighbours across are looked at
+    std::sort(boxes.begin(), boxes.end(), [](const PolyBox &a, const PolyBox &b) { return a.x0 < b.x0; });
+    std::vector<int> up(boxes.size());
+    for (size_t i = 0; i < up.size(); i++) up[i] = (int)i;
+    auto root = [&](int i) {
+        while (up[i] != i) i = up[i] = up[up[i]];
+        return i;
+    };
+    for (size_t i = 0; i < boxes.size(); i++)
+        for (size_t j = i + 1; j < boxes.size() && boxes[j].x0 - boxes[i].x1 < 32; j++) {
+            // a gap in x under 32 (or overlap), and in y no more than 4: the same line, or the line under it
+            if (boxes[j].y0 > boxes[i].y1 + 4 || boxes[i].y0 > boxes[j].y1 + 4) continue;
+            // only letters make a line: a backdrop, a bar or a panel is no word of one, and through it the lights under the mirror took the
+            // right edge's anchor from the panel beside them
+            if (!glyph(boxes[i]) || !glyph(boxes[j])) continue;
+            up[root((int)j)] = root((int)i);
+        }
+    std::vector<float> lo(boxes.size(), 1e9f), hi(boxes.size(), -1e9f);
+    for (size_t i = 0; i < boxes.size(); i++) {
+        int r = root((int)i);
+        lo[r] = std::min(lo[r], boxes[i].x0), hi[r] = std::max(hi[r], boxes[i].x1);
+    }
+    g_poly_line.clear();
+    for (size_t i = 0; i < boxes.size(); i++) {
+        if (!glyph(boxes[i])) continue;                     // the rest keeps its strip's own span, as before
+        int r = root((int)i);
+        g_poly_line[boxes[i].poly] = (lo[r] + hi[r]) / 2;
+    }
+}
+
+void HOOK_RenderLayer__20FlailerRenderManageriP5eView(Ctx &c, void (*orig)(Ctx &))
+{
+    if (g_lines_frame != g_frame_no) {
+        g_lines_frame = g_frame_no;
+        if (g_frame.wide) find_lines(c.r[4].w[0]);
+        else g_poly_line.clear();
+    }
+    orig(c);
+}
+
 void HOOK_Render__12FlailerStripP5eView(Ctx &c, void (*orig)(Ctx &))
 {
-    // the polys are a list at +36, their vertices' x at +0x10 of each 16 bytes
     u32 strip = c.r[4].w[0], head = strip + 36;
     std::vector<StripSpan> polys;
     for (u32 p = LW(head); p != head && p; p = LW(p)) {
-        StripSpan s = {1e9f, -1e9f};
-        for (int i = 0; i < 4; i++) {
-            float x;
-            memcpy(&x, host(p + 0x10 + i * 16), 4);
-            s.x0 = std::min(s.x0, x), s.x1 = std::max(s.x1, x);
-        }
-        polys.push_back(s);
+        PolyBox b = poly_box(p);
+        auto line = g_poly_line.find(p);
+        polys.push_back({b.x0, b.x1, line != g_poly_line.end() ? line->second : 1e9f});
     }
     std::sort(polys.begin(), polys.end(), [](const StripSpan &a, const StripSpan &b) { return a.x0 < b.x0; });
     g_strip_spans.clear();
     for (const StripSpan &s : polys) {
         // the gaps inside a text are well under this, the lights and the right panel are 60 pixels apart
-        if (!g_strip_spans.empty() && s.x0 - g_strip_spans.back().x1 < 32) g_strip_spans.back().x1 = std::max(g_strip_spans.back().x1, s.x1);
-        else g_strip_spans.push_back(s);
+        if (!g_strip_spans.empty() && s.x0 - g_strip_spans.back().x1 < 32) {
+            StripSpan &last = g_strip_spans.back();
+            last.x1 = std::max(last.x1, s.x1);
+            if (last.whole > 1e8f) last.whole = s.whole;
+        } else {
+            g_strip_spans.push_back(s);
+        }
     }
+    for (StripSpan &s : g_strip_spans)
+        if (s.whole > 1e8f) s.whole = (s.x0 + s.x1) / 2;   // a strip the lines did not see (drawn outside RenderLayer)
     orig(c);
     g_strip_spans.clear();
 }
@@ -1344,11 +1582,14 @@ static void speed_log(Ctx &c)
 // whatever the frame rate. Think alone sees the counter so made; the collisions and the replay use the real one.
 void HOOK_Think__15AICarControllerf(Ctx &c, void (*orig)(Ctx &))
 {
-    if (g_cfg.frame_rate != 60) {
+    const u32 gp = c.r[28].w[0], rc = LW(gp - 22216);
+    // the attract demo (RCSTATE_REPLAY_DEMO_MODE) is a PS2 recording, its racers' thinking that of 30 frames; a replay made here thinks as it
+    // was made
+    if (g_cfg.frame_rate != 60 || (rc && LW(rc) == 9)) {
         orig(c);
         return;
     }
-    const u32 gp = c.r[28].w[0], world = LW(gp - 22120), car = LW(c.r[4].w[0]);
+    const u32 world = LW(gp - 22120), car = LW(c.r[4].w[0]);
     const int first = (int)LW(world + 32), count = (int)LW(world + 36) - first;
     int me = -1;
     for (int i = 0; i < count && i < 8; i++)
@@ -1477,6 +1718,105 @@ void HOOK_WhatSectionsShouldWeDraw__20GrandSceneryCullInfoPsiP15SceneryCullInfo(
     c.r[2].d[0] = (u64)(s64)count;
 }
 
+// ---- the scenery's draw table ------------------------------------------------------------------
+// What the culling keeps of the scenery goes into one table for all the views, SceneryDrawInfoTable at 0x2f0ca8 up to 0x2f8fe8: 4200
+// entries of 8 bytes. DoCulling hands it to the views in turn, the player's first, the mirror's after; DrawAScenery adds nothing once a
+// view's pCurrentDrawInfo (+140 of its SceneryCullInfo) reaches pTopDrawInfo (+144). The PS2's distance fitted. The draw distance and the
+// most detailed models let the player's view take all of it in the thicker places, and the mirror kept only its sky (which is not
+// scenery): no road, no objects. So the first view of a frame starts the table again in the PC's memory past 32 MB, with room for a
+// million entries, and each next view goes on where the last stopped, as in DoCulling; StuffScenery reads each view's own first..current.
+static const u32 kOldDrawTable = 0x2f0ca8, kDrawTableOff = 0x0C000000, kDrawTableEntries = 1u << 20;
+static u32 g_draw_table_peak;
+
+void HOOK_CullView__20GrandSceneryCullInfoP15SceneryCullInfo(Ctx &c, void (*orig)(Ctx &))
+{
+    static const bool ready = ext_commit(kDrawTableOff, kDrawTableEntries * 8);
+    const u32 cull = c.r[5].w[0], table = EXT_BASE + kDrawTableOff, end = table + kDrawTableEntries * 8;
+    if (ready) {
+        if (LW(cull + 140) == kOldDrawTable) {              // the frame's first view
+            SW(cull + 136, table);
+            SW(cull + 140, table);
+        }
+        const u32 cur = LW(cull + 140);
+        if (cur >= table && cur < end) SW(cull + 144, end);
+    }
+    orig(c);
+    const u32 cur = LW(cull + 140);
+    if (cur >= table && cur <= end) {
+        const u32 used = (cur - table) / 8;
+        if (used > g_draw_table_peak) g_draw_table_peak = used;
+        if (cur == end) {
+            static bool told;
+            if (!told) fprintf(g_hle_log, "native: the scenery's draw table is full (%u entries)\n", kDrawTableEntries);
+            told = true;
+        }
+    }
+}
+
+// ---- the frame malloc buffers ---------------------------------------------------------------
+// eDmaDataList::AddData and the rest of a frame's lists take their nodes from one of two halves (bMalloc'd, 1.6 MB each on the PS2);
+// when a half is full, AddData adds nothing (FrameMallocFailed). The draw distance and the most detailed models take a race to 1.3 MB of
+// it at 200 %, more at 400 %. So the halves live in the PC's memory past 32 MB (ps2.h): 64 MB each, and a frame that still ran out
+// doubles them for the next ones, up to 96 MB each. A half grows in place (each has its 96 MB of addresses), so what the other half's
+// frame holds does not move. The last 32 MB of that memory are the scenery's draw table (HOOK_CullView).
+static const u32 kFrameHalfStart = 64u << 20, kFrameHalfMax = 96u << 20;
+static bool g_frame_ext;
+
+static bool frame_halves(u32 size)
+{
+    return ext_commit(0, size) && ext_commit(kFrameHalfMax, size);
+}
+
+void HOOK_eAllocateFrameMallocBuffers__FUi(Ctx &c, void (*orig)(Ctx &))
+{
+    const u32 gp = c.r[28].w[0], wanted = c.r[4].w[0];
+    if (!frame_halves(kFrameHalfStart)) {
+        fprintf(g_hle_log, "native: no memory past 32 MB, the frame buffers are the game's (%u bytes)\n", wanted);
+        orig(c);
+        return;
+    }
+    const u32 a = EXT_BASE, b = EXT_BASE + kFrameHalfMax;
+    SW(gp - 19320, a);                                      // FrameMemoryBuffer[0]
+    SW(gp - 19316, b);                                      // FrameMemoryBuffer[1]
+    SW(gp - 19392, kFrameHalfStart);                        // FrameMemoryBufferSize
+    SW(gp - 19388, a);                                      // CurrentBufferPos
+    SW(gp - 19384, a + kFrameHalfStart);                    // CurrentBufferEnd
+    SW(gp - 19376, 0);                                      // FrameMallocAllocNum
+    g_frame_ext = true;
+    fprintf(g_hle_log, "native: frame buffers 2 x %u MB past 32 MB (the game asked for %u bytes)\n", kFrameHalfStart >> 20, wanted);
+}
+
+void HOOK_eFreeFrameMallocBuffers__Fv(Ctx &c, void (*orig)(Ctx &))
+{
+    if (!g_frame_ext) {
+        orig(c);
+        return;
+    }
+    const u32 gp = c.r[28].w[0];
+    for (int off : {19320, 19316, 19392, 19388, 19384, 19376}) SW(gp - (u32)off, 0);
+    g_frame_ext = false;                                    // the memory stays committed for the next allocation
+}
+
+void HOOK_eSwapFrameMallocBuffers__Fv(Ctx &c, void (*orig)(Ctx &))
+{
+    const u32 gp = c.r[28].w[0];
+    if (g_frame_ext && LW(gp - 19372)) {                    // FrameMallocFailed: this frame lost some of its lists
+        const u32 size = LW(gp - 19392), short_by = LW(gp - 19368);
+        u32 grown = size;
+        while (grown < kFrameHalfMax && grown < size + short_by * 2) grown = std::min(grown * 2, kFrameHalfMax);
+        if (grown > size && frame_halves(grown)) {
+            SW(gp - 19392, grown);
+            fprintf(g_hle_log, "native: a frame's lists ran %u bytes past %u MB, the frame buffers are now 2 x %u MB\n", short_by, size >> 20,
+                    grown >> 20);
+        } else {
+            static bool told;
+            if (!told) fprintf(g_hle_log, "native: a frame's lists ran %u bytes past %u MB, the frame buffers cannot grow\n", short_by, size >> 20);
+            told = true;
+        }
+    }
+    orig(c);
+}
+
 void HOOK_eDisplayFrame__Fv(Ctx &c, void (*orig)(Ctx &))
 {
     g_pc_ctx = &c;
@@ -1485,6 +1825,39 @@ void HOOK_eDisplayFrame__Fv(Ctx &c, void (*orig)(Ctx &))
     pc_paint_buttons();         // the device changes in a race too
     g_frame.wide = native_narrow() < 1 && pc_racing();
     car_detail();
+    // TEMP diagnostics (HP2_FRAMEMEM=1): the frame malloc buffer and the mirror's draws, for the mirror that shows only the sky
+    static const bool diag = getenv("HP2_FRAMEMEM") != nullptr;
+    if (diag) {
+        const u32 gp = c.r[28].w[0];
+        static u32 peak, fails, last_fail_frame;
+        u32 used = LW(gp - 19312), failed = LW(gp - 19372), fail = LW(gp - 19368);
+        if (used > peak) peak = used;
+        if (failed) {
+            fails++;
+            if (g_frame_no - last_fail_frame >= 30) {
+                fprintf(g_hle_log, "framemem: FAILED frame %u: %u bytes short (frames failed so far %u), used %u of %u\n", g_frame_no, fail, fails,
+                        LW(gp - 19388) - LW(gp - 19320), LW(gp - 19392));
+                fflush(g_hle_log);
+                last_fail_frame = g_frame_no;
+            }
+        }
+        if (g_frame_no % 300 == 0) {
+            fprintf(g_hle_log, "framemem: frame %u half %u used %u peak %u failed frames %u maxfail %u free %u largest %u dd %d detail %d, scenery table peak %u (the PS2's 4200)\n", g_frame_no,
+                    LW(gp - 19392), used, peak, fails, LW(gp - 19364), pc_call(0x257988, 0), pc_call(0x2579b0, 0), g_cfg.draw_distance, g_cfg.max_detail, g_draw_table_peak);
+            fflush(g_hle_log);
+        }
+    }
     orig(c);
+    if (diag && pc_racing()) {
+        u32 draws = 0, verts = 0;
+        for (const NativeDraw &d : g_frame.draws)
+            if (d.target == 7) draws++, verts += d.count;
+        static u32 last_low;
+        if ((draws < 12 && g_frame_no - last_low >= 30) || g_frame_no % 300 == 0) {
+            fprintf(g_hle_log, "mirror: frame %u draws %u vertices %u%s\n", g_frame_no, draws, verts, draws < 12 ? "  <-- few" : "");
+            fflush(g_hle_log);
+            if (draws < 12) last_low = g_frame_no;
+        }
+    }
     native_end_frame();
 }

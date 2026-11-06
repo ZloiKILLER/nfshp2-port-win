@@ -31,12 +31,17 @@ __attribute__((always_inline)) static inline v4f clamp4(v4f v)
     v4i special = ((v4i)v & 0x7fffffff) > 0x7f7fffff;
     u64 w[2];
     memcpy(w, &special, 16);
-    if (__builtin_expect(w[0] | w[1], 0))
+    if (__builtin_expect((w[0] | w[1]) != 0, 0))
         for (int i = 0; i < 4; i++) v[i] = fclamp(v[i]);
     return v;
 }
 
 #define SPLAT(v, k) __builtin_shufflevector(v, v, k, k, k, k)
+
+// the EE's add, sub and mul (eefloat.h), four lanes at once
+__attribute__((always_inline)) static inline v4f vadd(v4f a, v4f b) { return ee_add4(a, b); }
+__attribute__((always_inline)) static inline v4f vsub(v4f a, v4f b) { return ee_sub4(a, b); }
+__attribute__((always_inline)) static inline v4f vmul(v4f a, v4f b) { return ee_mul4(a, b); }
 
 struct Mat {
     v4f r[4];
@@ -50,15 +55,15 @@ __attribute__((always_inline)) static inline Mat load_mat(u32 a)
 // the three axes as the game accumulates them
 __attribute__((always_inline)) static inline v4f axes(const Mat &m, v4f v)
 {
-    v4f acc = clamp4(m.r[0] * SPLAT(v, 0));
-    acc = clamp4(acc + m.r[1] * SPLAT(v, 1));
-    return clamp4(acc + m.r[2] * SPLAT(v, 2));
+    v4f acc = vmul(m.r[0], SPLAT(v, 0));
+    acc = vadd(acc, vmul(m.r[1], SPLAT(v, 1)));
+    return vadd(acc, vmul(m.r[2], SPLAT(v, 2)));
 }
 
-static inline v4f mul4(const Mat &m, v4f v) { return clamp4(axes(m, v) + m.r[3] * SPLAT(v, 3)); }
+static inline v4f mul4(const Mat &m, v4f v) { return vadd(axes(m, v), vmul(m.r[3], SPLAT(v, 3))); }
 
 // v.w taken as 1: VF0.w
-__attribute__((always_inline)) static inline v4f mul_point(const Mat &m, v4f v) { return clamp4(axes(m, v) + m.r[3]); }
+__attribute__((always_inline)) static inline v4f mul_point(const Mat &m, v4f v) { return vadd(axes(m, v), m.r[3]); }
 
 // VCLIP with w: +x -x +y -y +z -z from the low bit
 __attribute__((always_inline)) static inline u32 clip_flags(v4f v)
@@ -126,8 +131,8 @@ void HOOK_eRotTransPers__FP8bVector4P8bMatrix4T0(Ctx &c, void (*orig)(Ctx &))
     if (g_irq_pending) ps2_take_interrupts(c);
     u32 dest = c.r[4].w[0];
     v4f v = mul_point(load_mat(c.r[5].w[0]), load(c.r[6].w[0]));
-    float w = v[3], q = w == 0.0f ? 3.4028235e38f : fclamp(1.0f / w);
-    v4f out = clamp4(v * q);
+    float w = v[3], q = ee_div(1.0f, w);
+    v4f out = vmul(v, v4f{q, q, q, q});
     out[3] = w;
     if (g_check) {
         check_vec(c, orig, 2, "eRotTransPers", dest, &out, 1);
@@ -168,7 +173,7 @@ void HOOK_bMulMatrix__FP8bVector3PC8bMatrix4PC8bVector3(Ctx &c, void (*orig)(Ctx
     if (g_irq_pending) ps2_take_interrupts(c);
     u32 dest = c.r[4].w[0];
     // a constant at 0x320a60 gives the vector its w, and its xyz is added
-    v4f k = load(0x320a60), v = clamp4(k + load(c.r[6].w[0]));
+    v4f k = load(0x320a60), v = vadd(k, load(c.r[6].w[0]));
     v[3] = k[3];
     v4f out = mul4(load_mat(c.r[5].w[0]), v);
     if (g_check) {
@@ -180,21 +185,37 @@ void HOOK_bMulMatrix__FP8bVector3PC8bMatrix4PC8bVector3(Ctx &c, void (*orig)(Ctx
 
 // src/AcidFXE.cpp. Its fInvertMatrix written the same way differed from the generated code in most calls (1.49 of 1.6 million) and is not here.
 #define M(r, c) (((float (*)[4])m)[r][c])
+// the products as the generated code has them, (a * b) * (c * d), and the sum from the left
+#define P(r0, c0, r1, c1, r2, c2, r3, c3) ee_mul(ee_mul(M(r0, c0), M(r1, c1)), ee_mul(M(r2, c2), M(r3, c3)))
 static inline float fDeterminant(float *m)
 {
-    return (M(0, 3) * M(3, 0)) * (M(2, 1) * M(1, 2)) - (M(0, 2) * M(3, 0)) * (M(2, 1) * M(1, 3))
-         - (M(0, 3) * M(3, 0)) * (M(2, 2) * M(1, 1)) + (M(0, 1) * M(3, 0)) * (M(2, 2) * M(1, 3))
-         + (M(0, 2) * M(3, 0)) * (M(2, 3) * M(1, 1)) - (M(0, 1) * M(3, 0)) * (M(2, 3) * M(1, 2))
-         - (M(0, 3) * M(3, 1)) * (M(2, 0) * M(1, 2)) + (M(0, 2) * M(3, 1)) * (M(2, 0) * M(1, 3))
-         + (M(0, 3) * M(3, 1)) * (M(2, 2) * M(1, 0)) - (M(0, 0) * M(3, 1)) * (M(2, 2) * M(1, 3))
-         - (M(0, 2) * M(3, 1)) * (M(2, 3) * M(1, 0)) + (M(0, 0) * M(3, 1)) * (M(2, 3) * M(1, 2))
-         + (M(0, 3) * M(3, 2)) * (M(2, 0) * M(1, 1)) - (M(0, 1) * M(3, 2)) * (M(2, 0) * M(1, 3))
-         - (M(0, 3) * M(3, 2)) * (M(2, 1) * M(1, 0)) + (M(0, 0) * M(3, 2)) * (M(2, 1) * M(1, 3))
-         + (M(0, 1) * M(3, 2)) * (M(2, 3) * M(1, 0)) - (M(0, 0) * M(3, 2)) * (M(2, 3) * M(1, 1))
-         - (M(0, 2) * M(3, 3)) * (M(2, 0) * M(1, 1)) + (M(0, 1) * M(3, 3)) * (M(2, 0) * M(1, 2))
-         + (M(0, 2) * M(3, 3)) * (M(2, 1) * M(1, 0)) - (M(0, 0) * M(3, 3)) * (M(2, 1) * M(1, 2))
-         - (M(0, 1) * M(3, 3)) * (M(2, 2) * M(1, 0)) + (M(0, 0) * M(3, 3)) * (M(2, 2) * M(1, 1));
+    float d = P(0, 3, 3, 0, 2, 1, 1, 2);
+    d = ee_sub(d, P(0, 2, 3, 0, 2, 1, 1, 3));
+    d = ee_sub(d, P(0, 3, 3, 0, 2, 2, 1, 1));
+    d = ee_add(d, P(0, 1, 3, 0, 2, 2, 1, 3));
+    d = ee_add(d, P(0, 2, 3, 0, 2, 3, 1, 1));
+    d = ee_sub(d, P(0, 1, 3, 0, 2, 3, 1, 2));
+    d = ee_sub(d, P(0, 3, 3, 1, 2, 0, 1, 2));
+    d = ee_add(d, P(0, 2, 3, 1, 2, 0, 1, 3));
+    d = ee_add(d, P(0, 3, 3, 1, 2, 2, 1, 0));
+    d = ee_sub(d, P(0, 0, 3, 1, 2, 2, 1, 3));
+    d = ee_sub(d, P(0, 2, 3, 1, 2, 3, 1, 0));
+    d = ee_add(d, P(0, 0, 3, 1, 2, 3, 1, 2));
+    d = ee_add(d, P(0, 3, 3, 2, 2, 0, 1, 1));
+    d = ee_sub(d, P(0, 1, 3, 2, 2, 0, 1, 3));
+    d = ee_sub(d, P(0, 3, 3, 2, 2, 1, 1, 0));
+    d = ee_add(d, P(0, 0, 3, 2, 2, 1, 1, 3));
+    d = ee_add(d, P(0, 1, 3, 2, 2, 3, 1, 0));
+    d = ee_sub(d, P(0, 0, 3, 2, 2, 3, 1, 1));
+    d = ee_sub(d, P(0, 2, 3, 3, 2, 0, 1, 1));
+    d = ee_add(d, P(0, 1, 3, 3, 2, 0, 1, 2));
+    d = ee_add(d, P(0, 2, 3, 3, 2, 1, 1, 0));
+    d = ee_sub(d, P(0, 0, 3, 3, 2, 1, 1, 2));
+    d = ee_sub(d, P(0, 1, 3, 3, 2, 2, 1, 0));
+    d = ee_add(d, P(0, 0, 3, 3, 2, 2, 1, 1));
+    return d;
 }
+#undef P
 
 void HOOK_fDeterminant__FP8bMatrix4(Ctx &c, void (*orig)(Ctx &))
 {
@@ -223,12 +244,12 @@ void HOOK_ClassifyAABB__FPC8bVector4T0PC8bMatrix4(Ctx &c, void (*orig)(Ctx &))
     if (g_irq_pending) ps2_take_interrupts(c);
     v4f lo = load(c.r[4].w[0]), hi = load(c.r[5].w[0]);
     Mat m = load_mat(c.r[6].w[0]);
-    v4f size = clamp4(hi - lo);
+    v4f size = vsub(hi, lo);
     v4f p0 = mul_point(m, lo);
-    v4f x = clamp4(m.r[0] * SPLAT(size, 0)), y = clamp4(m.r[1] * SPLAT(size, 1)), z = clamp4(m.r[2] * SPLAT(size, 2));
-    v4f p1 = clamp4(p0 + x), p2 = clamp4(p1 + y), p3 = clamp4(p0 + y);
+    v4f x = vmul(m.r[0], SPLAT(size, 0)), y = vmul(m.r[1], SPLAT(size, 1)), z = vmul(m.r[2], SPLAT(size, 2));
+    v4f p1 = vadd(p0, x), p2 = vadd(p1, y), p3 = vadd(p0, y);
     v4f near_corners[4] = {p0, p1, p2, p3};
-    v4f far_corners[4] = {clamp4(p0 + z), clamp4(p1 + z), clamp4(p2 + z), clamp4(p3 + z)};
+    v4f far_corners[4] = {vadd(p0, z), vadd(p1, z), vadd(p2, z), vadd(p3, z)};
     u32 any = 0, all = 63;
     for (int i = 0; i < 4; i++) {
         u32 a = clip_flags(near_corners[i]), b = clip_flags(far_corners[i]);

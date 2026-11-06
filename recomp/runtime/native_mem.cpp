@@ -16,6 +16,8 @@ static inline u8 *span(u32 a, u32 n)
         return p + (u64)n <= 0x4000 ? g_spr + p : nullptr;
     }
     if (top != 0 && top != 2 && top != 3) return nullptr;
+    const u32 e = (a & 0x0FFFFFFF) - EXT_BASE;              // the PC's memory past 32 MB (ps2.h)
+    if (e < g_ext_size) return e + (u64)n <= g_ext_size ? g_ext + e : nullptr;
     const u32 p = a & (top ? 0x01FFFFFF : 0x0FFFFFFF);
     return p + (u64)n <= 0x02000000 ? g_ram + p : nullptr;
 }

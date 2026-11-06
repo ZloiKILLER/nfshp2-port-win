@@ -75,7 +75,10 @@ Window	Fönster
 Window or borderless fullscreen. Alt+Enter switches too.	Fönster eller kantlös helskärm. Alt+Enter växlar också.
 The size of the window. Fullscreen fills the monitor.	Fönstrets storlek. Helskärm fyller skärmen.
 Aspect Ratio	Bildformat
-The race's picture; the menus stay 4:3.	Bilden under lopp; menyerna förblir 4:3.
+The race's picture, no wider than the window. The menus stay 4:3.	Loppets bild, inte bredare än fönstret. Menyerna förblir 4:3.
+A 4:3 window shows the race in 4:3. A wider one has the wider pictures.	Ett 4:3-fönster visar loppet i 4:3. Ett bredare har de bredare bilderna.
+Fullscreen is the monitor's own resolution. Windowed has the sizes.	Helskärm har skärmens egen upplösning. I fönster finns storlekarna.
+On: each frame waits for the screen, no tearing. Off: shown at once.	På: varje bild väntar på skärmen, inga revor. Av: visas direkt.
 Render Scale	Renderingsskala
 The picture's detail, times the PS2's 512 x 448.	Bildens detaljer, gånger PS2:ans 512 x 448.
 Scaling	Skalning
@@ -83,7 +86,9 @@ How the picture is scaled to the window.	Hur bilden skalas till fönstret.
 Anti-Aliasing	Kantutjämning
 Smoother edges.	Mjukare kanter.
 Anisotropic Filtering	Anisotropisk filtrering
-Sharper textures far away.	Skarpare texturer på avstånd.
+Sharper textures far away, on everything in the world.	Skarpare texturer på avstånd, på allt i världen.
+This graphics card has no anti-aliasing for the game.	Det här grafikkortet har ingen kantutjämning för spelet.
+This graphics card has no anisotropic filtering.	Det här grafikkortet har ingen anisotropisk filtrering.
 Brightness	Ljusstyrka
 Lighter or darker, all over.	Ljusare eller mörkare, överallt.
 Contrast	Kontrast

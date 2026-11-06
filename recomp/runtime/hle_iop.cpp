@@ -268,11 +268,28 @@ void HLE_sceSifCallRpc(Ctx &c)
         LOG("RPC call server %08x fn %u send %08x/%u recv %08x/%u (ra %08x)\n", sid, fno,
             T0 ? A3 : 0, T0, recv, rsize, c.r[31].w[0]);
     if (sid == SOUND_SID) snd_log_packet(fno, A3, T0, c.r[31].w[0]);
-    if (iop_has_server(sid))
+    if (iop_has_server(sid)) {
         iop_call_rpc(sid, fno, A3, T0, recv, rsize);
-    // no server runs on our side: answer with zeros (success for most of them)
-    else if (recv && rsize && rsize < 0x100000)
+        // HP2_SNDLOG: the driver's answer too (its first 256 bytes: the channels' and streams' status), the words that changed since the last
+        FILE *f = sid == SOUND_SID && recv && rsize ? snd_log() : nullptr;
+        if (f) {
+            static u16 last[128];
+            const u32 n = std::min<u32>(rsize / 2, 128);
+            bool any = false;
+            for (u32 i = 0; i < n; i++) {
+                const u16 w = LH(recv + 2 * i);
+                if (w == last[i]) continue;
+                if (!any) fprintf(f, "%9.3f reply:", snd_time());
+                any = true;
+                fprintf(f, " [%u]=%04x", i, w);
+                last[i] = w;
+            }
+            if (any) fprintf(f, "\n");
+        }
+    } else if (recv && rsize && rsize < 0x100000) {
+        // no server runs on our side: answer with zeros (success for most of them)
         for (u32 i = 0; i < rsize; i++) SB(recv + i, 0);
+    }
     call_guest(c, endf, endp);
     RET(0);
 }

@@ -17,7 +17,8 @@ struct NativeVertex {
 struct NativeTexture {
     int w = 0, h = 0;               // the GS's: 2^TW, 2^TH, what ST 1.0 means. The image's own size can be less
     int image_w = 0, image_h = 0;
-    int levels = 1;
+    int levels = 1;                 // the game's own
+    int gpu_levels = 1;             // what the GPU's image has: the game's, or all of them down to one texel (native_vk's more_levels)
     std::vector<uint32_t> px;       // until the Vulkan side has it: the levels one after another
     std::vector<uint8_t> font_alpha;  // the fonts' level 0: their glyphs' seams are looked for here (native.cpp)
     uint32_t sum = 0, frame = 0;
@@ -116,5 +117,8 @@ void native_texture_take_time(double &ms, uint32_t &decoded);   // the time nati
 // native_vk.cpp
 bool native_vk_draw(const NativeFrame &frame);
 float native_narrow();                      // 4:3 over the race's aspect: 1 or less
+int native_aspect();                        // that aspect, 0 4:3, 1 16:10, 2 16:9: this frame's
+void native_dump_next();                    // TEMP (HP2_F11DUMP): the frame after next dumped, its draws and pictures
+bool native_dumping_now();
 // the last frame's depth over a rect of depth_rects, the GS's PSMZ24 words: false if it has not been read
 bool native_vk_depth(const NativeDepthRect &r, uint32_t *out);

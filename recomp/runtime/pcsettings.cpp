@@ -69,6 +69,14 @@ static int pc_next_power(int now, int top, int d)
     return now == 0 ? 2 : now >= top ? 0 : now * 2;
 }
 
+// the most the graphics card has: 0 of multisampling, 1 of anisotropy; all of the setting's range until the renderer knows
+static int gpu_limit(int what)
+{
+    int aa = 8, aniso = 16;
+    native_vk_limits(aa, aniso);
+    return what ? aniso : aa;
+}
+
 static void binding_page(const char *name, const char *title, bool pad, bool p2 = false)
 {
     PcPage &p = pc_add_page(name, title);
@@ -337,6 +345,8 @@ void pc_settings_register()
                           g_cfg.frame_rate = g_cfg.frame_rate == 60 ? 30 : 60;
                           pc_config_save();
                       }});
+    v.rows.push_back({"VSync", "On: each frame waits for the screen, no tearing. Off: shown at once.",
+                      [] { return onoff(g_cfg.vsync); }, [](int) { g_cfg.vsync ^= 1; pc_config_save(); }});
     v.rows.push_back({"Draw Distance", "How far away scenery still shows. 100% is the PS2's.",
                       [] { return std::to_string(g_cfg.draw_distance) + "%"; },
                       [](int d) {
@@ -362,21 +372,49 @@ void pc_settings_register()
     res.rows.push_back({"Window", "Window or borderless fullscreen. Alt+Enter switches too.",
                       [] { return std::string(g_cfg.fullscreen ? "Fullscreen" : "Windowed"); },
                       [](int) { window_set_fullscreen(!g_cfg.fullscreen); }});
+    // The window's size, of those the monitor has room for. Fullscreen it is the monitor's and nothing to choose.
     res.rows.push_back({"Resolution", "The size of the window. Fullscreen fills the monitor.",
-                      [] { return std::to_string(g_cfg.win_w) + "x" + std::to_string(g_cfg.win_h); },
+                      [] {
+                          int w, h;
+                          window_view_size(w, h);
+                          return std::to_string(w) + "x" + std::to_string(h);
+                      },
                       [](int d) {
+                          if (g_cfg.fullscreen) {
+                              pc_set_blurb("Fullscreen is the monitor's own resolution. Windowed has the sizes.");
+                              return;
+                          }
                           static const int kSizes[][2] = {{800, 600}, {960, 720}, {1024, 768}, {1280, 720}, {1280, 800}, {1280, 960},
                                                           {1366, 768}, {1600, 900}, {1600, 1200}, {1680, 1050}, {1920, 1080},
                                                           {1920, 1200}, {2560, 1440}, {2560, 1600}, {3840, 2160}};
-                          int n = (int)(sizeof kSizes / sizeof kSizes[0]), at = 1;
+                          int sw, sh;
+                          window_screen_size(sw, sh);
+                          std::vector<int> fits;
+                          for (int i = 0; i < (int)(sizeof kSizes / sizeof kSizes[0]); i++)
+                              if (kSizes[i][0] <= sw && kSizes[i][1] <= sh) fits.push_back(i);
+                          if (fits.empty()) fits.push_back(0);
+                          const int n = (int)fits.size();
+                          int at = -1;
                           for (int i = 0; i < n; i++)
-                              if (kSizes[i][0] == g_cfg.win_w && kSizes[i][1] == g_cfg.win_h) at = i;
-                          at = (at + (d < 0 ? n - 1 : 1)) % n;
-                          window_set_size(kSizes[at][0], kSizes[at][1]);
+                              if (kSizes[fits[i]][0] == g_cfg.win_w && kSizes[fits[i]][1] == g_cfg.win_h) at = i;
+                          at = at < 0 ? (d < 0 ? n - 1 : 0) : (at + (d < 0 ? n - 1 : 1)) % n;
+                          window_set_size(kSizes[fits[at]][0], kSizes[fits[at]][1]);
                       }});
-    res.rows.push_back({"Aspect Ratio", "The race's picture; the menus stay 4:3.",
-                      [] { return std::string(g_cfg.aspect == 2 ? "16:9" : g_cfg.aspect == 1 ? "16:10" : "4:3"); },
-                      [](int d) { g_cfg.aspect = (g_cfg.aspect + (d < 0 ? 2 : 1)) % 3; pc_config_save(); }});
+    // The aspect as it is drawn (pc_aspect): of those no wider than the window. The setting itself is kept, so a wide window gets it back.
+    res.rows.push_back({"Aspect Ratio", "The race's picture, no wider than the window. The menus stay 4:3.",
+                      [] {
+                          const int a = pc_aspect();
+                          return std::string(a == 2 ? "16:9" : a == 1 ? "16:10" : "4:3");
+                      },
+                      [](int d) {
+                          const int limit = pc_aspect_limit();
+                          if (!limit) {
+                              pc_set_blurb("A 4:3 window shows the race in 4:3. A wider one has the wider pictures.");
+                              return;
+                          }
+                          g_cfg.aspect = (pc_aspect() + (d < 0 ? limit : 1)) % (limit + 1);
+                          pc_config_save();
+                      }});
     res.rows.push_back({"Render Scale", "The picture's detail, times the PS2's 512 x 448.",
                         [] { return std::to_string(g_cfg.scale) + "x"; },
                         [](int d) { g_cfg.scale = (g_cfg.scale - 1 + (d < 0 ? 7 : 1)) % 8 + 1; pc_config_save(); }});
@@ -384,12 +422,29 @@ void pc_settings_register()
                       [] { return std::string(g_cfg.smooth ? "Smooth" : "Sharp"); },
                       [](int) { g_cfg.smooth ^= 1; pc_config_save(); }});
     PcPage &q = pc_add_page("PC Advanced", "Advanced");
+    // what the graphics card has, no more: a value it does not have would be shown and then not drawn
     q.rows.push_back({"Anti-Aliasing", "Smoother edges.",
-                      [] { return g_cfg.aa ? std::to_string(g_cfg.aa) + "x MSAA" : std::string("Off"); },
-                      [](int d) { g_cfg.aa = pc_next_power(g_cfg.aa, 8, d); pc_config_save(); }});
-    q.rows.push_back({"Anisotropic Filtering", "Sharper textures far away.",
-                      [] { return g_cfg.aniso ? std::to_string(g_cfg.aniso) + "x" : std::string("Off"); },
-                      [](int d) { g_cfg.aniso = pc_next_power(g_cfg.aniso, 16, d); pc_config_save(); }});
+                      [] {
+                          const int v = std::min(g_cfg.aa, gpu_limit(0));
+                          return v ? std::to_string(v) + "x MSAA" : std::string("Off");
+                      },
+                      [](int d) {
+                          const int top = gpu_limit(0);
+                          if (!top) pc_set_blurb("This graphics card has no anti-aliasing for the game.");
+                          g_cfg.aa = top ? pc_next_power(std::min(g_cfg.aa, top), top, d) : 0;
+                          pc_config_save();
+                      }});
+    q.rows.push_back({"Anisotropic Filtering", "Sharper textures far away, on everything in the world.",
+                      [] {
+                          const int v = std::min(g_cfg.aniso, gpu_limit(1));
+                          return v ? std::to_string(v) + "x" : std::string("Off");
+                      },
+                      [](int d) {
+                          const int top = gpu_limit(1);
+                          if (!top) pc_set_blurb("This graphics card has no anisotropic filtering.");
+                          g_cfg.aniso = top ? pc_next_power(std::min(g_cfg.aniso, top), top, d) : 0;
+                          pc_config_save();
+                      }});
 
     // the picture's look: left and right step it, Select goes on up and round
     auto stepped = [](int &v, int d, int lo, int hi, int step) {

@@ -164,8 +164,38 @@ u32 pc_screen_hash()
 }
 
 bool pc_race_menu() { return pc_racing() && (g_player_mode == 0 || g_player_mode == 6 || (g_player_mode != 1 && menu_on_screen())); }
-// the pointer: in the front end, the pause menu, a replay and the screens after the finish; in a race and while one loads, none
-bool pc_cursor_wanted() { return !pc_racing() || g_player_mode == 1 || g_player_mode == 6 || menu_on_screen() || pc_replay_playing(); }
+// the name of the screen that is up (FlailerScreenNode +16 its FlailerScreenConfig, +8 the config's ScreenName), "" with none
+static std::string screen_name()
+{
+    if (!g_pc_ctx) return "";
+    const u32 list = LW(gp() - 21324), node = list ? LW(list + 412) : 0, config = node ? LW(node + 16) : 0, name = config ? LW(config + 8) : 0;
+    return name ? pc_str(name) : "";
+}
+
+// The pointer: in the front end, the pause menu, a replay and the screens after the finish; in a race and while one loads, none. And none
+// at the start. There the game is on "BootAutoload" for a second, and then on "Title Screen" all through the logos and the opening film:
+// it is the title screen that plays them (TitleScreen::pInstance, gp-21156; its State +12 is 2, eTITLE_SCREEN_PLAYING_MOVIES, while a film
+// runs, 1 while it waits for a button on the title; it plays them again when left alone there). So: none before a screen is up, none on
+// "BootAutoload", none while the title screen plays a film. The profiles' and the language's choice are screens of their own, with something
+// to point at.
+bool pc_cursor_wanted()
+{
+    const std::string screen = screen_name();
+    const u32 title = g_pc_ctx ? LW(gp() - 21156) : 0;
+    const bool film = title && LW(title + 12) == 2;
+    {   // HP2_DIAG: the screens as they come
+        static const bool diag = getenv("HP2_DIAG") != nullptr;
+        static std::string last = "?";
+        static bool last_film;
+        if (diag && (screen != last || film != last_film))
+            fprintf(stderr, "screen: \"%s\"%s%s\n", screen.c_str(), menu_on_screen() ? ", with a menu" : "", film ? ", the title's film" : "");
+        last = screen;
+        last_film = film;
+    }
+    if (film) return false;
+    if (!pc_racing()) return !screen.empty() && screen != "BootAutoload";
+    return g_player_mode == 1 || g_player_mode == 6 || menu_on_screen() || pc_replay_playing();
+}
 bool pc_hud_up() { return pc_racing() && (g_player_mode == 2 || g_player_mode == 3); }
 bool pc_car_input() { return pc_racing() && g_player_mode != 0 && g_player_mode != 1 && g_player_mode != 6 && !menu_on_screen(); }
 
@@ -968,6 +998,38 @@ static void mouse_frame()
     }
     bool moved = inside && (x != last_x || y != last_y);
     if (inside) last_x = x, last_y = y;
+
+    // A question over the screen (quit the race, restart it, and the like): a tPopupMenu, FlailerScreenList +392, with two or three buttons
+    // side by side that are no menu's rows. The pointer on a button highlights it the popup's own way, a click on one is Cross on it; a click
+    // beside them does nothing. bIsActive +0, Config.nButtons +4, Config.PopupScreenHash +16, MenuItems +76, CurrentMenuIndex +92.
+    if (u32 lists = LW(gp() - 21324))
+        for (int k = 0; k < 2; k++) {
+            const u32 pop = LW(lists + 392 + 4 * k);
+            if (!pop || !LB(pop)) continue;
+            pending = -1, click = false;
+            const u32 pchunk = find_menu_screen(LW(pop + 16));
+            const int buttons = std::min<int>((int)LW(pop + 4), 3);
+            int over = -1;
+            for (int b = 0; b < buttons && pchunk; b++) {
+                const u32 item = LW(pop + 76 + 4 * b);
+                u32 o = item ? find_object(pchunk, LW(item + 12)) : 0;
+                if (!o) o = find_object(pchunk, 0xe0105663u + (u32)b);      // POPUP_1, POPUP_2, POPUP_3
+                if (!o || (s8)LB(o + 41) != 1) continue;
+                // a button's text is centred on its place: Flailer's 640 x 480 in the 512 x 448, as below
+                const float bx = fl(o + 48) * 0.8f, by = fl(o + 52) * (448.0f / 480.0f) + 15.0f;
+                if (inside && std::fabs(x - bx) < 80 && std::fabs(y - by) < 24) over = b;
+            }
+            if (over >= 0 && (moved || pressed) && (u32)over != LW(pop + 92)) {
+                pc_call(0x16b5f0, pop);         // tPopupMenu::UnHighlightCurrentMenuItem
+                SW(pop + 92, (u32)over);
+                pc_call(0x16b618, pop);         // tPopupMenu::HighlightCurrentMenuItem
+            }
+            if (pressed && over >= 0 && g_mouse_wait <= 0) {
+                g_mouse_out = 1 << PCB_CROSS;
+                g_mouse_wait = 4;
+            }
+            return;
+        }
 
     u32 list = LW(gp() - 21324), node = list ? LW(list + 412) : 0;
     u32 screens = node ? node + 8 : 0, screen = screens ? LW(screens) : 0;

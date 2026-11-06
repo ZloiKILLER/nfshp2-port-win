@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include "eefloat.h"
 
 typedef uint8_t u8;
 typedef int8_t s8;
@@ -71,13 +72,28 @@ void io_write(u32 addr, u64 value, int size);
 u128 io_read128(u32 addr);
 void io_write128(u32 addr, u128 value);
 
+// The PC's own memory past the PS2's 32 MB, at guest 0x02000000 up to 0x0FFFFFFF: reserved whole, committed as it is needed. Only the port
+// puts things there (the frame malloc buffers, native.cpp); the game's heap stays in the 32 MB. ext_commit(off, n): those bytes usable.
+static const u32 EXT_BASE = 0x02000000, EXT_MAX = 0x0E000000;
+extern u8 *g_ext;
+extern u32 g_ext_size;
+bool ext_commit(u32 off, u32 bytes);
+
 static inline u8 *host(u32 a)
 {
     if ((a >> 28) == 7)
         return (a & 0x0FFFFFFF) < 0x4000 ? g_spr + (a & 0x3FFF) : nullptr;
     u32 top = a >> 28;
     u32 p = (top == 2 || top == 3) ? (a & 0x01FFFFFF) : (a & 0x1FFFFFFF);
-    if (p < 0x02000000) return g_ram + p;
+    if (p < 0x02000000) {
+        // uncached views of the PC's memory, else the 32 MB's mirror as before
+        if (top == 2 || top == 3) {
+            const u32 e = (a & 0x0FFFFFFF) - EXT_BASE;
+            if (e < g_ext_size) return g_ext + e;
+        }
+        return g_ram + p;
+    }
+    if (p - EXT_BASE < g_ext_size) return g_ext + (p - EXT_BASE);
     if (p - 0x11000000u < 0x10000u) return g_vumem + (p - 0x11000000u);
     return nullptr;
 }
@@ -251,34 +267,24 @@ static inline void op_sdr(Ctx &c, int rt, u32 a)
 }
 
 // ---- FPU (COP1) ---------------------------------------------------------------
-// The EE FPU has no NaN/Inf; results are clamped to the largest finite value.
-static inline float fclamp(float v)
-{
-    if (std::isnan(v)) return 0.0f;
-    if (std::isinf(v)) return v > 0 ? 3.4028235e38f : -3.4028235e38f;
-    return v;
-}
+// The EE FPU has no NaN/Inf (fclamp), and its add, sub, mul and madd are the EE's to the bit (eefloat.h).
 #define F(n) c.f[n].f
-static inline void FPU_add_s(Ctx &c, int d, int s, int t) { F(d) = fclamp(F(s) + F(t)); }
-static inline void FPU_sub_s(Ctx &c, int d, int s, int t) { F(d) = fclamp(F(s) - F(t)); }
-static inline void FPU_mul_s(Ctx &c, int d, int s, int t) { F(d) = fclamp(F(s) * F(t)); }
-static inline void FPU_div_s(Ctx &c, int d, int s, int t)
-{
-    F(d) = F(t) == 0.0f ? (std::signbit(F(s)) != std::signbit(F(t)) ? -3.4028235e38f : 3.4028235e38f)
-                        : fclamp(F(s) / F(t));
-}
-static inline void FPU_sqrt_s(Ctx &c, int d, int, int t) { F(d) = std::sqrt(std::fabs(F(t))); }
-static inline void FPU_rsqrt_s(Ctx &c, int d, int s, int t) { F(d) = fclamp(F(s) / std::sqrt(std::fabs(F(t)))); }
+static inline void FPU_add_s(Ctx &c, int d, int s, int t) { F(d) = ee_add(F(s), F(t)); }
+static inline void FPU_sub_s(Ctx &c, int d, int s, int t) { F(d) = ee_sub(F(s), F(t)); }
+static inline void FPU_mul_s(Ctx &c, int d, int s, int t) { F(d) = ee_mul(F(s), F(t)); }
+static inline void FPU_div_s(Ctx &c, int d, int s, int t) { F(d) = ee_div(F(s), F(t)); }
+static inline void FPU_sqrt_s(Ctx &c, int d, int, int t) { F(d) = ee_sqrt(F(t)); }
+static inline void FPU_rsqrt_s(Ctx &c, int d, int s, int t) { F(d) = ee_rsqrt(F(s), F(t)); }
 static inline void FPU_abs_s(Ctx &c, int d, int s, int) { F(d) = std::fabs(F(s)); }
 static inline void FPU_mov_s(Ctx &c, int d, int s, int) { c.f[d].u = c.f[s].u; }
 static inline void FPU_neg_s(Ctx &c, int d, int s, int) { c.f[d].u = c.f[s].u ^ 0x80000000u; }
-static inline void FPU_adda_s(Ctx &c, int, int s, int t) { c.acc = fclamp(F(s) + F(t)); }
-static inline void FPU_suba_s(Ctx &c, int, int s, int t) { c.acc = fclamp(F(s) - F(t)); }
-static inline void FPU_mula_s(Ctx &c, int, int s, int t) { c.acc = fclamp(F(s) * F(t)); }
-static inline void FPU_madd_s(Ctx &c, int d, int s, int t) { F(d) = fclamp(c.acc + F(s) * F(t)); }
-static inline void FPU_msub_s(Ctx &c, int d, int s, int t) { F(d) = fclamp(c.acc - F(s) * F(t)); }
-static inline void FPU_madda_s(Ctx &c, int, int s, int t) { c.acc = fclamp(c.acc + F(s) * F(t)); }
-static inline void FPU_msuba_s(Ctx &c, int, int s, int t) { c.acc = fclamp(c.acc - F(s) * F(t)); }
+static inline void FPU_adda_s(Ctx &c, int, int s, int t) { c.acc = ee_add(F(s), F(t)); }
+static inline void FPU_suba_s(Ctx &c, int, int s, int t) { c.acc = ee_sub(F(s), F(t)); }
+static inline void FPU_mula_s(Ctx &c, int, int s, int t) { c.acc = ee_mul(F(s), F(t)); }
+static inline void FPU_madd_s(Ctx &c, int d, int s, int t) { F(d) = ee_madd(c.acc, F(s), F(t)); }
+static inline void FPU_msub_s(Ctx &c, int d, int s, int t) { F(d) = ee_msub(c.acc, F(s), F(t)); }
+static inline void FPU_madda_s(Ctx &c, int, int s, int t) { c.acc = ee_madd(c.acc, F(s), F(t)); }
+static inline void FPU_msuba_s(Ctx &c, int, int s, int t) { c.acc = ee_msub(c.acc, F(s), F(t)); }
 static inline void FPU_max_s(Ctx &c, int d, int s, int t) { F(d) = F(s) > F(t) ? F(s) : F(t); }
 static inline void FPU_min_s(Ctx &c, int d, int s, int t) { F(d) = F(s) < F(t) ? F(s) : F(t); }
 static inline void FPU_cvt_w_s(Ctx &c, int d, int s, int)
@@ -335,14 +341,14 @@ void op_ctc2(Ctx &c, int rd, u32 v);
         VF a = c.vf[s]; float y = c.vi_i;                                          \
         for (int i = 0; i < 4; i++) if (dx(m, i)) { float x = a.f[i]; vf_set(c, d, i, expr); } \
     }
-VU_BIN(vadd, x + y)
-VU_BIN(vsub, x - y)
-VU_BIN(vmul, x * y)
+VU_BIN(vadd, ee_add(x, y))
+VU_BIN(vsub, ee_sub(x, y))
+VU_BIN(vmul, ee_mul(x, y))
 VU_BIN(vmax, x > y ? x : y)
 VU_BIN(vmini, x < y ? x : y)
 #define ACC (c.vacc.f[i])
-VU_BIN(vmadd, ACC + x * y)
-VU_BIN(vmsub, ACC - x * y)
+VU_BIN(vmadd, ee_madd(ACC, x, y))
+VU_BIN(vmsub, ee_msub(ACC, x, y))
 #undef ACC
 #define BC_ALIAS(op, base)                                                        \
     static inline void VU_##op##x(Ctx &c, u32 w) { VU_##base##bc(c, w); }        \
@@ -374,11 +380,11 @@ BC_ALIAS(vmini, vmini) BC_ALIAS(vmadd, vmadd) BC_ALIAS(vmsub, vmsub)
         int s = VFS(w); u32 m = VDEST(w); VF a = c.vf[s]; float y = c.vi_i;        \
         for (int i = 0; i < 4; i++) if (dx(m, i)) { float x = a.f[i], acc = c.vacc.f[i]; (void)acc; c.vacc.f[i] = fclamp(expr); } \
     }
-VU_ACC(vadda, x + y)
-VU_ACC(vsuba, x - y)
-VU_ACC(vmula, x * y)
-VU_ACC(vmadda, acc + x * y)
-VU_ACC(vmsuba, acc - x * y)
+VU_ACC(vadda, ee_add(x, y))
+VU_ACC(vsuba, ee_sub(x, y))
+VU_ACC(vmula, ee_mul(x, y))
+VU_ACC(vmadda, ee_madd(acc, x, y))
+VU_ACC(vmsuba, ee_msub(acc, x, y))
 BC_ALIAS(vadda, vadda) BC_ALIAS(vsuba, vsuba) BC_ALIAS(vmula, vmula)
 BC_ALIAS(vmadda, vmadda) BC_ALIAS(vmsuba, vmsuba)
 
@@ -387,17 +393,17 @@ BC_ALIAS(vmadda, vmadda) BC_ALIAS(vmsuba, vmsuba)
 static inline void VU_vopmula(Ctx &c, u32 w)
 {
     VF a = c.vf[VFS(w)], b = c.vf[VFT(w)];
-    c.vacc.f[0] = fclamp(a.f[1] * b.f[2]);
-    c.vacc.f[1] = fclamp(a.f[2] * b.f[0]);
-    c.vacc.f[2] = fclamp(a.f[0] * b.f[1]);
+    c.vacc.f[0] = ee_mul(a.f[1], b.f[2]);
+    c.vacc.f[1] = ee_mul(a.f[2], b.f[0]);
+    c.vacc.f[2] = ee_mul(a.f[0], b.f[1]);
 }
 static inline void VU_vopmsub(Ctx &c, u32 w)
 {
     VF a = c.vf[VFS(w)], b = c.vf[VFT(w)];
     int d = VFD(w);
-    float r0 = c.vacc.f[0] - a.f[1] * b.f[2];
-    float r1 = c.vacc.f[1] - a.f[2] * b.f[0];
-    float r2 = c.vacc.f[2] - a.f[0] * b.f[1];
+    float r0 = ee_msub(c.vacc.f[0], a.f[1], b.f[2]);
+    float r1 = ee_msub(c.vacc.f[1], a.f[2], b.f[0]);
+    float r2 = ee_msub(c.vacc.f[2], a.f[0], b.f[1]);
     vf_set(c, d, 0, r0);
     vf_set(c, d, 1, r1);
     vf_set(c, d, 2, r2);
@@ -422,15 +428,10 @@ static inline float vfsf(Ctx &c, u32 w) { return c.vf[VFS(w)].f[(w >> 21) & 3]; 
 static inline float vftf(Ctx &c, u32 w) { return c.vf[VFT(w)].f[(w >> 23) & 3]; }
 static inline void VU_vdiv(Ctx &c, u32 w)
 {
-    float t = vftf(c, w);
-    c.vq = t == 0.0f ? 3.4028235e38f : fclamp(vfsf(c, w) / t);
+    c.vq = ee_div(vfsf(c, w), vftf(c, w));
 }
-static inline void VU_vsqrt(Ctx &c, u32 w) { c.vq = std::sqrt(std::fabs(vftf(c, w))); }
-static inline void VU_vrsqrt(Ctx &c, u32 w)
-{
-    float t = std::sqrt(std::fabs(vftf(c, w)));
-    c.vq = t == 0.0f ? 3.4028235e38f : fclamp(vfsf(c, w) / t);
-}
+static inline void VU_vsqrt(Ctx &c, u32 w) { c.vq = ee_sqrt(vftf(c, w)); }
+static inline void VU_vrsqrt(Ctx &c, u32 w) { c.vq = ee_rsqrt(vfsf(c, w), vftf(c, w)); }
 static inline void VU_vwaitq(Ctx &, u32) {}
 static inline void VU_vnop(Ctx &, u32) {}
 static inline void VU_vclipw(Ctx &c, u32 w)

@@ -27,13 +27,23 @@ static bool spulog()
 
 static u32 g_trans_handler[2], g_trans_arg[2];
 
+// libsd-common.h: SD_PARAM_MMIX 0x08 (no 0x80), then with 0x80: MVOL 0x09-0x0A, EVOL 0x0B-0x0C, AVOL 0x0D-0x0E, BVOL 0x0F-0x10, MVOLX 0x11-0x12
 static void set_param(u32 entry, u16 value)
 {
     int core = entry & 1, reg = (entry >> 8) & 0xFF;
+    switch (reg) {
+    case 0x08: spu2_set_core_param(core, SPU2_MMIX, value); return;
+    case 0x09: spu2_set_master(core, SPU2_MVOLL, value); return;
+    case 0x0A: spu2_set_master(core, SPU2_MVOLR, value); return;
+    case 0x0B: spu2_set_core_param(core, SPU2_EVOLL, value); return;
+    case 0x0C: spu2_set_core_param(core, SPU2_EVOLR, value); return;
+    case 0x0D: spu2_set_core_param(core, SPU2_AVOLL, value); return;
+    case 0x0E: spu2_set_core_param(core, SPU2_AVOLR, value); return;
+    case 0x0F: spu2_set_core_param(core, SPU2_BVOLL, value); return;
+    case 0x10: spu2_set_core_param(core, SPU2_BVOLR, value); return;
+    }
     if (entry & 0x80) {
-        if (reg == 0x09) spu2_set_master(core, SPU2_MVOLL, value);
-        else if (reg == 0x0A) spu2_set_master(core, SPU2_MVOLR, value);
-        else SLOG("libsd: core param %04x = %04x ignored\n", entry, value);
+        SLOG("libsd: core param %04x = %04x ignored\n", entry, value);
         return;
     }
     if (reg < 8) spu2_set_voice(core, (entry >> 1) & 31, reg, value);
@@ -41,15 +51,28 @@ static void set_param(u32 entry, u16 value)
 
 static u16 get_param(u32 entry)
 {
-    int reg = (entry >> 8) & 0xFF;
+    int core = entry & 1, reg = (entry >> 8) & 0xFF;
+    switch (reg) {
+    case 0x08: return spu2_core_param(core, SPU2_MMIX);
+    case 0x0B: return spu2_core_param(core, SPU2_EVOLL);
+    case 0x0C: return spu2_core_param(core, SPU2_EVOLR);
+    case 0x0D: return spu2_core_param(core, SPU2_AVOLL);
+    case 0x0E: return spu2_core_param(core, SPU2_AVOLR);
+    case 0x0F: return spu2_core_param(core, SPU2_BVOLL);
+    case 0x10: return spu2_core_param(core, SPU2_BVOLR);
+    case 0x11: return spu2_master(core, SPU2_MVOLL);
+    case 0x12: return spu2_master(core, SPU2_MVOLR);
+    }
     if (entry & 0x80) return 0;
-    return reg < 8 ? spu2_voice(entry & 1, (entry >> 1) & 31, reg) : 0;
+    return reg < 8 ? spu2_voice(core, (entry >> 1) & 31, reg) : 0;
 }
 
 static void set_switch(u32 entry, u32 value)
 {
     int core = entry & 1;
     switch ((entry >> 8) & 0xFF) {
+    case 0x13: spu2_set_mix(core, SPU2_PMON, value); break;
+    case 0x14: spu2_set_mix(core, SPU2_NON, value); break;
     case 0x15: spu2_key_on(core, value); break;
     case 0x16: spu2_key_off(core, value); break;
     case 0x17: spu2_clear_endx(core); break;
@@ -65,6 +88,8 @@ static u32 get_switch(u32 entry)
 {
     int core = entry & 1;
     switch ((entry >> 8) & 0xFF) {
+    case 0x13: return spu2_mix(core, SPU2_PMON);
+    case 0x14: return spu2_mix(core, SPU2_NON);
     case 0x17: return spu2_endx(core);
     case 0x18: return spu2_mix(core, SPU2_VMIXL);
     case 0x19: return spu2_mix(core, SPU2_VMIXEL);
@@ -74,17 +99,25 @@ static u32 get_switch(u32 entry)
     return 0;
 }
 
+// ESA 0x1C, EEA 0x1D (libsd keeps its high bits: the end is value | 0x1FFFF), TSA 0x1E, IRQA 0x1F, voices 0x20-0x22
+static u32 g_esa[2] = {0x1DFFF0, 0x1FFFF0};
 static void set_addr(u32 entry, u32 value)
 {
-    int reg = (entry >> 8) & 0xFF;
-    if (reg >= 0x20 && reg <= 0x22) spu2_set_voice_addr(entry & 1, (entry >> 1) & 31, reg - 0x20, value);
+    int core = entry & 1, reg = (entry >> 8) & 0xFF;
+    if (reg >= 0x20 && reg <= 0x22) spu2_set_voice_addr(core, (entry >> 1) & 31, reg - 0x20, value);
+    else if (reg == 0x1C) {
+        g_esa[core] = value;
+        spu2_set_effect_area(core, value, spu2_effect_end(core));
+    } else if (reg == 0x1D) spu2_set_effect_area(core, g_esa[core], (value & ~0x1FFFFu) | 0x1FFFF);
     else SLOG("libsd: addr %04x = %06x ignored\n", entry, value);
 }
 
 static u32 get_addr(u32 entry)
 {
-    int reg = (entry >> 8) & 0xFF;
-    if (reg >= 0x20 && reg <= 0x22) return spu2_voice_addr(entry & 1, (entry >> 1) & 31, reg - 0x20);
+    int core = entry & 1, reg = (entry >> 8) & 0xFF;
+    if (reg >= 0x20 && reg <= 0x22) return spu2_voice_addr(core, (entry >> 1) & 31, reg - 0x20);
+    if (reg == 0x1C) return g_esa[core];
+    if (reg == 0x1D) return spu2_effect_end(core);
     return 0;
 }
 
@@ -112,10 +145,17 @@ static void sceSdSetAddr(IopRegs &c)
     set_addr(A0 & 0xFFFF, A1);
 }
 static void sceSdGetAddr(IopRegs &c) { V0 = get_addr(A0 & 0xFFFF); }
+// (attribute | core, value): SD_CORE_EFFECT_ENABLE 2, IRQ_ENABLE 4, MUTE_ENABLE 6, NOISE_CLK 8, SPDIF_MODE 0xA
+static u32 g_core_attr[2][6];
 static void sceSdSetCoreAttr(IopRegs &c)
 {
-    SLOG("libsd: SetCoreAttr %04x = %u\n", A0 & 0xFFFF, A1);
+    const u32 core = A0 & 1, attr = A0 & 0xE, value = A1;
+    SLOG("libsd: SetCoreAttr %04x = %u\n", A0 & 0xFFFF, value);
+    g_core_attr[core][attr >> 1] = value;
+    if (attr == 0x2) spu2_set_effect_enable((int)core, value != 0);
+    else if (attr == 0x8) spu2_set_noise_clock((int)core, value);
 }
+static void sceSdGetCoreAttr(IopRegs &c) { V0 = g_core_attr[A0 & 1][(A0 & 0xE) >> 1]; }
 
 // sceSdBatch {u16 func, u16 entry, u32 value}; (batch, returns, count)
 static void sceSdProcBatch(IopRegs &c)
@@ -160,12 +200,29 @@ static void sceSdBlockTrans(IopRegs &c)
     V0 = 0;
 }
 static void sceSdBlockTransStatus(IopRegs &c) { V0 = 0; }
+// sceSdSetEffectAttr(core, attr): sceSdEffectAttr {int core; int mode; short depth_L, depth_R; int delay; int feedback}; mode | 0x100
+// clears the work area. Mode 0..9: off, room, studio 1-3, hall, space, echo, delay, pipe.
 static void sceSdSetEffectAttr(IopRegs &c)
 {
-    SLOG("libsd: SetEffectAttr core %u mode %u (not emulated)\n", iop_lw(A0), iop_lw(A0 + 4));
+    const u32 attr = A0 > 1 ? A0 : A1;                  // (core, attr) as libsd has it; an attr alone takes its core from it
+    const int core = (int)((A0 > 1 ? iop_lw(attr) : A0) & 1);
+    const u32 mode = iop_lw(attr + 4);
+    const s16 dl = (s16)iop_lh(attr + 8), dr = (s16)iop_lh(attr + 10);
+    const int delay = (int)iop_lw(attr + 12), feedback = (int)iop_lw(attr + 16);
+    fprintf(iop_log(), "libsd: SetEffectAttr core %d mode %u depth %d %d delay %d feedback %d\n", core, mode, dl, dr, delay, feedback);
+    if ((mode & 0xFF) > 9) {
+        V0 = (u32)-1;
+        return;
+    }
+    spu2_set_effect(core, (int)(mode & 0xFF), dl, dr, delay, feedback, (mode & 0x100) != 0);
     V0 = 0;
 }
-static void sceSdClearEffectWorkArea(IopRegs &c) { V0 = 0; }
+// (core, channel, mode)
+static void sceSdClearEffectWorkArea(IopRegs &c)
+{
+    spu2_clear_effect((int)(A0 & 1));
+    V0 = 0;
+}
 static void sceSdSetTransIntrHandler(IopRegs &c)
 {
     u32 ch = A0 & 1;
@@ -184,6 +241,7 @@ void iop_libsd_register()
     iop_add_hle("sceSdSetAddr", sceSdSetAddr);
     iop_add_hle("sceSdGetAddr", sceSdGetAddr);
     iop_add_hle("sceSdSetCoreAttr", sceSdSetCoreAttr);
+    iop_add_hle("sceSdGetCoreAttr", sceSdGetCoreAttr);
     iop_add_hle("sceSdProcBatch", sceSdProcBatch);
     iop_add_hle("sceSdVoiceTrans", sceSdVoiceTrans);
     iop_add_hle("sceSdVoiceTransStatus", sceSdVoiceTransStatus);

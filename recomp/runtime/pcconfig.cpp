@@ -11,6 +11,24 @@
 #endif
 
 PcConfig g_cfg;
+
+void window_view_size(int &w, int &h);      // hw.h
+
+int pc_aspect_limit()
+{
+    int w = 0, h = 0;
+    window_view_size(w, h);
+    if (w <= 0 || h <= 0) return 2;
+    const double r = (double)w / h;
+    return r >= 16.0 / 9.0 - 0.02 ? 2 : r >= 16.0 / 10.0 - 0.02 ? 1 : 0;
+}
+
+int pc_aspect()
+{
+    const int limit = pc_aspect_limit();
+    return g_cfg.aspect < limit ? g_cfg.aspect : limit;
+}
+
 int g_pad_playstation;
 int g_pad_steering_now = 100;
 
@@ -250,6 +268,7 @@ void pc_config_save()
     fprintf(f, "contrast=%d        ; percent, 50 to 150\n", g_cfg.contrast);
     fprintf(f, "gamma=%d           ; percent, 50 to 200: above 100 lighter\n", g_cfg.gamma);
     fprintf(f, "frame_rate=%d       ; the race's, 30 or 60\n", g_cfg.frame_rate);
+    fprintf(f, "vsync=%d            ; 1 = the picture waits for the screen (no tearing), 0 = shown at once\n", g_cfg.vsync);
     fprintf(f, "draw_distance=%d   ; percent, 100 to 400: 100 is the PS2's\n", g_cfg.draw_distance);
     fprintf(f, "profile=%s\n", g_cfg.last_profile);
     fprintf(f, "language=%s     ; ENGLISH, FRENCH, GERMAN, ITALIAN, SPANISH, SWEDISH, or one of data\\lang\\\n", g_cfg.language);
@@ -301,6 +320,7 @@ static bool read_settings(const std::string &path, bool &old_controls)
         else if (!strcmp(key, "contrast")) g_cfg.contrast = clampi(n, 50, 150);
         else if (!strcmp(key, "gamma")) g_cfg.gamma = clampi(n, 50, 200);
         else if (!strcmp(key, "frame_rate")) g_cfg.frame_rate = n == 60 ? 60 : 30;
+        else if (!strcmp(key, "vsync")) g_cfg.vsync = n != 0;
         else if (!strcmp(key, "draw_distance")) g_cfg.draw_distance = clampi(n, 100, 400);
         else if (!strcmp(key, "show_fps")) g_cfg.show_fps = n != 0;
         else if (!strcmp(key, "max_detail")) g_cfg.max_detail = n != 0;

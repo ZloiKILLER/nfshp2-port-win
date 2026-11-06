@@ -24,9 +24,16 @@ void gs_vblank();
 
 // window (window.cpp)
 void window_start();
+int window_dpi_aware();                 // before the window: the process takes the screen's real pixels; what it was (0 unaware, 1 system, 2 per monitor)
+void window_dpi_thread();               // HP2_DPI, for tests: this thread as in a process Windows scales
 void *window_handle();                  // the window to draw to (an HWND), null until it is there
 void window_set_fullscreen(bool fs);    // from any thread; saves hp2.ini
 void window_set_size(int w, int h);     // from any thread; saves hp2.ini; a fullscreen window keeps it for later
+void window_cursor_frame();             // the pointer shown or hidden as the screen and the mouse have it: once a frame
+void window_screen_size(int &w, int &h);    // the monitor the window is on (the main one before there is a window), in pixels
+void window_view_size(int &w, int &h);  // what the picture is shown in: the setting's window, or the monitor when fullscreen
+// native_vk.cpp: the most multisampling and anisotropy the GPU in use has (0: none); false until there is a device
+bool native_vk_limits(int &aa, int &aniso);
 void window_quit();                     // from any thread; closes the window and ends the program
 // the program again, for another profile: a save is the game's whole state, and a new profile needs the game's start
 void window_relaunch(const std::string &profile);

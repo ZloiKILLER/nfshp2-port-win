@@ -29,7 +29,12 @@ static u32 d_ctrl, d_stat, d_pcr, d_sqwc, d_rbsr, d_rbor, d_stadr, d_enable = 0x
 enum { CHCR_DIR = 1, CHCR_TTE = 1 << 6, CHCR_TIE = 1 << 7, CHCR_STR = 1 << 8 };
 
 // tag and data addresses: bit 31 selects the scratchpad
-static u32 bus_addr(u32 a) { return (a & 0x80000000u) ? (0x70000000u | (a & 0x3FF0)) : (a & 0x01FFFFF0); }
+static u32 bus_addr(u32 a)
+{
+    if (a & 0x80000000u) return 0x70000000u | (a & 0x3FF0);
+    if ((a & 0x0FFFFFFF) - EXT_BASE < g_ext_size) return a & 0x0FFFFFF0;     // the PC's memory past 32 MB (ps2.h)
+    return a & 0x01FFFFF0;
+}
 
 static void sink(int ch, u32 addr, u32 qwc)
 {

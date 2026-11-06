@@ -22,6 +22,7 @@ struct PcConfig {
     int contrast = 100;         // percent, 50..150
     int gamma = 100;            // percent, 50..200: 100 changes nothing, above it lighter
     int frame_rate = 30;        // the race's, 30 or 60; the menus have 60
+    int vsync = 1;              // the picture waits for the screen's refresh (no tearing); 0: shown at once
     int draw_distance = 200;    // percent, 100..400: 100 is the PS2's
     char last_profile[32] = {}; // listed first on the profiles' screen
     int show_fps = 0;
@@ -47,6 +48,10 @@ struct PcConfig {
 extern PcConfig g_cfg;
 extern int g_pad_playstation;   // the pad in use has PlayStation's buttons (window_pad keeps it)
 extern int g_pad_steering_now;  // the sensitivity now: pad_steering while driving, else 100
+// The race's aspect as it is drawn: the setting's, but no wider than the window (fullscreen: the screen), where a wider picture would only
+// get bars above and below. pc_aspect_limit is the widest that fits.
+int pc_aspect();
+int pc_aspect_limit();
 void pc_config_init();          // read hp2.ini (HP2_INI=<path> names another file); the main program only
 void pc_config_save();
 // the profile's file of controls: its values, or with none the defaults (fresh) or what is set now; each save writes it
