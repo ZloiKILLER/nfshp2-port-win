@@ -1,0 +1,215 @@
+; The port's strings in Svenska: tools/recomp/make_lang.py writes this file (the format is in recomp/runtime/pclang.h).
+@name Svenska
+Audio	Ljud
+Set the volume and the Jukebox.	Ställ in volymen och jukeboxen.
+Controls	Kontroller
+Keyboard and gamepad.	Tangentbord och handkontroll.
+Graphics	Grafik
+Window, resolution, detail.	Fönster, upplösning, detaljer.
+HUD	HUD
+Set what you want to see.	Välj vad du vill se.
+Profiles	Profiler
+Choose, add or delete a profile.	Välj, lägg till eller ta bort en profil.
+Player Names	Spelarnamn
+Set your player names.	Ange spelarnas namn.
+Languages	Språk
+Choose the language of the game.	Välj spelets språk.
+Credits	Medverkande
+See who made this game.	Se vem som gjorde spelet.
+Master Volume	Huvudvolym
+Master volume of the game.	Spelets huvudvolym.
+Exit	Avsluta
+Close the game.	Stäng spelet.
+Back	Tillbaka
+PRESS ENTER	TRYCK PÅ ENTER
+PRESS START	TRYCK PÅ START
+SAVED	SPARAT
+The name is set.	Namnet är satt.
+The name stays as it was.	Namnet förblir som det var.
+Type a new name, Backspace edits this one. Enter sets it, Esc leaves it.	Skriv ett nytt namn, Backsteg ändrar detta. Enter sparar, Esc avbryter.
+On	På
+Off	Av
+Selected	Vald
+Current	Aktuell
+Maximum	Maximal
+Original	Original
+Fullscreen	Helskärm
+Windowed	Fönster
+Smooth	Mjuk
+Sharp	Skarp
+First	Första
+Second	Andra
+Auto	Auto
+Cancel	Avbryt
+Delete?	Ta bort?
+Press...	Tryck...
+The game's texts and speech in this language.	Spelets texter och tal på detta språk.
+Profile	Profil
+New Profile	Ny profil
+Delete Profile	Ta bort profil
+A profile needs a name.	En profil behöver ett namn.
+There is a profile of that name.	Det finns redan en profil med det namnet.
+That name cannot be a folder.	Det namnet kan inte vara en mapp.
+Select it twice to delete this profile, its save and its controls.	Välj två gånger för att ta bort profilen, dess sparning och kontroller.
+Play as this profile.	Spela med denna profil.
+This is the profile in use.	Det är profilen som används.
+The profile in use cannot be deleted.	Profilen som används kan inte tas bort.
+Select it again to delete it for good.	Välj igen för att ta bort den för gott.
+Delete nothing.	Ta inte bort något.
+Select, then type its name. With a gamepad it gets a number.	Välj och skriv namnet. Med handkontroll får den ett nummer.
+Type the name. Enter makes it, Esc leaves it.	Skriv namnet. Enter skapar, Esc avbryter.
+Choose one to delete.	Välj en att ta bort.
+Resolution	Upplösning
+The window, the screen's resolution and the render scale.	Fönstret, skärmens upplösning och renderingsskalan.
+Frame Rate	Bildfrekvens
+The race's frame rate. The PS2's was 30.	Bildfrekvens under lopp. PS2 hade 30.
+Draw Distance	Siktavstånd
+How far away scenery still shows. 100% is the PS2's.	Hur långt bort miljön syns. 100 % som på PS2.
+Level of Detail	Detaljnivå
+Maximum: scenery and cars always at their most detailed models. Original: as on the PS2.	Maximal: miljö och bilar alltid med sina mest detaljerade modeller. Original: som på PS2.
+Show FPS	Visa FPS
+Frames per second in the corner of the picture.	Bilder per sekund i bildens hörn.
+Advanced	Avancerat
+Anti-aliasing, texture filtering, brightness, contrast and gamma.	Kantutjämning, texturfiltrering, ljusstyrka, kontrast och gamma.
+Window	Fönster
+Window or borderless fullscreen. Alt+Enter switches too.	Fönster eller kantlös helskärm. Alt+Enter växlar också.
+The size of the window. Fullscreen fills the monitor.	Fönstrets storlek. Helskärm fyller skärmen.
+Aspect Ratio	Bildformat
+The race's picture; the menus stay 4:3.	Bilden under lopp; menyerna förblir 4:3.
+Render Scale	Renderingsskala
+The picture's detail, times the PS2's 512 x 448.	Bildens detaljer, gånger PS2:ans 512 x 448.
+Scaling	Skalning
+How the picture is scaled to the window.	Hur bilden skalas till fönstret.
+Anti-Aliasing	Kantutjämning
+Smoother edges.	Mjukare kanter.
+Anisotropic Filtering	Anisotropisk filtrering
+Sharper textures far away.	Skarpare texturer på avstånd.
+Brightness	Ljusstyrka
+Lighter or darker, all over.	Ljusare eller mörkare, överallt.
+Contrast	Kontrast
+The difference between light and dark.	Skillnaden mellan ljust och mörkt.
+Gamma	Gamma
+Above 1.00 the dark parts get lighter.	Över 1.00 blir de mörka delarna ljusare.
+Defaults	Standard
+Brightness, contrast and gamma as they were.	Ljusstyrka, kontrast och gamma som de var.
+The picture is back to the defaults.	Bilden är återställd.
+Keyboard	Tangentbord
+The keys for driving. In menus: arrows, Enter, Esc.	Tangenterna för körning. I menyer: pilar, Enter, Esc.
+Gamepad	Handkontroll
+The buttons for driving, the stick and vibration.	Knapparna för körning, spaken och vibrationen.
+Player 2	Spelare 2
+What the second player drives with in a two-player race.	Vad den andra spelaren kör med i ett lopp för två.
+Second: the second gamepad or half the keyboard. First: the first one.	Andra: den andra handkontrollen eller halva tangentbordet. Första: den första.
+Player 2's keys, when the keyboard is shared.	Spelare 2:s tangenter när tangentbordet delas.
+Player 2 Keyboard	Tangentbord spelare 2
+Layouts	Layouter
+The game's own layouts: what each of the PS2's buttons does in a race.	Spelets egna layouter: vad varje PS2-knapp gör under lopp.
+Buttons	Knappar
+Which of the pad's buttons is which of the PS2's. In menus: A, B back, Y help.	Vilken knapp på handkontrollen som motsvarar vilken på PS2. I menyer: A, B tillbaka, Y hjälp.
+Stick Dead Zone	Spakens dödzon
+How far the left stick moves before the car steers.	Hur långt vänster spak rör sig innan bilen styr.
+Steering	Styrning
+Above 100%, the car turns sharper for a small move of the stick.	Över 100 % svänger bilen skarpare för en liten spakrörelse.
+Vibration	Vibration
+Vibration of the gamepad.	Handkontrollens vibration.
+Button Icons	Knappikoner
+Which buttons the game shows, and the menus' layout that goes with them.	Vilka knappar spelet visar och menyernas layout som hör till.
+Gamepad Buttons	Handkontrollens knappar
+Reset to Default	Återställ standard
+Back to the defaults.	Tillbaka till standard.
+Put these keys back as they were.	Återställ dessa tangenter.
+Put the gamepad's buttons back as they were.	Återställ handkontrollens knappar.
+Put the gamepad back as it was.	Återställ handkontrollen.
+The gamepad is back to the defaults.	Handkontrollen är återställd.
+Cancelled.	Avbrutet.
+Done. Select a row to bind it again.	Klart. Välj en rad för att binda om den.
+Select, then press the gamepad button. Esc cancels.	Välj och tryck på knappen. Esc avbryter.
+Select, then press the key. Esc cancels.	Välj och tryck på tangenten. Esc avbryter.
+Press a gamepad button. Esc cancels.	Tryck på en knapp. Esc avbryter.
+Press a key. Esc cancels.	Tryck på en tangent. Esc avbryter.
+Cycle HUD	Byt HUD
+Steer Left	Styr vänster
+Steer Right	Styr höger
+Accelerate	Gasa
+Brake / Reverse	Broms / Back
+Horn / Siren	Tuta / Siren
+Change View	Byt vy
+Look Back	Titta bakåt
+Handbrake	Handbroms
+Shift Down / Freeze	Växla ned / Frys
+Shift Up / Zoom	Växla upp / Zoom
+Speed Boost	Turbo
+Pause	Paus
+Reset Car	Återställ bil
+Up	Upp
+Down	Ned
+Left	Vänster
+Right	Höger
+Enter	Enter
+Space	Mellanslag
+Esc	Esc
+Backspace	Backsteg
+Delete	Delete
+Insert	Insert
+Home	Home
+End	End
+Page Up	Page Up
+Page Down	Page Down
+Caps Lock	Caps Lock
+Shift	Shift
+L Shift	V Shift
+R Shift	H Shift
+L Ctrl	V Ctrl
+R Ctrl	H Ctrl
+Ctrl	Ctrl
+L Alt	V Alt
+R Alt	Alt Gr
+Pad Up	Styrkors upp
+Pad Down	Styrkors ned
+Pad Left	Styrkors vänster
+Pad Right	Styrkors höger
+L Stick	V spak
+R Stick	H spak
+#100004	HUD
+#150004	Sparat spel
+#151001	Laddar spelets inställningar.
+#151003	Inga sparade spelinställningar hittades.
+#151004	Sparar spelets inställningar.@Stäng inte spelet.
+#151006	Sparmappen kan inte öppnas.@ @Försöka igen?
+#151007	Sparmappen är skadad. Skapa den igen?
+#151008	Skapar sparmappen...
+#151009	Sparmappen har skapats.
+#151010	Sparmappen kan inte skapas.@ @Försöka igen?
+#151011	Det finns inte plats på disken för att spara. Försöka igen?
+#151012	Spelet kunde inte sparas.@Försöka igen?
+#151013	Letar efter sparade spel...
+#151014	En ny sparmapp har skapats.
+#151015	Sparmappen kan inte öppnas.@ Försöka ladda igen?
+#151016	Sparmappen kan inte användas.
+#151017	Sparmappen kan inte öppnas.
+#151018	Det sparade spelet kunde inte laddas.@Försöka igen?
+#151020	Skriva över det@sparade spelet?
+#151022	Nuvarande inställningar ersätts av det sparade spelet. Fortsätta?
+#151023	Skapa ett sparat spel?
+#151024	Det sparade spelet kunde inte laddas.
+#151025	Sparmappen kan inte öppnas.
+#151027	Sparmappen kan inte öppnas. Försöka igen?
+#151101	Sparmappen är skadad.
+#152001	Skapar sparmappen...
+#300350	Tryck på \x81 för att återställa bilen.
+#800023	\x82 \x83 Luta bilen
+#800024	\x84 \x85 Vrid bilen
+#800026	\x8b \x8d Zooma kameran
+#800070	\x82 \x83 Välj alternativ
+#800071	\x86 \x80 Använd alternativ
+#802004	\x82 \x83 Luta bilen
+#802005	\x84 \x85 Vrid bilen
+#802006	\x82 \x83 \x84 \x85 Vrid och luta bilen
+#802007	\x8b \x8d Zooma kameran
+#802010	\x82 \x83 Luta bilen
+#802011	\x84 \x85 Vrid bilen
+#802012	\x82 \x83 \x84 \x85 Vrid och luta bilen
+#802013	\x8b \x8d Zooma kameran
+#900005	Anslut en@handkontroll för@spelare %d.
+#900011	Anslut en handkontroll.
+#940001	Tryck på \x80 för att delta i detta evenemang.

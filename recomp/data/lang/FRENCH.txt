@@ -1,0 +1,215 @@
+; The port's strings in Français: tools/recomp/make_lang.py writes this file (the format is in recomp/runtime/pclang.h).
+@name Français
+Audio	Audio
+Set the volume and the Jukebox.	Réglez le volume et le juke-box.
+Controls	Commandes
+Keyboard and gamepad.	Clavier et manette.
+Graphics	Graphismes
+Window, resolution, detail.	Fenêtre, résolution, détails.
+HUD	HUD
+Set what you want to see.	Choisissez ce que vous voulez voir.
+Profiles	Profils
+Choose, add or delete a profile.	Choisir, ajouter ou supprimer un profil.
+Player Names	Noms des joueurs
+Set your player names.	Définissez les noms des joueurs.
+Languages	Langues
+Choose the language of the game.	Choisissez la langue du jeu.
+Credits	Générique
+See who made this game.	Découvrez qui a créé ce jeu.
+Master Volume	Volume général
+Master volume of the game.	Volume général du jeu.
+Exit	Quitter
+Close the game.	Quitter le jeu.
+Back	Retour
+PRESS ENTER	APPUYEZ SUR ENTRÉE
+PRESS START	APPUYEZ SUR START
+SAVED	SAUVEGARDÉ
+The name is set.	Le nom est enregistré.
+The name stays as it was.	Le nom reste inchangé.
+Type a new name, Backspace edits this one. Enter sets it, Esc leaves it.	Tapez un nouveau nom, Retour arrière modifie celui-ci. Entrée valide, Échap annule.
+On	Oui
+Off	Non
+Selected	Choisie
+Current	Actuel
+Maximum	Maximum
+Original	Original
+Fullscreen	Plein écran
+Windowed	Fenêtre
+Smooth	Lisse
+Sharp	Net
+First	Première
+Second	Seconde
+Auto	Auto
+Cancel	Annuler
+Delete?	Supprimer ?
+Press...	Appuyez...
+The game's texts and speech in this language.	Les textes et les voix du jeu dans cette langue.
+Profile	Profil
+New Profile	Nouveau profil
+Delete Profile	Supprimer un profil
+A profile needs a name.	Un profil doit avoir un nom.
+There is a profile of that name.	Un profil porte déjà ce nom.
+That name cannot be a folder.	Ce nom ne peut pas servir de dossier.
+Select it twice to delete this profile, its save and its controls.	Sélectionnez deux fois pour supprimer ce profil, sa sauvegarde et ses commandes.
+Play as this profile.	Jouer avec ce profil.
+This is the profile in use.	C'est le profil utilisé.
+The profile in use cannot be deleted.	Le profil utilisé ne peut pas être supprimé.
+Select it again to delete it for good.	Sélectionnez encore pour le supprimer définitivement.
+Delete nothing.	Ne rien supprimer.
+Select, then type its name. With a gamepad it gets a number.	Sélectionnez, puis tapez son nom. Avec une manette, il reçoit un numéro.
+Type the name. Enter makes it, Esc leaves it.	Tapez le nom. Entrée le crée, Échap annule.
+Choose one to delete.	Choisissez celui à supprimer.
+Resolution	Résolution
+The window, the screen's resolution and the render scale.	La fenêtre, la résolution de l'écran et l'échelle du rendu.
+Frame Rate	Images/seconde
+The race's frame rate. The PS2's was 30.	Images par seconde en course. Sur PS2 : 30.
+Draw Distance	Distance de vue
+How far away scenery still shows. 100% is the PS2's.	Jusqu'où le décor reste visible. 100 % : comme sur PS2.
+Level of Detail	Niveau de détail
+Maximum: scenery and cars always at their most detailed models. Original: as on the PS2.	Maximum : décor et voitures toujours avec leurs modèles les plus détaillés. Original : comme sur PS2.
+Show FPS	Afficher les IPS
+Frames per second in the corner of the picture.	Les images par seconde dans un coin de l'image.
+Advanced	Avancé
+Anti-aliasing, texture filtering, brightness, contrast and gamma.	Anticrénelage, filtrage des textures, luminosité, contraste et gamma.
+Window	Fenêtre
+Window or borderless fullscreen. Alt+Enter switches too.	Fenêtre ou plein écran sans bordure. Alt+Entrée bascule aussi.
+The size of the window. Fullscreen fills the monitor.	La taille de la fenêtre. Le plein écran remplit le moniteur.
+Aspect Ratio	Format d'image
+The race's picture; the menus stay 4:3.	L'image de la course ; les menus restent en 4:3.
+Render Scale	Échelle du rendu
+The picture's detail, times the PS2's 512 x 448.	La finesse de l'image, en multiples du 512 x 448 de la PS2.
+Scaling	Mise à l'échelle
+How the picture is scaled to the window.	Comment l'image est adaptée à la fenêtre.
+Anti-Aliasing	Anticrénelage
+Smoother edges.	Des bords plus lisses.
+Anisotropic Filtering	Filtrage anisotrope
+Sharper textures far away.	Des textures plus nettes au loin.
+Brightness	Luminosité
+Lighter or darker, all over.	Plus clair ou plus sombre, partout.
+Contrast	Contraste
+The difference between light and dark.	L'écart entre le clair et le sombre.
+Gamma	Gamma
+Above 1.00 the dark parts get lighter.	Au-dessus de 1.00, les zones sombres s'éclaircissent.
+Defaults	Par défaut
+Brightness, contrast and gamma as they were.	Luminosité, contraste et gamma d'origine.
+The picture is back to the defaults.	L'image est revenue aux réglages par défaut.
+Keyboard	Clavier
+The keys for driving. In menus: arrows, Enter, Esc.	Les touches de conduite. Dans les menus : flèches, Entrée, Échap.
+Gamepad	Manette
+The buttons for driving, the stick and vibration.	Les boutons de conduite, le stick et les vibrations.
+Player 2	Joueur 2
+What the second player drives with in a two-player race.	Ce qu'utilise le second joueur dans une course à deux.
+Second: the second gamepad or half the keyboard. First: the first one.	Seconde : la seconde manette ou la moitié du clavier. Première : la première.
+Player 2's keys, when the keyboard is shared.	Les touches du joueur 2 quand le clavier est partagé.
+Player 2 Keyboard	Clavier joueur 2
+Layouts	Configurations
+The game's own layouts: what each of the PS2's buttons does in a race.	Les configurations du jeu : le rôle de chaque bouton PS2 en course.
+Buttons	Boutons
+Which of the pad's buttons is which of the PS2's. In menus: A, B back, Y help.	Quel bouton de la manette correspond à quel bouton PS2. Dans les menus : A, B retour, Y aide.
+Stick Dead Zone	Zone morte du stick
+How far the left stick moves before the car steers.	La course du stick gauche avant que la voiture tourne.
+Steering	Direction
+Above 100%, the car turns sharper for a small move of the stick.	Au-dessus de 100 %, la voiture tourne plus fort pour un petit mouvement du stick.
+Vibration	Vibrations
+Vibration of the gamepad.	Les vibrations de la manette.
+Button Icons	Icônes des boutons
+Which buttons the game shows, and the menus' layout that goes with them.	Les boutons affichés par le jeu, et la disposition des menus qui va avec.
+Gamepad Buttons	Boutons de la manette
+Reset to Default	Valeurs par défaut
+Back to the defaults.	Retour aux valeurs par défaut.
+Put these keys back as they were.	Remettre ces touches comme à l'origine.
+Put the gamepad's buttons back as they were.	Remettre les boutons de la manette comme à l'origine.
+Put the gamepad back as it was.	Remettre la manette comme à l'origine.
+The gamepad is back to the defaults.	La manette est revenue aux réglages par défaut.
+Cancelled.	Annulé.
+Done. Select a row to bind it again.	Terminé. Sélectionnez une ligne pour la réaffecter.
+Select, then press the gamepad button. Esc cancels.	Sélectionnez, puis appuyez sur le bouton de la manette. Échap annule.
+Select, then press the key. Esc cancels.	Sélectionnez, puis appuyez sur la touche. Échap annule.
+Press a gamepad button. Esc cancels.	Appuyez sur un bouton de la manette. Échap annule.
+Press a key. Esc cancels.	Appuyez sur une touche. Échap annule.
+Cycle HUD	Changer le HUD
+Steer Left	Tourner à gauche
+Steer Right	Tourner à droite
+Accelerate	Accélérer
+Brake / Reverse	Freiner / Reculer
+Horn / Siren	Klaxon / Sirène
+Change View	Changer de vue
+Look Back	Regarder derrière
+Handbrake	Frein à main
+Shift Down / Freeze	Rétrograder / Figer
+Shift Up / Zoom	Monter / Zoom
+Speed Boost	Turbo
+Pause	Pause
+Reset Car	Replacer la voiture
+Up	Haut
+Down	Bas
+Left	Gauche
+Right	Droite
+Enter	Entrée
+Space	Espace
+Esc	Échap
+Backspace	Retour arr.
+Delete	Suppr
+Insert	Inser
+Home	Origine
+End	Fin
+Page Up	Page préc.
+Page Down	Page suiv.
+Caps Lock	Verr. maj
+Shift	Maj
+L Shift	Maj G
+R Shift	Maj D
+L Ctrl	Ctrl G
+R Ctrl	Ctrl D
+Ctrl	Ctrl
+L Alt	Alt G
+R Alt	Alt Gr
+Pad Up	Croix haut
+Pad Down	Croix bas
+Pad Left	Croix gauche
+Pad Right	Croix droite
+L Stick	Stick G
+R Stick	Stick D
+#100004	HUD
+#150004	Partie sauvegardée
+#151001	Chargement des réglages du jeu.
+#151003	Aucun réglage de jeu sauvegardé.
+#151004	Sauvegarde des réglages du jeu.@Ne fermez pas le jeu.
+#151006	Impossible d'ouvrir le dossier de sauvegarde.@ @Réessayer ?
+#151007	Le dossier de sauvegarde est endommagé. Le recréer ?
+#151008	Création du dossier de sauvegarde...
+#151009	Le dossier de sauvegarde a été créé.
+#151010	Impossible de créer le dossier de sauvegarde.@ @Réessayer ?
+#151011	Espace disque insuffisant pour sauvegarder. Réessayer ?
+#151012	La partie n'a pas pu être sauvegardée.@Réessayer ?
+#151013	Recherche des parties sauvegardées...
+#151014	Un nouveau dossier de sauvegarde a été créé.
+#151015	Impossible d'ouvrir le dossier de sauvegarde.@ Réessayer le chargement ?
+#151016	Le dossier de sauvegarde est inutilisable.
+#151017	Impossible d'ouvrir le dossier de sauvegarde.
+#151018	La partie sauvegardée n'a pas pu être chargée.@Réessayer ?
+#151020	Écraser la@partie sauvegardée ?
+#151022	Les réglages actuels seront remplacés par la partie sauvegardée. Continuer ?
+#151023	Créer une sauvegarde ?
+#151024	La partie sauvegardée n'a pas pu être chargée.
+#151025	Impossible d'ouvrir le dossier de sauvegarde.
+#151027	Impossible d'ouvrir le dossier de sauvegarde. Réessayer ?
+#151101	Le dossier de sauvegarde est endommagé.
+#152001	Création du dossier de sauvegarde...
+#300350	Appuyez sur \x81 pour replacer la voiture.
+#800023	\x82 \x83 Incliner la voiture
+#800024	\x84 \x85 Tourner la voiture
+#800026	\x8b \x8d Zoom caméra
+#800070	\x82 \x83 Choisir une option
+#800071	\x86 \x80 Valider l'option
+#802004	\x82 \x83 Incliner la voiture
+#802005	\x84 \x85 Tourner la voiture
+#802006	\x82 \x83 \x84 \x85 Tourner et incliner
+#802007	\x8b \x8d Zoom caméra
+#802010	\x82 \x83 Incliner la voiture
+#802011	\x84 \x85 Tourner la voiture
+#802012	\x82 \x83 \x84 \x85 Tourner et incliner
+#802013	\x8b \x8d Zoom caméra
+#900005	Veuillez brancher@une manette pour@le joueur %d.
+#900011	Veuillez brancher une manette.
+#940001	Appuyez sur \x80 pour participer à cette épreuve.

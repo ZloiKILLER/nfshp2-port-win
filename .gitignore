@@ -1,0 +1,6 @@
+# What a build makes: the generated code, the build folder, the game folder
+/work/
+/build/
+/recompwin/
+__pycache__/
+*.pyc

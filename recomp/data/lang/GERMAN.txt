@@ -1,0 +1,215 @@
+; The port's strings in Deutsch: tools/recomp/make_lang.py writes this file (the format is in recomp/runtime/pclang.h).
+@name Deutsch
+Audio	Audio
+Set the volume and the Jukebox.	Lautstärke und Jukebox einstellen.
+Controls	Steuerung
+Keyboard and gamepad.	Tastatur und Gamepad.
+Graphics	Grafik
+Window, resolution, detail.	Fenster, Auflösung, Details.
+HUD	HUD
+Set what you want to see.	Wählen Sie, was Sie sehen wollen.
+Profiles	Profile
+Choose, add or delete a profile.	Profil wählen, anlegen oder löschen.
+Player Names	Spielernamen
+Set your player names.	Spielernamen festlegen.
+Languages	Sprachen
+Choose the language of the game.	Sprache des Spiels wählen.
+Credits	Mitwirkende
+See who made this game.	Sehen Sie, wer dieses Spiel gemacht hat.
+Master Volume	Gesamtlautstärke
+Master volume of the game.	Gesamtlautstärke des Spiels.
+Exit	Beenden
+Close the game.	Spiel beenden.
+Back	Zurück
+PRESS ENTER	ENTER DRÜCKEN
+PRESS START	START DRÜCKEN
+SAVED	GESPEICHERT
+The name is set.	Der Name ist gesetzt.
+The name stays as it was.	Der Name bleibt, wie er war.
+Type a new name, Backspace edits this one. Enter sets it, Esc leaves it.	Neuen Namen eingeben, Rücktaste ändert diesen. Enter übernimmt, Esc bricht ab.
+On	An
+Off	Aus
+Selected	Gewählt
+Current	Aktuell
+Maximum	Maximal
+Original	Original
+Fullscreen	Vollbild
+Windowed	Fenster
+Smooth	Weich
+Sharp	Scharf
+First	Erstes
+Second	Zweites
+Auto	Auto
+Cancel	Abbrechen
+Delete?	Löschen?
+Press...	Drücken...
+The game's texts and speech in this language.	Texte und Sprachausgabe des Spiels in dieser Sprache.
+Profile	Profil
+New Profile	Neues Profil
+Delete Profile	Profil löschen
+A profile needs a name.	Ein Profil braucht einen Namen.
+There is a profile of that name.	Ein Profil dieses Namens gibt es schon.
+That name cannot be a folder.	Dieser Name kann kein Ordner sein.
+Select it twice to delete this profile, its save and its controls.	Zweimal wählen, um dieses Profil mit Spielstand und Steuerung zu löschen.
+Play as this profile.	Mit diesem Profil spielen.
+This is the profile in use.	Dieses Profil ist in Gebrauch.
+The profile in use cannot be deleted.	Das Profil in Gebrauch kann nicht gelöscht werden.
+Select it again to delete it for good.	Noch einmal wählen, um es endgültig zu löschen.
+Delete nothing.	Nichts löschen.
+Select, then type its name. With a gamepad it gets a number.	Wählen, dann den Namen eingeben. Mit dem Gamepad gibt es eine Nummer.
+Type the name. Enter makes it, Esc leaves it.	Namen eingeben. Enter legt an, Esc bricht ab.
+Choose one to delete.	Eines zum Löschen wählen.
+Resolution	Auflösung
+The window, the screen's resolution and the render scale.	Fenster, Bildschirmauflösung und Renderskalierung.
+Frame Rate	Bildrate
+The race's frame rate. The PS2's was 30.	Bildrate im Rennen. Auf der PS2 waren es 30.
+Draw Distance	Sichtweite
+How far away scenery still shows. 100% is the PS2's.	Wie weit die Umgebung sichtbar bleibt. 100 % wie auf der PS2.
+Level of Detail	Detailstufe
+Maximum: scenery and cars always at their most detailed models. Original: as on the PS2.	Maximal: Umgebung und Autos immer mit ihren detailliertesten Modellen. Original: wie auf der PS2.
+Show FPS	FPS anzeigen
+Frames per second in the corner of the picture.	Bilder pro Sekunde in der Bildecke.
+Advanced	Erweitert
+Anti-aliasing, texture filtering, brightness, contrast and gamma.	Kantenglättung, Texturfilter, Helligkeit, Kontrast und Gamma.
+Window	Fenster
+Window or borderless fullscreen. Alt+Enter switches too.	Fenster oder randloses Vollbild. Auch Alt+Enter schaltet um.
+The size of the window. Fullscreen fills the monitor.	Größe des Fensters. Vollbild füllt den Monitor.
+Aspect Ratio	Seitenverhältnis
+The race's picture; the menus stay 4:3.	Das Bild im Rennen; die Menüs bleiben 4:3.
+Render Scale	Renderskalierung
+The picture's detail, times the PS2's 512 x 448.	Bilddetails als Vielfaches der 512 x 448 der PS2.
+Scaling	Skalierung
+How the picture is scaled to the window.	Wie das Bild an das Fenster angepasst wird.
+Anti-Aliasing	Kantenglättung
+Smoother edges.	Glattere Kanten.
+Anisotropic Filtering	Anisotrope Filterung
+Sharper textures far away.	Schärfere Texturen in der Ferne.
+Brightness	Helligkeit
+Lighter or darker, all over.	Überall heller oder dunkler.
+Contrast	Kontrast
+The difference between light and dark.	Der Unterschied zwischen hell und dunkel.
+Gamma	Gamma
+Above 1.00 the dark parts get lighter.	Über 1.00 werden dunkle Bereiche heller.
+Defaults	Standard
+Brightness, contrast and gamma as they were.	Helligkeit, Kontrast und Gamma wie zuvor.
+The picture is back to the defaults.	Das Bild ist wieder auf Standard.
+Keyboard	Tastatur
+The keys for driving. In menus: arrows, Enter, Esc.	Die Tasten zum Fahren. In Menüs: Pfeile, Enter, Esc.
+Gamepad	Gamepad
+The buttons for driving, the stick and vibration.	Die Knöpfe zum Fahren, der Stick und die Vibration.
+Player 2	Spieler 2
+What the second player drives with in a two-player race.	Womit der zweite Spieler im Rennen zu zweit fährt.
+Second: the second gamepad or half the keyboard. First: the first one.	Zweites: das zweite Gamepad oder die halbe Tastatur. Erstes: das erste.
+Player 2's keys, when the keyboard is shared.	Die Tasten von Spieler 2 bei geteilter Tastatur.
+Player 2 Keyboard	Tastatur Spieler 2
+Layouts	Belegungen
+The game's own layouts: what each of the PS2's buttons does in a race.	Die Belegungen des Spiels: was jede PS2-Taste im Rennen tut.
+Buttons	Knöpfe
+Which of the pad's buttons is which of the PS2's. In menus: A, B back, Y help.	Welcher Gamepad-Knopf welcher PS2-Taste entspricht. In Menüs: A, B zurück, Y Hilfe.
+Stick Dead Zone	Stick-Totzone
+How far the left stick moves before the car steers.	Wie weit sich der linke Stick bewegt, bevor das Auto lenkt.
+Steering	Lenkung
+Above 100%, the car turns sharper for a small move of the stick.	Über 100 % lenkt das Auto bei kleiner Stickbewegung stärker.
+Vibration	Vibration
+Vibration of the gamepad.	Vibration des Gamepads.
+Button Icons	Tastensymbole
+Which buttons the game shows, and the menus' layout that goes with them.	Welche Knöpfe das Spiel zeigt, mit der passenden Menübelegung.
+Gamepad Buttons	Gamepad-Knöpfe
+Reset to Default	Standard wiederherstellen
+Back to the defaults.	Zurück zum Standard.
+Put these keys back as they were.	Diese Tasten zurücksetzen.
+Put the gamepad's buttons back as they were.	Die Gamepad-Knöpfe zurücksetzen.
+Put the gamepad back as it was.	Das Gamepad zurücksetzen.
+The gamepad is back to the defaults.	Das Gamepad ist wieder auf Standard.
+Cancelled.	Abgebrochen.
+Done. Select a row to bind it again.	Fertig. Eine Zeile wählen, um sie neu zu belegen.
+Select, then press the gamepad button. Esc cancels.	Wählen, dann den Gamepad-Knopf drücken. Esc bricht ab.
+Select, then press the key. Esc cancels.	Wählen, dann die Taste drücken. Esc bricht ab.
+Press a gamepad button. Esc cancels.	Einen Gamepad-Knopf drücken. Esc bricht ab.
+Press a key. Esc cancels.	Eine Taste drücken. Esc bricht ab.
+Cycle HUD	HUD wechseln
+Steer Left	Links lenken
+Steer Right	Rechts lenken
+Accelerate	Gas geben
+Brake / Reverse	Bremsen / Rückwärts
+Horn / Siren	Hupe / Sirene
+Change View	Ansicht wechseln
+Look Back	Zurückschauen
+Handbrake	Handbremse
+Shift Down / Freeze	Runterschalten / Anhalten
+Shift Up / Zoom	Hochschalten / Zoom
+Speed Boost	Turbo
+Pause	Pause
+Reset Car	Auto zurücksetzen
+Up	Oben
+Down	Unten
+Left	Links
+Right	Rechts
+Enter	Enter
+Space	Leertaste
+Esc	Esc
+Backspace	Rücktaste
+Delete	Entf
+Insert	Einfg
+Home	Pos1
+End	Ende
+Page Up	Bild auf
+Page Down	Bild ab
+Caps Lock	Feststell
+Shift	Umschalt
+L Shift	Umschalt L
+R Shift	Umschalt R
+L Ctrl	Strg L
+R Ctrl	Strg R
+Ctrl	Strg
+L Alt	Alt L
+R Alt	Alt Gr
+Pad Up	Steuerkreuz oben
+Pad Down	Steuerkreuz unten
+Pad Left	Steuerkreuz links
+Pad Right	Steuerkreuz rechts
+L Stick	Stick L
+R Stick	Stick R
+#100004	HUD
+#150004	Spielstand
+#151001	Spieleinstellungen werden geladen.
+#151003	Keine gespeicherten Spieleinstellungen gefunden.
+#151004	Spieleinstellungen werden gespeichert.@Spiel nicht beenden.
+#151006	Der Speicherordner lässt sich nicht öffnen.@ @Erneut versuchen?
+#151007	Der Speicherordner ist beschädigt. Neu anlegen?
+#151008	Speicherordner wird angelegt...
+#151009	Der Speicherordner wurde angelegt.
+#151010	Der Speicherordner lässt sich nicht anlegen.@ @Erneut versuchen?
+#151011	Nicht genug Speicherplatz zum Speichern. Erneut versuchen?
+#151012	Das Spiel konnte nicht gespeichert werden.@Erneut versuchen?
+#151013	Gespeicherte Spiele werden gesucht...
+#151014	Ein neuer Speicherordner wurde angelegt.
+#151015	Der Speicherordner lässt sich nicht öffnen.@ Erneut laden?
+#151016	Der Speicherordner ist nicht nutzbar.
+#151017	Der Speicherordner lässt sich nicht öffnen.
+#151018	Der Spielstand konnte nicht geladen werden.@Erneut versuchen?
+#151020	Spielstand@überschreiben?
+#151022	Die aktuellen Einstellungen werden durch den Spielstand ersetzt. Fortfahren?
+#151023	Spielstand anlegen?
+#151024	Der Spielstand konnte nicht geladen werden.
+#151025	Der Speicherordner lässt sich nicht öffnen.
+#151027	Der Speicherordner lässt sich nicht öffnen. Erneut versuchen?
+#151101	Der Speicherordner ist beschädigt.
+#152001	Speicherordner wird angelegt...
+#300350	\x81 drücken, um das Auto zurückzusetzen.
+#800023	\x82 \x83 Auto neigen
+#800024	\x84 \x85 Auto drehen
+#800026	\x8b \x8d Kamera zoomen
+#800070	\x82 \x83 Option wählen
+#800071	\x86 \x80 Option ausführen
+#802004	\x82 \x83 Auto neigen
+#802005	\x84 \x85 Auto drehen
+#802006	\x82 \x83 \x84 \x85 Drehen und neigen
+#802007	\x8b \x8d Kamera zoomen
+#802010	\x82 \x83 Auto neigen
+#802011	\x84 \x85 Auto drehen
+#802012	\x82 \x83 \x84 \x85 Drehen und neigen
+#802013	\x8b \x8d Kamera zoomen
+#900005	Bitte ein Gamepad@für Spieler %d@anschließen.
+#900011	Bitte ein Gamepad anschließen.
+#940001	\x80 drücken, um an diesem Event teilzunehmen.

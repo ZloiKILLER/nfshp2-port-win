@@ -1,0 +1,153 @@
+# SDK functions replaced by host code (recomp/runtime/hle_iop.cpp).
+# Names are A1.56 symbols carried over to the retail ELF by symmap.py.
+
+# SIF: IOP boot, commands, RPC, module loading
+sceSifInitCmd
+sceSifExitCmd
+sceSifInitRpc
+sceSifExitRpc
+sceSifBindRpc
+sceSifCallRpc
+sceSifCheckStatRpc
+sceSifSetDma
+sceSifDmaStat
+sceSifSendCmd
+sceSifAddCmdHandler
+sceSifSetCmdBuffer
+sceSifGetReg
+sceSifSetReg
+sceSifGetSreg
+sceSifSetSreg
+sceSifLoadModule
+sceSifLoadStartModule
+sceSifLoadFileReset
+sceSifResetIop
+sceSifRebootIop
+sceSifSyncIop
+sceSifIsAliveIop
+
+# CD/DVD: sectors come straight from the retail ISO image
+sceCdInit
+sceCdInitEeCB
+sceCdMmode
+sceCdDiskReady
+sceCdNcmdDiskReady
+sceCdGetDiskType
+sceCdGetError
+sceCdSearchFile
+sceCdRead
+sceCdReadChain
+sceCdSync
+sceCdSyncS
+sceCdReadClock
+sceScfGetLocalTimefromRTC
+
+# IOP file I/O (cdrom0: paths map onto the ISO)
+sceFsInit
+sceFsReset
+sceOpen
+sceClose
+sceRead
+sceLseek
+sceWrite
+sceIoctl
+sceDevctl
+
+# pad: one DualShock 2 in port 0, nothing pressed
+scePadInit
+scePadInit2
+scePadEnd
+scePadPortOpen
+scePadPortClose
+scePadGetState
+scePadRead
+scePadInfoMode
+scePadSetMainMode
+scePadGetReqState
+scePadSetReqState
+scePadInfoAct
+scePadSetActAlign
+scePadSetActDirect
+scePadInfoPressMode
+scePadEnterPressMode
+scePadExitPressMode
+scePadInfoComb
+scePadGetPortMax
+scePadGetSlotMax
+scePadGetModVersion
+scePadSetButtonInfo
+scePadGetButtonMask
+scePadSetVrefParam
+scePadSetWarningLevel
+
+# memory card: the folder saves/ (every libmc call cMC makes)
+sceMcInit
+sceMcEnd
+sceMcSync
+sceMcGetInfo
+sceMcUdCheckNewCard
+sceMcOpen
+sceMcMkdir
+sceMcClose
+sceMcRead
+sceMcWrite
+sceMcGetDir
+sceMcDelete
+# symmap.py places these two wrong (libmc of the retail has three more functions than
+# A1.56); the start is the prologue that cMC::MCFormat / MCUnformat call
+sceMcFormat 0x28eda0
+sceMcUnformat 0x28f360
+
+# Game functions the port patches (recomp/runtime/pcmenu.cpp): the recompiled body stays and
+# HOOK_<name>(Ctx &, orig) runs around it
+hook LoaderFlailerChunk__FP6bChunk
+hook __17FlailerScreenList
+hook __14tOptionsScreeni
+hook HandleEvent__14tOptionsScreeniP18ScreenCallbackData
+hook Tick__17FlailerScreenList
+hook HandleEvent__11NewMainMenu13ScreenMessageP18ScreenCallbackData
+hook UnloaderFlailerChunk__FP6bChunk
+hook __21tDisplayOptionsScreeni
+hook Loader__15LanguageManagerP6bChunk
+hook SetInputMode__6Player16PlayerInputModes
+hook AttachDmaDataListMain__FP9eDmaChainP12eDmaDataListP8DMAState
+hook elSetupLightContext__FP13eLightContextP8bMatrix4T1P8bVector4P5eView 0x115978
+hook eDisplayFrame__Fv
+hook Think__15AICarControllerf 0x191148
+hook Callback__14BootAutoLoader13ScreenMessageP18ScreenCallbackData 0x247ab0
+hook HandleEvent__9NameEntry13ScreenMessageP18ScreenCallbackData 0x24d870
+hook HandleEvent__12MemcardSaver13ScreenMessageP18ScreenCallbackData 0x246138
+hook HandleEvent__13MemcardLoader13ScreenMessageP18ScreenCallbackData 0x246c00
+hook DisplayMessage__15MemcardPrompteriii 0x245e30
+hook DisplayYesNoMessage__15MemcardPrompteriiiii 0x245f60
+hook TreeCull__20ScenerySectionHeaderP15SceneryCullInfo 0x150378
+hook DrawAScenery__20ScenerySectionHeaderiP15SceneryCullInfoi 0x14fe18
+hook WhatSectionsShouldWeDraw__20GrandSceneryCullInfoPsiP15SceneryCullInfo 0x150950
+hook FetchVRAM__FP12eRenderStage 0x111348
+hook eMulMatrix__FP8bMatrix4T0T0 0x11b248
+hook eMulVector__FP8bVector4PC8bMatrix4PC8bVector4 0x11b2c0
+hook eRotTransPers__FP8bVector4P8bMatrix4T0 0x11b350
+hook eGetClipFlags__FP8bVector4P8bMatrix4 0x11b3b8
+hook ClassifyAABB__FPC8bVector4T0PC8bMatrix4 0x10ccb0
+# the movie decoder as C++ (native_movie.cpp)
+hook ToImage__8DCTImagePUcici 0x234b38
+# when the keyboard is shared by two players (pcmenu.cpp)
+hook SetTwoPlayerScreenMode__Fi 0x16caa8
+# memory and maths as C++ (native_mem.cpp, hot_math.cpp)
+hook bMemCpy 0x250288
+hook bMemSet 0x250340
+hook memcpy 0x296e14
+hook memset 0x296ec4
+hook LZDecompress__FPUcT0 0x1b41c8
+hook bMulMatrix__FP8bMatrix4PC8bMatrix4T1 0x25ae18
+hook bMulMatrix__FP8bVector3PC8bMatrix4PC8bVector3 0x25aed0
+hook fDeterminant__FP8bMatrix4 0x126088
+hook Render__12FlailerStripP5eView 0x145950
+hook AddData__12eDmaDataListUsPvUsUs 0x104a20
+hook CreateViewMatricies__FP5eViewP8bMatrix4T1T1T1T1T1fff 0x10e638
+hook eAttachFog__FP9eDmaChainUi 0x119768
+hook eAttachDepthOfField__FP9eDmaChainUiUi 0x119f70
+hook eAttachBlackAndWhite__FP9eDmaChainUiUi 0x11a9f0
+hook AttachTextureEnvDirect__FP9eDmaChainP11TextureInfo 0x1090b8
+hook __18AudioOptionsScreeni
+hook HandleEvent__18AudioOptionsScreeniP18ScreenCallbackData 0x1efb80

@@ -1,0 +1,40 @@
+// The exe's icon; window.cpp takes it by this id for the window too
+1 ICON "speed.ico"
+
+// The file's properties (Explorer, Details)
+1 VERSIONINFO
+FILEVERSION 0,1,0,0
+PRODUCTVERSION 0,1,0,0
+FILEFLAGSMASK 0x3f
+FILEFLAGS 0
+FILEOS 0x40004
+FILETYPE 1
+FILESUBTYPE 0
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "FileDescription", "Ported by ZloiKILLER"
+            VALUE "FileVersion", "0.1"
+            VALUE "ProductName", "Need for Speed: Hot Pursuit 2"
+            VALUE "ProductVersion", "0.1"
+            VALUE "OriginalFilename", "speed.exe"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
+
+// What the first start writes into the game's folder (install.cpp): the names of the disc's files, the port's texts, the cursor, the README
+ZDIR_NAMES RCDATA "../data/zdir_names_ntsc.txt"
+LANG_ENGLISH RCDATA "../data/lang/ENGLISH.txt"
+LANG_FRENCH RCDATA "../data/lang/FRENCH.txt"
+LANG_GERMAN RCDATA "../data/lang/GERMAN.txt"
+LANG_ITALIAN RCDATA "../data/lang/ITALIAN.txt"
+LANG_SPANISH RCDATA "../data/lang/SPANISH.txt"
+LANG_SWEDISH RCDATA "../data/lang/SWEDISH.txt"
+UI_CURSOR RCDATA "../data/ui/cursor.cur"
+README RCDATA "../data/README.txt"
