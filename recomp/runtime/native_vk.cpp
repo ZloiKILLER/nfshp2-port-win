@@ -198,6 +198,7 @@ static struct {
     VkPipeline fold_pipeline;
     VkPipelineLayout fold_layout;
     bool env_ready[6], env_drawn_now[6], sphere_ready;
+    bool scene_ready;                       // the scene image has had a layout: copy_scene, or the fog's first frame
     VkCommandBuffer cmd;
     VkFence fence;
     bool waiting;
@@ -210,6 +211,7 @@ static struct {
     int swap_w, swap_h;
     bool swap_stale;
     VkSemaphore acquired, rendered;
+    std::vector<VkSemaphore> present_sems;  // per swapchain image: what its present waits on (one for all may still be in use by the last)
     VkBuffer fps_buf;
     void *fps_map;
     int fps_shown, fps_frames, presented;
@@ -395,8 +397,10 @@ static void all_barrier()
 static void depth_barrier(VkImageLayout from, VkImageLayout to)
 {
     VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
-    b.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
-    b.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+    // the copies of copy_depth_rects read it too
+    b.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT;
+    b.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_SHADER_READ_BIT |
+                      VK_ACCESS_TRANSFER_READ_BIT;
     b.oldLayout = from;
     b.newLayout = to;
     b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -661,6 +665,13 @@ static bool setup_resources()
         !make_image(g.palette, palette_view, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT, 256, 8))
         return false;
 
+    // Every render pass waits for all that came before it, and all that comes after waits for it, the layout changes at its start and end
+    // included. Without these the passes' own changes of layout raced the copies and the passes around them: NVIDIA's GPUs keep them in
+    // order anyway, AMD's do not (blocks of black and old pictures in the menus, 2026-11-06; the validation layer's sync checks name them).
+    static const VkAccessFlags kAll = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    static const VkSubpassDependency kDeps[2] = {
+        {VK_SUBPASS_EXTERNAL, 0, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT, kAll, 0},
+        {0, VK_SUBPASS_EXTERNAL, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT, kAll, 0}};
     VkAttachmentDescription at[2] = {};
     at[0].format = VK_FORMAT_B8G8R8A8_UNORM;
     at[0].samples = VK_SAMPLE_COUNT_1_BIT;
@@ -684,6 +695,8 @@ static bool setup_resources()
     rp.pAttachments = at;
     rp.subpassCount = 1;
     rp.pSubpasses = &sub;
+    rp.dependencyCount = getenv("HP2_NODEPS") ? 0 : 2;
+    rp.pDependencies = kDeps;
     if (vkCreateRenderPass(g.dev, &rp, nullptr, &g.pass)) return false;
     // the picture again after an effect
     at[0].loadOp = at[1].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
@@ -750,6 +763,18 @@ static bool setup_resources()
         rp2.pAttachments = a2;
         rp2.subpassCount = 1;
         rp2.pSubpasses = &sub2;
+        VkSubpassDependency2 deps2[2] = {};
+        for (int i = 0; i < 2; i++) {
+            deps2[i].sType = VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2;
+            deps2[i].srcSubpass = kDeps[i].srcSubpass;
+            deps2[i].dstSubpass = kDeps[i].dstSubpass;
+            deps2[i].srcStageMask = kDeps[i].srcStageMask;
+            deps2[i].dstStageMask = kDeps[i].dstStageMask;
+            deps2[i].srcAccessMask = kDeps[i].srcAccessMask;
+            deps2[i].dstAccessMask = kDeps[i].dstAccessMask;
+        }
+        rp2.dependencyCount = getenv("HP2_NODEPS") ? 0 : 2;
+        rp2.pDependencies = deps2;
         if (create2(g.dev, &rp2, nullptr, &g.pass)) return false;
         a2[0].loadOp = a2[1].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
         a2[0].initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
@@ -813,6 +838,8 @@ static bool setup_resources()
     frp.pAttachments = &fa;
     frp.subpassCount = 1;
     frp.pSubpasses = &fs;
+    frp.dependencyCount = getenv("HP2_NODEPS") ? 0 : 2;
+    frp.pDependencies = kDeps;
     if (vkCreateRenderPass(g.dev, &frp, nullptr, &g.fold_pass)) return false;
     VkFramebufferCreateInfo sfb = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
     sfb.renderPass = g.fold_pass;
@@ -1155,7 +1182,7 @@ static bool rebuild()
     for (auto it = g_undo.rbegin(); it != g_undo.rend(); ++it) (*it)();
     g_undo.clear();
     g.color_ms = g.depth_ms = VK_NULL_HANDLE;
-    g.rvm_ready = g.prev_ready = g.sphere_ready = false;
+    g.rvm_ready = g.prev_ready = g.sphere_ready = g.scene_ready = false;
     for (int i = 0; i < 6; i++) g.env_ready[i] = g.env_drawn_now[i] = false;
     g.waiting = false;
     g.depth_rects.clear();
@@ -1816,6 +1843,12 @@ static void blit_to_window(VkImage image, const NativeFrame &frame)
     VkClearColorValue black = {};
     VkImageSubresourceRange all = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     vkCmdClearColorImage(g.cmd, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &all);
+    // each write over the last waits for it: the clear, the picture, the counter and the word. Without, AMD's GPUs do them at once, by tiles
+    auto after_write = [&] {
+        image_barrier(image, 0, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+                      VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    };
+    after_write();
     // a TV picture whatever its size in pixels, 4:3 or the race's: the largest such box in the middle of the window
     float aspect = (4.0f / 3.0f) / (frame.wide ? native_narrow() : 1.0f);
     int bw = g.swap_w, bh = g.swap_h;
@@ -1832,7 +1865,9 @@ static void blit_to_window(VkImage image, const NativeFrame &frame)
     bl.dstOffsets[1] = {bx + bw, by + bh, 1};
     vkCmdBlitImage(g.cmd, g.color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl,
                    g_cfg.smooth ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+    after_write();
     if (g_cfg.show_fps) draw_fps(image, bx + 8, by + 8);
+    after_write();
     draw_notice(image, bx + bw, by + bh, kFpsBytes / 2);
     image_barrier(image, 0, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, VK_ACCESS_TRANSFER_WRITE_BIT, 0,
                   VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
@@ -1915,13 +1950,28 @@ static void copy_scene()
     }
     image_barrier(g.scene, g.scene_levels - 1, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
                   VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+    g.scene_ready = true;
 }
 
 // the render pass of the picture is over: lay this on it
 static void draw_fx(const NativeFrame &frame, const NativeFx &f, int row)
 {
-    if (f.kind != FX_FOG) copy_scene();
-    else all_barrier();
+    if (f.kind != FX_FOG) {
+        copy_scene();
+    } else {
+        all_barrier();
+        // the fog does not read the scene image, but its pipeline has it bound: it must not be in no layout at all
+        if (!g.scene_ready) {
+            image_barrier(g.scene, 0, g.scene_levels, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                          VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+            VkClearColorValue black = {};
+            VkImageSubresourceRange all = {VK_IMAGE_ASPECT_COLOR_BIT, 0, (uint32_t)g.scene_levels, 0, 1};
+            vkCmdClearColorImage(g.cmd, g.scene, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &all);
+            image_barrier(g.scene, 0, g.scene_levels, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                          VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+            g.scene_ready = true;
+        }
+    }
     depth_barrier(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     VkRenderPassBeginInfo rb = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     rb.renderPass = g.post_pass;
@@ -2228,6 +2278,7 @@ bool native_vk_draw(const NativeFrame &frame)
         VkBufferImageCopy copy = {};
         copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         copy.imageExtent = {(uint32_t)W, (uint32_t)H, 1};
+        all_barrier();                      // after the passes that wrote the picture
         vkCmdCopyImageToBuffer(g.cmd, g.color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.readback, 1, &copy);
     }
     // the window: its size, then an image if one is free (a frame that finds none is simply not shown)
@@ -2254,6 +2305,17 @@ bool native_vk_draw(const NativeFrame &frame)
         }
     }
     if (on_screen) blit_to_window(g.swap_images[image], frame);
+    // the semaphore the present waits on: the image's own
+    VkSemaphore present_wait = g.rendered;
+    if (on_screen) {
+        while (g.present_sems.size() <= image) {
+            VkSemaphoreCreateInfo sci = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+            VkSemaphore sem = VK_NULL_HANDLE;
+            vkCreateSemaphore(g.dev, &sci, nullptr, &sem);
+            g.present_sems.push_back(sem);
+        }
+        if (g.present_sems[image]) present_wait = g.present_sems[image];
+    }
     gpu_mark(4);
     vkEndCommandBuffer(g.cmd);
     const double record_ms = cpu_lap();
@@ -2266,13 +2328,13 @@ bool native_vk_draw(const NativeFrame &frame)
         si.pWaitSemaphores = &g.acquired;
         si.pWaitDstStageMask = &wait_stage;
         si.signalSemaphoreCount = 1;
-        si.pSignalSemaphores = &g.rendered;
+        si.pSignalSemaphores = &present_wait;
     }
     vkQueueSubmit(g.queue, 1, &si, g.fence);
     if (on_screen) {
         VkPresentInfoKHR pi = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
         pi.waitSemaphoreCount = 1;
-        pi.pWaitSemaphores = &g.rendered;
+        pi.pWaitSemaphores = &present_wait;
         pi.swapchainCount = 1;
         pi.pSwapchains = &g.swapchain;
         pi.pImageIndices = &image;
