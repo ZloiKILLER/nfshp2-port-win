@@ -1,9 +1,12 @@
 # Need for Speed: Hot Pursuit 2 — Windows port
 
-A static recompilation of the PlayStation 2 game (USA, SLUS-20362) for Windows: the game's own code, translated to C++, on a native Vulkan
+A static recompilation of the PlayStation 2 game for Windows: the game's own code, translated to C++, on a native Vulkan
 renderer, with PC controls, menus, profiles and settings. Ported by ZloiKILLER.
 
-**The game is not included.** You need your own copy: the disc image (`.iso`) of the USA release, SLUS-20362.
+**The game is not included.** You need your own copy, the disc image (`.iso`) of one of these releases:
+
+- USA, SLUS-20362
+- Europe v1.00, SLES-50731
 
 ## Playing
 
