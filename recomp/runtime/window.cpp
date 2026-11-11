@@ -288,6 +288,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         break;
     case WM_DESTROY:
         window_rumble(0, 0);            // a pad's motors outlive the program
+        pad_settle(150);                // the pads' thread tells them
         ExitProcess(0);
     }
     return DefWindowProcA(h, m, wp, lp);

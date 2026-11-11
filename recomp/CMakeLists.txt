@@ -26,11 +26,12 @@ endif()
 set(SHADER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/runtime/shaders)
 set(SHADER_OUT ${CMAKE_CURRENT_BINARY_DIR}/shaders)
 set(SHADER_HEADERS)
-foreach(s native.vert native.frag native_fold.vert native_fold.frag native_post.vert native_post.frag native_restore.frag native_grade.frag native_opaque.frag)
+foreach(s native.vert native.frag native_fold.vert native_fold.frag native_post.vert native_post.frag native_restore.frag native_grade.frag native_opaque.frag
+        native_smaa_edge.vert native_smaa_edge.frag native_smaa_weight.vert native_smaa_weight.frag native_smaa_blend.vert native_smaa_blend.frag)
     add_custom_command(OUTPUT ${SHADER_OUT}/${s}.spv.h
         COMMAND ${CMAKE_COMMAND} -E make_directory ${SHADER_OUT}
         COMMAND ${GLSLC} --target-env=vulkan1.1 -O -mfmt=c -o ${SHADER_OUT}/${s}.spv.h ${SHADER_DIR}/${s}
-        DEPENDS ${SHADER_DIR}/${s}
+        DEPENDS ${SHADER_DIR}/${s} ${SHADER_DIR}/smaa/common.glsl ${SHADER_DIR}/smaa/SMAA.hlsl
         COMMENT "glslc ${s}")
     list(APPEND SHADER_HEADERS ${SHADER_OUT}/${s}.spv.h)
 endforeach()
@@ -78,7 +79,10 @@ add_subdirectory(${SDL3_SOURCE} ${CMAKE_CURRENT_BINARY_DIR}/sdl3 EXCLUDE_FROM_AL
 add_executable(hp2recomp runtime/ps2.cpp runtime/pcmenu.cpp runtime/pcsettings.cpp runtime/pclang.cpp runtime/setup.cpp runtime/install.cpp runtime/pcplatform.cpp runtime/pad.cpp runtime/native.cpp runtime/native_tex.cpp runtime/native_vk.cpp runtime/hle_iop.cpp runtime/dma.cpp runtime/vif.cpp runtime/profile.cpp runtime/hot_math.cpp runtime/native_mem.cpp runtime/native_movie.cpp runtime/gs_regs.cpp runtime/pcconfig.cpp runtime/window.cpp ${SOUND_SOURCES} ${HOST_SOURCES} ${GEN_SOURCES})
 target_include_directories(hp2recomp PRIVATE runtime ${GEN_DIR} ${VULKAN_INCLUDE} ${SHADER_OUT})
 # the playable build is recompwin/speed.exe, next to data/, hp2.ini and saves/
-set_target_properties(hp2recomp PROPERTIES CXX_STANDARD 17 OUTPUT_NAME speed RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/../recompwin)
+if(NOT HP2_NAME)
+    set(HP2_NAME speed)      # -DHP2_NAME=<other>: a build for measuring, beside the playable one
+endif()
+set_target_properties(hp2recomp PROPERTIES CXX_STANDARD 17 OUTPUT_NAME ${HP2_NAME} RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/../recompwin)
 if(WIN32)
     set_target_properties(hp2recomp PROPERTIES WIN32_EXECUTABLE ON)     # no console
     target_link_options(hp2recomp PRIVATE -Wl,/entry:mainCRTStartup)    # still main()

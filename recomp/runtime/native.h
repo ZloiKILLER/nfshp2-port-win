@@ -26,6 +26,7 @@ struct NativeTexture {
     bool upscaled = false;          // a replacement larger than the game's: the GPU's filter, the GS's levels do not fit it
     bool dirty = false;
     void *vk = nullptr;             // native_vk.cpp's
+    char name[28] = {};             // the game's, for the logs
 };
 
 enum NativeBlend {

@@ -16,10 +16,20 @@
 // Overflow and exponent 255 are the host's clamp to the largest finite value, where the EE would have 0x7FFFFFFF: rare in a game's maths.
 // Built with EE_HOST_FLOAT defined: the host's arithmetic alone, for comparing. Checked against the models: work/eefloat/*.cpp.
 #pragma once
+// TEMP: one kind of operation on the host alone (work/eefloat: where the cost is)
+#ifdef EE_HOST_FLOAT
+#define EE_HOST_ADD
+#define EE_HOST_MUL
+#define EE_HOST_DIV
+#define EE_HOST_SQRT
+#endif
 #include <cstdint>
 #include <cstring>
 #include <cmath>
 #include <atomic>
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 
 // ps2.cpp: the multiplier's correction where the first mantissa's low 16 bits are 0, a bit for each pattern of the second's low 16 bits
 // (ee_float_init fills it from the model); the last divisions and roots that took the recurrence, by their operands' bits
@@ -38,6 +48,14 @@ extern EeSqrtEntry g_ee_sqrt_cache[4096];
 // a thread of their own (ee_tables_build, from main, 2 to 3 s), and used once g_ee_tables is set; till then the recurrence.
 extern uint8_t g_ee_recip_up[1 << 20], g_ee_sqrt_up[1 << 21];
 extern std::atomic<bool> g_ee_tables;
+// TEMP (-DEE_COUNT): how many of each a world step makes: add, mul, div, sqrt, add4, mul4, div by recurrence
+#ifdef EE_COUNT
+extern uint64_t g_ee_count[8];
+#define EE_N(i) (g_ee_count[i]++)
+void ee_count_site(int kind);
+#else
+#define EE_N(i) ((void)0)
+#endif
 
 static inline uint32_t ee_bits(float f)
 {
@@ -62,7 +80,8 @@ static inline float fclamp(float v)
 
 static inline float ee_add(float a, float b)
 {
-#ifndef EE_HOST_FLOAT
+    EE_N(0);
+#ifndef EE_HOST_ADD
     uint32_t x = ee_bits(a), y = ee_bits(b);
     const int d = (int)(x >> 23 & 255) - (int)(y >> 23 & 255);
     const int sy = d > 24 ? 31 : d - 1, sx = d < -24 ? 31 : -d - 1;
@@ -153,10 +172,15 @@ static inline float ee_mul_slow(uint32_t x, uint32_t y, float r)
 
 static inline float ee_mul(float a, float b)
 {
+    EE_N(1);
+#ifdef EE_COUNT
+    ee_count_site(1);
+#endif
     const float r = fclamp(a * b);
-#ifndef EE_HOST_FLOAT
+#ifndef EE_HOST_MUL
     const uint32_t x = ee_bits(a), y = ee_bits(b);
-    if (__builtin_expect(ee_mul_differs(x, y), 0)) return ee_mul_slow(x, y, r);
+    // the product's bits 15..22 first (they are the raw words' product's too): all zero once in 256, the rest of the test only then
+    if (__builtin_expect(((x * y) & 0x7f8000u) == 0, 0) && ee_mul_differs(x, y)) return ee_mul_slow(x, y, r);
 #endif
     return r;
 }
@@ -181,6 +205,7 @@ static inline int ee_qsel(EeCsa r)
 
 static inline float ee_div_srt(float a, float b)
 {
+    EE_N(6);
     const uint32_t x = ee_bits(a), y = ee_bits(b), sign = (x ^ y) & 0x80000000u;
     const uint32_t ex = x >> 23 & 255, ey = y >> 23 & 255;
     if (!ey) return ee_float(sign | 0x7f7fffffu);           // by zero: the largest value (the EE's is 0x7FFFFFFF, past the host's)
@@ -239,7 +264,11 @@ static inline uint32_t ee_past_ulp(double v)
 
 static inline float ee_div(float a, float b)
 {
-#ifndef EE_HOST_FLOAT
+    EE_N(2);
+#ifdef EE_COUNT
+    ee_count_site(0);
+#endif
+#ifndef EE_HOST_DIV
     const uint32_t x = ee_bits(a), y = ee_bits(b);
     const uint32_t ex = x >> 23 & 255, ey = y >> 23 & 255;
     // The recurrence ends one ulp above the host's quotient only past a bound on the fraction f past the ulp, set by the divisor's
@@ -275,7 +304,8 @@ static inline float ee_div(float a, float b)
 
 static inline float ee_sqrt(float a)
 {
-#ifndef EE_HOST_FLOAT
+    EE_N(3);
+#ifndef EE_HOST_SQRT
     const uint32_t x = ee_bits(a);
     // the root's mantissa depends on the operand's 23 bits and its exponent's lowest alone: the host's or one ulp more (the table)
     if ((x >> 23 & 255) - 1 < 254 && g_ee_tables.load(std::memory_order_acquire)) {
@@ -315,15 +345,26 @@ static inline ee_v4f ee_clamp4(ee_v4f v)
 
 static inline ee_v4f ee_add4(ee_v4f a, ee_v4f b)
 {
-#ifndef EE_HOST_FLOAT
+    EE_N(4);
+#ifndef EE_HOST_ADD
     ee_v4u x = (ee_v4u)a, y = (ee_v4u)b;
     const ee_v4i d = (ee_v4i)(x >> 23 & 255u) - (ee_v4i)(y >> 23 & 255u);
+#if defined(__SSE2__)
+    // SSE2 has no shift by a count for each lane: the mask ~0 << n is -(2^n), and 2^n comes from the float of that exponent, cut to an
+    // integer. n is |d| - 1 for the smaller operand, 0 for the other; from d = 25 on the float is 2^31 or more (or a NaN), which cuts to
+    // 0x80000000: the mask that leaves the sign alone
+    const ee_v4i ny = (d - 1) & (d > 1), nx = (-d - 1) & (d < -1);
+    const ee_v4i fy = ((ny + 127) << 23) | ((d > 24) & 0x4f000000), fx = ((nx + 127) << 23) | ((d < -24) & 0x4f000000);
+    y &= (ee_v4u)(0 - (ee_v4i)_mm_cvttps_epi32((__m128)fy));
+    x &= (ee_v4u)(0 - (ee_v4i)_mm_cvttps_epi32((__m128)fx));
+#else
     // the shift for the smaller operand: |d| - 1, 31 from 25 on (only its sign left), 0 where it is not the smaller
     const ee_v4i far_y = d > 24, far_x = d < -24, y_small = d > 0, x_small = d < 0;
     const ee_v4u sy = (ee_v4u)((far_y & 31) | (~far_y & y_small & (d - 1)));
     const ee_v4u sx = (ee_v4u)((far_x & 31) | (~far_x & x_small & (-d - 1)));
     y &= ~0u << sy;
     x &= ~0u << sx;
+#endif
     return ee_clamp4((ee_v4f)x + (ee_v4f)y);
 #else
     return ee_clamp4(a + b);
@@ -334,12 +375,12 @@ static inline ee_v4f ee_sub4(ee_v4f a, ee_v4f b) { return ee_add4(a, (ee_v4f)((e
 
 static inline ee_v4f ee_mul4(ee_v4f a, ee_v4f b)
 {
+    EE_N(5);
     ee_v4f r = ee_clamp4(a * b);
-#ifndef EE_HOST_FLOAT
+#ifndef EE_HOST_MUL
     const ee_v4u x = (ee_v4u)a, y = (ee_v4u)b;
-    const ee_v4u ma = (x & 0x7fffffu) | 0x800000u, mb = (y & 0x7fffffu) | 0x800000u;
-    const ee_v4i maybe = (ee_v4i)(((ma * mb) & 0x7f8000u) == 0u) & (ee_v4i)((mb & 0xffffu) != 0u) & (ee_v4i)((x & 0x7f800000u) != 0u) &
-                         (ee_v4i)((y & 0x7f800000u) != 0u);
+    // bits 15..22 of each lane's product all zero: once in 256, and only then the lanes are looked at one by one
+    const ee_v4i maybe = (ee_v4i)(((x * y) & 0x7f8000u) == 0u);
     uint64_t w[2];
     memcpy(w, &maybe, 16);
     if (__builtin_expect((w[0] | w[1]) != 0, 0))

@@ -1,12 +1,12 @@
 Need for Speed: Hot Pursuit 2 - Windows port
 
 INSTALLING
-  You need your own copy of the game: the disc image (.iso) of Need for Speed: Hot Pursuit 2 for PlayStation 2, USA (SLUS-20362).
-  Start speed.exe. The first time it asks for the disc image and where to install, and makes the folder nfshp2port there with
-  everything the game needs (about 3.6 GB). The disc image is only read. Then the game starts.
+  You need your own copy of the game: the disc image (.iso) of Need for Speed: Hot Pursuit 2 for PlayStation 2, USA (SLUS-20362) or Europe v1.00 (SLES-50731).
+  Start speed.exe. The first time it asks for the disc image and for the folder to install into (any folder you like), and puts
+  everything the game needs there (about 3.6 GB). The disc image is only read. Then the game starts.
 
 RUNNING
-  Start speed.exe in nfshp2port (or the shortcut on the desktop). The folder can be moved anywhere: the game needs nothing outside it.
+  Start speed.exe in the game's folder (or the shortcut on the desktop). The folder can be moved anywhere: the game needs nothing outside it.
 
 CONTROLS
   In menus (fixed)
@@ -60,7 +60,7 @@ TWO PLAYERS (Hot Pursuit > Challenge > Players)
 SETTINGS
   Options > Graphics   frame rate, draw distance, frame counter
                        Resolution: window mode, resolution, aspect ratio, render scale up to 8x, picture scaling
-                       Advanced: anti-aliasing, anisotropic filtering, brightness, contrast, gamma.
+                       Advanced: antialiasing (off, MSAA or SMAA, 2x or 4x), anisotropic filtering, brightness, contrast, gamma.
                        They all apply at once, no restart.
   Options > HUD        map, mirror, units, standings and other race display elements
   Options > Audio      master volume and volumes by sound type

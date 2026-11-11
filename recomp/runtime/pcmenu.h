@@ -34,6 +34,7 @@ struct PcRow {
     std::function<std::string()> value;     // null: an action row (no value, no arrows)
     std::function<void(int dir)> change;     // dir -1 / +1 for Left / Right, 0 for Select
     bool select_only = false;                // Left and Right do nothing and no arrows show: a binding, which shows a value but only Select starts
+    std::function<bool()> disabled;          // true: the row shows greyed and cannot be chosen, by the pad or by the pointer (the game's own grey)
 };
 
 struct PcPage {

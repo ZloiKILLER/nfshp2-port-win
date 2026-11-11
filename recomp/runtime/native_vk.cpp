@@ -61,6 +61,27 @@ static const uint32_t kGradeFrag[] =
 static const uint32_t kOpaqueFrag[] =
 #include "native_opaque.frag.spv.h"
     ;
+// SMAA: Jimenez and others' "Enhanced Subpixel Morphological Antialiasing" (shaders/smaa, MIT), its three passes and two tables
+static const uint32_t kSmaaEdgeVert[] =
+#include "native_smaa_edge.vert.spv.h"
+    ;
+static const uint32_t kSmaaWeightVert[] =
+#include "native_smaa_weight.vert.spv.h"
+    ;
+static const uint32_t kSmaaBlendVert[] =
+#include "native_smaa_blend.vert.spv.h"
+    ;
+static const uint32_t kSmaaEdgeFrag[] =
+#include "native_smaa_edge.frag.spv.h"
+    ;
+static const uint32_t kSmaaWeightFrag[] =
+#include "native_smaa_weight.frag.spv.h"
+    ;
+static const uint32_t kSmaaBlendFrag[] =
+#include "native_smaa_blend.frag.spv.h"
+    ;
+#include "smaa/AreaTex.h"
+#include "smaa/SearchTex.h"
 
 #define NV_INSTANCE(X)                                                                                     \
     X(vkEnumeratePhysicalDevices) X(vkGetPhysicalDeviceProperties) X(vkGetPhysicalDeviceQueueFamilyProperties) \
@@ -158,6 +179,15 @@ static struct {
     VkPipeline pipeline_ms[2][2][NB_COUNT][2][2], alpha_only_ms[2][2][2], restore_pipeline;
     VkPipelineLayout restore_layout;
     VkDescriptorSet restore_set;
+    // SMAA on the finished picture (the setting's): edges, then weights, then the picture blended, each a pass of its own
+    bool smaa, smaa_tables;
+    VkImage smaa_edges, smaa_weights, smaa_area, smaa_search;
+    VkRenderPass smaa_pass;
+    VkFramebuffer smaa_fb[2];
+    VkPipeline smaa_pipeline[3];
+    VkPipelineLayout smaa_layout[3];
+    VkDescriptorSet smaa_scene_set, smaa_edges_set, smaa_weights_set, smaa_area_set, smaa_search_set;
+    VkBuffer smaa_stage;
     VkPipeline grade_pipeline;              // brightness, contrast, gamma
     VkPipelineLayout grade_layout;
     VkDescriptorSet grade_set;
@@ -746,7 +776,7 @@ static bool setup()
 }
 
 // the picture's size, the multisampling, the filter: what the settings say
-static int settings_key() { return g_cfg.scale | native_aspect() << 4 | g_cfg.aa << 8 | g_cfg.aniso << 16; }
+static int settings_key() { return g_cfg.scale | native_aspect() << 4 | g_cfg.msaa() << 8 | g_cfg.aniso << 16 | (g_cfg.aa_mode == 2) << 24; }
 
 // what the menu may offer: the most samples the picture can have, the most anisotropy
 bool native_vk_limits(int &aa, int &aniso)
@@ -773,9 +803,9 @@ static bool setup_resources()
     static const bool exact = getenv("HP2_NATIVEEXACT") != nullptr;
     g.aniso = !exact && g.can_aniso ? std::min(g_cfg.aniso, (int)props.limits.maxSamplerAnisotropy) : 0;
     g.samples = VK_SAMPLE_COUNT_1_BIT;
-    if (!exact && g_cfg.aa > 1 && props.apiVersion >= VK_API_VERSION_1_2) {
+    if (!exact && g_cfg.msaa() > 1 && props.apiVersion >= VK_API_VERSION_1_2) {
         VkSampleCountFlags can = props.limits.framebufferColorSampleCounts & props.limits.framebufferDepthSampleCounts;
-        for (int s = g_cfg.aa; s >= 2 && g.samples == VK_SAMPLE_COUNT_1_BIT; s /= 2)
+        for (int s = g_cfg.msaa(); s >= 2 && g.samples == VK_SAMPLE_COUNT_1_BIT; s /= 2)
             if (can & (VkSampleCountFlags)s) g.samples = (VkSampleCountFlagBits)s;
     }
 
@@ -939,7 +969,7 @@ static bool setup_resources()
     if (!make_image(g.env_depth, ed, VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT, ENV_SIZE, ENV_SIZE)) return false;
     VkImageView env_view[6];
     for (int i = 0; i < 6; i++) {
-        if (!make_image(g.env[i], env_view[i], VK_FORMAT_B8G8R8A8_UNORM, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        if (!make_image(g.env[i], env_view[i], VK_FORMAT_B8G8R8A8_UNORM, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                         VK_IMAGE_ASPECT_COLOR_BIT, ENV_SIZE, ENV_SIZE))
             return false;
         VkImageView v2[2] = {env_view[i], ed};
@@ -1304,6 +1334,87 @@ static bool setup_resources()
         if (vkCreateGraphicsPipelines(g.dev, VK_NULL_HANDLE, 1, &pi, nullptr, &g.grade_pipeline)) return false;
     }
 
+    // SMAA: two images of the picture's size for the edges and the weights, the two tables, and a pipeline a pass
+    g.smaa = false;
+    static const bool exact_smaa = getenv("HP2_NATIVEEXACT") != nullptr;
+    if (g_cfg.aa_mode == 2 && !exact_smaa) {
+        VkImageView ev, wv, av, sv2;
+        const VkImageUsageFlags target = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        const VkImageUsageFlags table = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        void *stage_map = nullptr;
+        if (!make_image(g.smaa_edges, ev, VK_FORMAT_R8G8B8A8_UNORM, target, VK_IMAGE_ASPECT_COLOR_BIT) ||
+            !make_image(g.smaa_weights, wv, VK_FORMAT_R8G8B8A8_UNORM, target, VK_IMAGE_ASPECT_COLOR_BIT) ||
+            !make_image(g.smaa_area, av, VK_FORMAT_R8G8_UNORM, table, VK_IMAGE_ASPECT_COLOR_BIT, AREATEX_WIDTH, AREATEX_HEIGHT) ||
+            !make_image(g.smaa_search, sv2, VK_FORMAT_R8_UNORM, table, VK_IMAGE_ASPECT_COLOR_BIT, SEARCHTEX_WIDTH, SEARCHTEX_HEIGHT) ||
+            !make_buffer(g.smaa_stage, &stage_map, AREATEX_SIZE + SEARCHTEX_SIZE, VK_BUFFER_USAGE_TRANSFER_SRC_BIT))
+            return false;
+        memcpy(stage_map, areaTexBytes, AREATEX_SIZE);
+        memcpy((uint8_t *)stage_map + AREATEX_SIZE, searchTexBytes, SEARCHTEX_SIZE);
+        g.smaa_tables = false;
+        VkAttachmentDescription sa2 = at[0];
+        sa2.format = VK_FORMAT_R8G8B8A8_UNORM;
+        sa2.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        sa2.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        sa2.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        frp.pAttachments = &sa2;
+        if (vkCreateRenderPass(g.dev, &frp, nullptr, &g.smaa_pass)) return false;
+        frp.pAttachments = &fa;
+        VkFramebufferCreateInfo sf = {VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+        sf.renderPass = g.smaa_pass;
+        sf.attachmentCount = 1;
+        sf.width = W;
+        sf.height = H;
+        sf.layers = 1;
+        sf.pAttachments = &ev;
+        if (vkCreateFramebuffer(g.dev, &sf, nullptr, &g.smaa_fb[0])) return false;
+        sf.pAttachments = &wv;
+        if (vkCreateFramebuffer(g.dev, &sf, nullptr, &g.smaa_fb[1])) return false;
+        // bilinear, clamped, the first level only: what SMAA's fetches between texels count on
+        VkSamplerCreateInfo sc = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        sc.addressModeU = sc.addressModeV = sc.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sc.magFilter = sc.minFilter = VK_FILTER_LINEAR;
+        sc.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        VkSampler linear;
+        if (vkCreateSampler(g.dev, &sc, nullptr, &linear)) return false;
+        la.pSetLayouts = &g.set_layout;
+        struct {
+            VkDescriptorSet *set;
+            VkImageView view;
+        } sets[5] = {{&g.smaa_scene_set, scene_view}, {&g.smaa_edges_set, ev}, {&g.smaa_weights_set, wv}, {&g.smaa_area_set, av}, {&g.smaa_search_set, sv2}};
+        for (auto &e : sets) {
+            if (vkAllocateDescriptorSets(g.dev, &la, e.set)) return false;
+            bind_view(*e.set, e.view, linear);
+        }
+        const VkDescriptorSetLayout three[3] = {g.set_layout, g.set_layout, g.set_layout};
+        VkPushConstantRange spc = {VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(float) * 5 + sizeof(int) * 3};
+        const struct {
+            const uint32_t *vert, *frag;
+            size_t vert_bytes, frag_bytes;
+            uint32_t sets;
+            VkRenderPass pass;
+        } passes[3] = {{kSmaaEdgeVert, kSmaaEdgeFrag, sizeof kSmaaEdgeVert, sizeof kSmaaEdgeFrag, 1, g.smaa_pass},
+                       {kSmaaWeightVert, kSmaaWeightFrag, sizeof kSmaaWeightVert, sizeof kSmaaWeightFrag, 3, g.smaa_pass},
+                       {kSmaaBlendVert, kSmaaBlendFrag, sizeof kSmaaBlendVert, sizeof kSmaaBlendFrag, 2, g.post_pass}};
+        for (int i = 0; i < 3; i++) {
+            VkPipelineLayoutCreateInfo sl = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+            sl.setLayoutCount = passes[i].sets;
+            sl.pSetLayouts = three;
+            sl.pushConstantRangeCount = 1;
+            sl.pPushConstantRanges = &spc;
+            if (vkCreatePipelineLayout(g.dev, &sl, nullptr, &g.smaa_layout[i])) return false;
+            st[0].module = shader(passes[i].vert, passes[i].vert_bytes);
+            st[1].module = shader(passes[i].frag, passes[i].frag_bytes);
+            ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+            ba.blendEnable = VK_FALSE;
+            ba.colorWriteMask = 0xf;
+            pi.pDepthStencilState = nullptr;
+            pi.layout = g.smaa_layout[i];
+            pi.renderPass = passes[i].pass;
+            if (vkCreateGraphicsPipelines(g.dev, VK_NULL_HANDLE, 1, &pi, nullptr, &g.smaa_pipeline[i])) return false;
+        }
+        g.smaa = true;
+    }
+
     // the picture's alpha to 1, before the window takes it (opaque_picture)
     {
         VkPipelineLayoutCreateInfo ol = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
@@ -1394,6 +1505,60 @@ static void grade_picture(const NativeFrame &frame)
     vkCmdDraw(g.cmd, 3, 1, 0, 0);
     vkCmdEndRenderPass(g.cmd);
     all_barrier();
+}
+
+// SMAA on the finished picture, the 2D over it included (the game's 3D and 2D are one list in one picture): the edges by luma, the weights,
+// the blend. Level 2 is the reference's HIGH preset, 4 its ULTRA. The tables go to the GPU with the first frame that needs them.
+static void smaa_picture()
+{
+    if (!g.smaa) return;
+    if (!g.smaa_tables) {
+        g.smaa_tables = true;
+        const struct {
+            VkImage img;
+            int w, h;
+            VkDeviceSize at;
+        } tables[2] = {{g.smaa_area, AREATEX_WIDTH, AREATEX_HEIGHT, 0}, {g.smaa_search, SEARCHTEX_WIDTH, SEARCHTEX_HEIGHT, AREATEX_SIZE}};
+        for (const auto &t : tables) {
+            image_barrier(t.img, 0, 1, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                          VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+            VkBufferImageCopy copy = {};
+            copy.bufferOffset = t.at;
+            copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            copy.imageExtent = {(uint32_t)t.w, (uint32_t)t.h, 1};
+            vkCmdCopyBufferToImage(g.cmd, g.smaa_stage, t.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+            image_barrier(t.img, 0, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+                          VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+        }
+    }
+    copy_scene();
+    struct {
+        float rt[4], threshold;
+        int steps, diag, corner;
+    } push = {{1.0f / W, 1.0f / H, (float)W, (float)H}, 0.1f, 16, 8, 25};
+    if (g_cfg.aa_level >= 4) push.threshold = 0.05f, push.steps = 32, push.diag = 16;
+    const VkViewport vp = {0, 0, (float)W, (float)H, 0, 1};
+    const VkRect2D sc = {{0, 0}, {(uint32_t)W, (uint32_t)H}};
+    const VkDescriptorSet sets[3][3] = {{g.smaa_scene_set}, {g.smaa_edges_set, g.smaa_area_set, g.smaa_search_set}, {g.smaa_scene_set, g.smaa_weights_set}};
+    const uint32_t counts[3] = {1, 3, 2};
+    for (int i = 0; i < 3; i++) {
+        VkClearValue clear = {};
+        VkRenderPassBeginInfo rb = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        rb.renderPass = i < 2 ? g.smaa_pass : g.post_pass;
+        rb.framebuffer = i < 2 ? g.smaa_fb[i] : g.post_fb;
+        rb.renderArea.extent = {(uint32_t)W, (uint32_t)H};
+        rb.clearValueCount = i < 2 ? 1 : 0;
+        rb.pClearValues = &clear;
+        vkCmdBeginRenderPass(g.cmd, &rb, VK_SUBPASS_CONTENTS_INLINE);
+        vkCmdSetViewport(g.cmd, 0, 1, &vp);
+        vkCmdSetScissor(g.cmd, 0, 1, &sc);
+        vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.smaa_pipeline[i]);
+        vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.smaa_layout[i], 0, counts[i], sets[i], 0, nullptr);
+        vkCmdPushConstants(g.cmd, g.smaa_layout[i], VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof push, &push);
+        vkCmdDraw(g.cmd, 3, 1, 0, 0);
+        vkCmdEndRenderPass(g.cmd);
+        all_barrier();
+    }
 }
 
 // The picture's alpha to 1, last of all and only for the window: the game's alpha (depth for the fog, the blends' masks) has been read by
@@ -1530,7 +1695,9 @@ static void draw_target(const NativeFrame &frame, int target, int vw, int vh, si
     for (size_t i = first; i < last; i++) {
         const NativeDraw &d = frame.draws[i];
         // the players' views and the 2D layer share a picture and go in the game's order
-        bool mine = target == 1 ? d.target <= 4 || d.target == 6 : d.target == target;
+        // Target 6 in the frontend is the car a second time, half a line off, which the GS averages with the first (eAttachBlendTargets):
+        // its antialiasing. Here the first is the picture, and the second would only be drawn over it.
+        bool mine = target == 1 ? d.target <= 4 || (d.target == 6 && !frame.env_override) : d.target == target;
         if (!d.count || !mine) continue;
         if (g_dp_now && target == 1) {
             static uint32_t since;
@@ -1585,8 +1752,10 @@ static void draw_target(const NativeFrame &frame, int target, int vw, int vh, si
             if (target == 7 || (has_sphere && gloss)) pass(d, 1, road->set, alpha_pipes[d.depth_test], -2.0f, true);
         }
         // the third (0x318, 0x31c with a gloss map): the sphere map, Cs As + Cd or Cs Ad + Cd
+        // In the frontend (eDisplayFrame's header for 0x318 and 0x31c alike, 0x10af58 and 0x10b040) both are ALPHA 0x48, Cs As + Cd:
+        // a body's reflection there goes by the material's strength and the map's alpha, not by the gloss the first pass left
         if (has_sphere) {
-            if (gloss) {
+            if (gloss && !env_tex) {
                 pass(d, 2, env_set, dest_pipeline, -3.0f, true);
                 pass(d, 2, env_set, dest_pipeline, -3.0f, true);
             } else {
@@ -1596,6 +1765,10 @@ static void draw_target(const NativeFrame &frame, int target, int vw, int vh, si
         }
     }
 }
+
+static VkBuffer g_env_log_rb;
+static void *g_env_log_map;
+static int g_env_log_have;
 
 // the targets 8..13 that have strips this frame
 static void draw_env_views(const NativeFrame &frame, VkDeviceSize &)
@@ -1632,6 +1805,39 @@ static void draw_env_views(const NativeFrame &frame, VkDeviceSize &)
     bool has[6] = {};
     for (const NativeDraw &d : frame.draws)
         if (d.count && d.target >= 8 && d.target <= 13) has[d.target - 8] = true;
+    // TEMP (HP2_ENVLOG=<frames>): the alpha bit the views hold, which decides on the GS what of a view is folded into the sphere map. The
+    // views copied the last time are counted first (their frame is long done), then this frame's are copied.
+    static const int env_log_every = getenv("HP2_ENVLOG") ? std::max(atoi(getenv("HP2_ENVLOG")), 30) : 0;
+    bool env_log_now = false;
+    if (env_log_every && g.frame % env_log_every == 0) {
+        if (!g_env_log_rb) make_buffer(g_env_log_rb, &g_env_log_map, 6 * ENV_SIZE * ENV_SIZE * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        if (g_env_log_rb && g_env_log_have) {
+            fprintf(g_hle_log, "envlog: frame %llu, pixels with the alpha bit clear (drawn / the clear's grey kept), of 4096:", (unsigned long long)g.frame - env_log_every);
+            for (int i = 0; i < 6; i++) {
+                if (!(g_env_log_have >> i & 1)) continue;
+                const uint8_t *px = (const uint8_t *)g_env_log_map + (size_t)i * ENV_SIZE * ENV_SIZE * 4;
+                const int grey = (96 + 16 * i) & 0xf8;
+                int drawn = 0, kept = 0;
+                for (int k = 0; k < ENV_SIZE * ENV_SIZE; k++)
+                    if (px[k * 4 + 3] < 128) (px[k * 4] == grey && px[k * 4 + 1] == grey && px[k * 4 + 2] == grey ? kept : drawn)++;
+                fprintf(g_hle_log, " view %d: %d / %d;", i, drawn, kept);
+            }
+            fputc(10, g_hle_log);
+            // what was drawn into the views: each texture once, with what its alpha comes from
+            std::string seen;
+            for (const NativeDraw &d : frame.draws) {
+                if (!d.count || d.target < 8 || d.target > 13) continue;
+                char one[160];
+                snprintf(one, sizeof one, " %s(blend %d atest %d flags %x)", d.tex ? d.tex->name : "-", d.blend, d.alpha_test, d.flags);
+                if (seen.find(one) == std::string::npos && seen.size() < 3000) seen += one;
+            }
+            fprintf(g_hle_log, "envlog: drawn into the views:%s", seen.c_str());
+            fputc(10, g_hle_log);
+            fflush(g_hle_log);
+        }
+        g_env_log_have = 0;
+        env_log_now = g_env_log_rb != VK_NULL_HANDLE;
+    }
     for (int i = 0; i < 6; i++) {
         if (!has[i]) continue;
         VkClearValue clear[2] = {};
@@ -1648,6 +1854,18 @@ static void draw_env_views(const NativeFrame &frame, VkDeviceSize &)
         vkCmdEndRenderPass(g.cmd);
         g.env_ready[i] = true;
         g.env_drawn_now[i] = true;
+        if (env_log_now) {
+            image_barrier(g.env[i], 0, 1, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                          VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+            VkBufferImageCopy copy = {};
+            copy.bufferOffset = (VkDeviceSize)i * ENV_SIZE * ENV_SIZE * 4;
+            copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            copy.imageExtent = {(uint32_t)ENV_SIZE, (uint32_t)ENV_SIZE, 1};
+            vkCmdCopyImageToBuffer(g.cmd, g.env[i], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_env_log_rb, 1, &copy);
+            image_barrier(g.env[i], 0, 1, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_READ_BIT,
+                          VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+            g_env_log_have |= 1 << i;
+        }
     }
 }
 
@@ -2548,6 +2766,7 @@ bool native_vk_draw(const NativeFrame &frame)
                       VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
     }
     copy_depth_rects(frame);
+    smaa_picture();
     grade_picture(frame);
     gpu_mark(3);
     static const bool shots = getenv("HP2_NATIVESHOT") != nullptr;

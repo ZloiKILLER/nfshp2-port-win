@@ -175,3 +175,6 @@ hook GetTimestep__5World 0x14d718
 hook DoTimestep__5Worldf 0x14dcd8
 hook bGetTickerDifference__FUiUi 0x250f48
 hook ConsiderLaunching__14DemoModeReplay
+hook Render__13CarRenderInfoP5eViewPC8bVector3PC8bMatrix4P8bMatrix4T4Uii 0x120ef8
+hook Render__6eModelP8bMatrix4P13eLightContextUi 0x10dc80
+hook GetPixelSize__5eViewPC8bVector3f 0x107600

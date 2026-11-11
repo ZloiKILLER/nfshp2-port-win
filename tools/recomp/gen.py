@@ -201,6 +201,12 @@ def find_functions(base, words, data_words):
             t = (hi[ins.rs] + ins.simm) & 0xFFFFFFFF
             if base <= t < end and t % 4 == 0 and entry_like(t):
                 starts.add(t)
+            # A callback with no frame that comes after a tail jump, not after a return: `j <the common handler>; li a2,<n>` behind a
+            # function that ends `j ...; addiu sp,sp,N`. Two screens' handlers are such (0x1b8f30, 0x1b9210: the Setup screens of the
+            # knockout races, which ended the game with "indirect call to non-function"). tools/recomp/missed_entries.py lists what
+            # is left.
+            elif base <= t < end and t % 4 == 0 and t not in starts and after_jump(t) and frameless_region(t, 16):
+                starts.add(t)
         elif ins.name in ("jr", "j"):
             hi.clear()
     # GCC emits `addiu sp,sp,-N` only as a prologue: every one starts a function

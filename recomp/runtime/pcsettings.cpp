@@ -423,17 +423,8 @@ void pc_settings_register()
                       [](int) { g_cfg.smooth ^= 1; pc_config_save(); }});
     PcPage &q = pc_add_page("PC Advanced", "Advanced");
     // what the graphics card has, no more: a value it does not have would be shown and then not drawn
-    q.rows.push_back({"Anti-Aliasing", "Smoother edges.",
-                      [] {
-                          const int v = std::min(g_cfg.aa, gpu_limit(0));
-                          return v ? std::to_string(v) + "x MSAA" : std::string("Off");
-                      },
-                      [](int d) {
-                          const int top = gpu_limit(0);
-                          if (!top) pc_set_blurb("This graphics card has no anti-aliasing for the game.");
-                          g_cfg.aa = top ? pc_next_power(std::min(g_cfg.aa, top), top, d) : 0;
-                          pc_config_save();
-                      }});
+    // no value beside it: a row that opens a page, as Resolution and Advanced do, not one to step through
+    q.rows.push_back({"Antialiasing", "Smoother edges: off, MSAA or SMAA.", nullptr, [](int) { pc_open_page("PC Antialiasing"); }});
     q.rows.push_back({"Anisotropic Filtering", "Sharper textures far away, on everything in the world.",
                       [] {
                           const int v = std::min(g_cfg.aniso, gpu_limit(1));
@@ -472,6 +463,35 @@ void pc_settings_register()
                           pc_set_blurb("The picture is back to the defaults.");
                           pc_refresh_page();
                       }});
+
+    // Antialiasing: the way, and how much of it. MSAA draws the scene in samples (what the graphics card has of them); SMAA finds the
+    // finished picture's edges and blends along them, 2x its HIGH preset and 4x its ULTRA.
+    PcPage &aa = pc_add_page("PC Antialiasing", "Antialiasing");
+    aa.rows.push_back({"Antialiasing", "Off, MSAA (the scene drawn in samples) or SMAA (the picture's edges smoothed).",
+                       [] { return std::string(g_cfg.aa_mode == 1 ? "MSAA" : g_cfg.aa_mode == 2 ? "SMAA" : "Off"); },
+                       [](int d) {
+                           const bool msaa = gpu_limit(0) >= 2;
+                           for (int i = 0; i < 3; i++) {
+                               g_cfg.aa_mode = (g_cfg.aa_mode + (d < 0 ? 2 : 1)) % 3;
+                               if (g_cfg.aa_mode != 1 || msaa) break;
+                           }
+                           if (g_cfg.aa_mode == 1 && gpu_limit(0) < g_cfg.aa_level) g_cfg.aa_level = 2;
+                           pc_config_save();
+                       }});
+    {
+        PcRow level{"Quality", "MSAA: samples a pixel. SMAA: how far it looks along an edge.",
+                    [] { return std::to_string(g_cfg.aa_level) + "x"; },
+                    [](int) {
+                        g_cfg.aa_level = g_cfg.aa_level == 2 ? 4 : 2;
+                        if (g_cfg.aa_mode == 1 && gpu_limit(0) < g_cfg.aa_level) {
+                            g_cfg.aa_level = 2;
+                            pc_set_blurb("This graphics card has no more samples for the game.");
+                        }
+                        pc_config_save();
+                    }};
+        level.disabled = [] { return g_cfg.aa_mode == 0; };
+        aa.rows.push_back(level);
+    }
 
     PcPage &p = pc_add_page("PC Controls", "Controls");
     p.rows.push_back({"Keyboard", "The keys for driving. In menus: arrows, Enter, Esc.", nullptr,

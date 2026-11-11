@@ -262,7 +262,8 @@ void pc_config_save()
     fprintf(f, "window=%d,%d     ; the window's picture\n", g_cfg.win_w, g_cfg.win_h);
     fprintf(f, "smooth=%d           ; 1 = smooth picture scaling, 0 = sharp\n", g_cfg.smooth);
     fprintf(f, "aspect=%d           ; the race's picture: 0 = 4:3, 1 = 16:10, 2 = 16:9\n", g_cfg.aspect);
-    fprintf(f, "aa=%d               ; multisampling: 0 = off, 2, 4, 8\n", g_cfg.aa);
+    fprintf(f, "aa_mode=%d          ; anti-aliasing: 0 = off, 1 = MSAA, 2 = SMAA\n", g_cfg.aa_mode);
+    fprintf(f, "aa_level=%d         ; 2 or 4: MSAA samples, SMAA quality\n", g_cfg.aa_level);
     fprintf(f, "aniso=%d            ; anisotropic filtering: 0 = off, 2, 4, 8, 16\n", g_cfg.aniso);
     fprintf(f, "brightness=%d       ; percent, -50 to 50\n", g_cfg.brightness);
     fprintf(f, "contrast=%d        ; percent, 50 to 150\n", g_cfg.contrast);
@@ -314,7 +315,12 @@ static bool read_settings(const std::string &path, bool &old_controls)
         else if (!strcmp(key, "fullscreen")) g_cfg.fullscreen = n != 0;
         else if (!strcmp(key, "smooth")) g_cfg.smooth = n != 0;
         else if (!strcmp(key, "aspect")) g_cfg.aspect = clampi(n, 0, 2);
-        else if (!strcmp(key, "aa")) g_cfg.aa = n >= 8 ? 8 : n >= 4 ? 4 : n >= 2 ? 2 : 0;
+        else if (!strcmp(key, "aa")) {      // an older hp2.ini: multisampling, 0, 2, 4 or 8
+            g_cfg.aa_mode = n >= 2;
+            if (n >= 2) g_cfg.aa_level = n >= 4 ? 4 : 2;
+        }
+        else if (!strcmp(key, "aa_mode")) g_cfg.aa_mode = clampi(n, 0, 2);
+        else if (!strcmp(key, "aa_level")) g_cfg.aa_level = n >= 4 ? 4 : 2;
         else if (!strcmp(key, "aniso")) g_cfg.aniso = n >= 16 ? 16 : n >= 8 ? 8 : n >= 4 ? 4 : n >= 2 ? 2 : 0;
         else if (!strcmp(key, "brightness")) g_cfg.brightness = clampi(n, -50, 50);
         else if (!strcmp(key, "contrast")) g_cfg.contrast = clampi(n, 50, 150);

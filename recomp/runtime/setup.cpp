@@ -1,6 +1,7 @@
 // The first start (setup.h): a window asks for the .iso of Need for Speed: Hot Pursuit 2 (a disc of kKnownDiscs) and where to install, reads the image
-// as ISO 9660 without mounting it, checks the game's program by its SHA-1, makes the folder nfshp2port with all the game needs (install.cpp),
-// puts this exe in it, and starts the game from there.
+// as ISO 9660 without mounting it, checks the game's program by its SHA-1, makes the folder with all the game needs (install.cpp), puts this exe
+// in it, and starts the game from there. The folder is any the user names: typed, or browsed to (then with the game's own folder under it, as
+// installers do). It is remembered (HKCU\Software\NFSHP2Port, InstallDir), so this exe started again elsewhere starts the installed game.
 #include "setup.h"
 
 #include "host.h"
@@ -52,6 +53,26 @@ bool is_game_folder(const fs::path &dir)
     return fs::is_regular_file(dir / L"data" / L"index.txt", ec) && fs::is_regular_file(dir / L"data" / L"SLUS_203.62", ec);
 }
 
+const wchar_t kGameFolder[] = L"Need for Speed Hot Pursuit 2";
+const wchar_t kRegKey[] = L"Software\\NFSHP2Port", kRegValue[] = L"InstallDir";
+
+// where the game was installed last, "" if nowhere or not known
+std::wstring remembered_folder()
+{
+    wchar_t buf[MAX_PATH * 4] = {};
+    DWORD bytes = sizeof buf - sizeof buf[0];
+    if (RegGetValueW(HKEY_CURRENT_USER, kRegKey, kRegValue, RRF_RT_REG_SZ, nullptr, buf, &bytes) != ERROR_SUCCESS) return L"";
+    return buf;
+}
+
+void remember_folder(const std::wstring &dir)
+{
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kRegKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS) return;
+    RegSetValueExW(key, kRegValue, 0, REG_SZ, (const BYTE *)dir.c_str(), (DWORD)((dir.size() + 1) * sizeof(wchar_t)));
+    RegCloseKey(key);
+}
+
 bool start_exe(const fs::path &exe)
 {
     STARTUPINFOW si = {sizeof si};
@@ -82,13 +103,13 @@ void make_shortcut(const fs::path &exe)
 }
 
 // ---- the window ------------------------------------------------------------------------------------
-enum { ID_BROWSE = 101, ID_INSTALL, ID_CANCEL, ID_FOLDER, ID_SHORTCUT, WM_SETUP_PROGRESS = WM_APP + 1, WM_SETUP_DONE };
+enum { ID_BROWSE = 101, ID_INSTALL, ID_CANCEL, ID_FOLDER, ID_SHORTCUT, ID_TARGET, WM_SETUP_PROGRESS = WM_APP + 1, WM_SETUP_DONE };
 
 struct Ui {
     HWND wnd = nullptr, path = nullptr, status = nullptr, target = nullptr, bar = nullptr, step = nullptr, install = nullptr, cancel = nullptr,
          browse = nullptr, folder = nullptr, shortcut = nullptr;
     HFONT font = nullptr, heading = nullptr;
-    std::wstring iso, root, failure;
+    std::wstring iso, root, failure, disc;    // disc: the name of the image's disc once it has been checked, "" until then
     std::atomic<bool> busy{false}, stop{false};
     std::atomic<int> permille{0};
     std::wstring step_text;
@@ -98,10 +119,41 @@ struct Ui {
 
 void set_status(const std::wstring &s) { SetWindowTextW(g_ui.status, s.c_str()); }
 
-// the image chosen: is it the game, and is there room
+// the folder in the box, as it is typed: no quotes, no spaces around it, no slash at its end
+std::wstring typed_folder()
+{
+    wchar_t buf[MAX_PATH * 4] = {};
+    GetWindowTextW(g_ui.target, buf, (int)(sizeof buf / sizeof buf[0]));
+    std::wstring r = buf;
+    while (!r.empty() && (r.back() == L' ' || r.back() == L'"' || r.back() == L'\\' || r.back() == L'/')) r.pop_back();
+    size_t at = 0;
+    while (at < r.size() && (r[at] == L' ' || r[at] == L'"')) at++;
+    r = r.substr(at);
+    if (r.size() == 2 && r[1] == L':') r += L'\\';     // a drive alone is its root
+    return r;
+}
+
+// The image is the game's (g_ui.disc): is the folder one to install into, and is there room. Install is there to press only then.
+void check_folder()
+{
+    EnableWindow(g_ui.install, FALSE);
+    if (g_ui.disc.empty()) return;
+    g_ui.root = typed_folder();
+    const fs::path root = g_ui.root;
+    if (g_ui.root.empty() || !root.is_absolute()) return set_status(g_ui.disc + L". Give the folder with its drive, like D:\\Games\\" + kGameFolder + L".");
+    ULARGE_INTEGER free_bytes = {};
+    const std::wstring drive = root.root_path().wstring();
+    if (!GetDiskFreeSpaceExW(drive.c_str(), &free_bytes, nullptr, nullptr)) return set_status(g_ui.disc + L". There is no drive " + drive + L".");
+    if (free_bytes.QuadPart < kNeeded) return set_status(g_ui.disc + L". Not enough free space: 3.6 GB are needed on " + drive + L".");
+    set_status(g_ui.disc + L". Ready to install.");
+    EnableWindow(g_ui.install, TRUE);
+}
+
+// the image chosen: is it the game
 void check_iso()
 {
     EnableWindow(g_ui.install, FALSE);
+    g_ui.disc.clear();
     Iso iso;
     std::string why;
     if (!iso.open(g_ui.iso, why)) return set_status(widen(why));
@@ -119,12 +171,8 @@ void check_iso()
         if (hex == k.elf_sha1 && !_stricmp(boot.c_str(), k.boot)) name = k.name;
     if (name.empty())
         return set_status(L"This disc is not supported yet.");
-    ULARGE_INTEGER free_bytes = {};
-    const std::wstring drive = g_ui.root.substr(0, 3);
-    if (GetDiskFreeSpaceExW(drive.c_str(), &free_bytes, nullptr, nullptr) && free_bytes.QuadPart < kNeeded)
-        return set_status(widen(name) + L". Not enough free space: 3.6 GB are needed on " + drive + L".");
-    set_status(widen(name) + L". Ready to install.");
-    EnableWindow(g_ui.install, TRUE);
+    g_ui.disc = widen(name);
+    check_folder();
 }
 
 void browse()
@@ -143,7 +191,8 @@ void browse()
     check_iso();
 }
 
-// where to install: the folder chosen, with nfshp2port in it (unless it is one already)
+// Where to install, browsed to: the folder chosen with the game's own folder under it, unless it is that already (by its name, or by the game
+// being in it). What is in the box after that is the user's to change, and is taken as it stands.
 void choose_folder()
 {
     IFileOpenDialog *d = nullptr;
@@ -159,12 +208,11 @@ void choose_folder()
         if (SUCCEEDED(d->GetResult(&it)) && SUCCEEDED(it->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
             std::wstring r = path;
             while (!r.empty() && (r.back() == L'\\' || r.back() == L'/')) r.pop_back();
-            const std::wstring tail = L"nfshp2port";
-            if (r.size() < tail.size() || _wcsicmp(r.c_str() + r.size() - tail.size(), tail.c_str())) r += L"\\nfshp2port";
+            const fs::path picked = r;
+            if (_wcsicmp(picked.filename().c_str(), kGameFolder) && !is_game_folder(picked)) r = (picked / kGameFolder).wstring();
             g_ui.root = r;
-            SetWindowTextW(g_ui.target, r.c_str());
+            SetWindowTextW(g_ui.target, r.c_str());     // EN_CHANGE checks it
             CoTaskMemFree(path);
-            if (!g_ui.iso.empty()) check_iso();
         }
         if (it) it->Release();
     }
@@ -210,7 +258,7 @@ void install_thread()
 
 void lock_controls(bool locked)
 {
-    for (HWND h : {g_ui.browse, g_ui.folder, g_ui.shortcut, g_ui.install}) EnableWindow(h, !locked);
+    for (HWND h : {g_ui.browse, g_ui.folder, g_ui.shortcut, g_ui.install, g_ui.target}) EnableWindow(h, !locked);
     SetWindowTextW(g_ui.cancel, locked ? L"Cancel" : L"Exit");
 }
 
@@ -220,7 +268,19 @@ LRESULT CALLBACK wnd_proc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_COMMAND:
         if (LOWORD(w) == ID_BROWSE && !g_ui.busy) browse();
         else if (LOWORD(w) == ID_FOLDER && !g_ui.busy) choose_folder();
+        else if (LOWORD(w) == ID_TARGET && HIWORD(w) == EN_CHANGE && !g_ui.busy) check_folder();
         else if (LOWORD(w) == ID_INSTALL && !g_ui.busy) {
+            g_ui.root = typed_folder();
+            std::error_code ec;
+            const fs::path root = g_ui.root;
+            if (fs::exists(root, ec) && !fs::is_directory(root, ec)) {
+                MessageBoxW(h, L"That is a file, not a folder.", L"Setup", MB_ICONWARNING);
+                return 0;
+            }
+            if (fs::is_directory(root, ec) && !fs::is_empty(root, ec) && !is_game_folder(root) &&
+                MessageBoxW(h, (L"The folder\n" + g_ui.root + L"\nalready has files in it. The game's files go straight into it.\n\nInstall there anyway?").c_str(),
+                            L"Setup", MB_ICONQUESTION | MB_YESNO | MB_DEFBUTTON2) != IDYES)
+                return 0;
             g_ui.busy = true;
             g_ui.want_shortcut = SendMessageW(g_ui.shortcut, BM_GETCHECK, 0, 0) == BST_CHECKED;
             lock_controls(true);
@@ -282,7 +342,7 @@ bool run_window(const fs::path &exe_dir)
     InitializeCriticalSection(&g_ui.lock);
     INITCOMMONCONTROLSEX icc = {sizeof icc, ICC_PROGRESS_CLASS | ICC_STANDARD_CLASSES};
     InitCommonControlsEx(&icc);
-    g_ui.root = (exe_dir / L"nfshp2port").wstring();
+    g_ui.root = (exe_dir / kGameFolder).wstring();
     NONCLIENTMETRICSW ncm = {sizeof ncm};
     SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof ncm, &ncm, 0);
     g_ui.font = CreateFontIndirectW(&ncm.lfMessageFont);
@@ -300,7 +360,7 @@ bool run_window(const fs::path &exe_dir)
     wc.hbrBackground = GetSysColorBrush(COLOR_WINDOW);
     wc.lpszClassName = L"HP2Setup";
     RegisterClassW(&wc);
-    const int W = 600, H = 390;
+    const int W = 600, H = 412;
     RECT r = {0, 0, W, H};
     const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
     AdjustWindowRect(&r, style, FALSE);
@@ -323,19 +383,20 @@ bool run_window(const fs::path &exe_dir)
     g_ui.path = add(L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL | ES_READONLY, 20, 180, W - 40 - 110, 24);
     g_ui.browse = add(L"BUTTON", L"Browse...", BS_PUSHBUTTON | WS_TABSTOP, W - 20 - 100, 179, 100, 26, ID_BROWSE);
     g_ui.status = add(L"STATIC", L"No disc image chosen.", 0, 20, 212, W - 40, 20);
-    add(L"STATIC", L"Install to:", 0, 20, 242, 100, 20);
-    g_ui.target = add(L"STATIC", g_ui.root.c_str(), SS_PATHELLIPSIS, 100, 242, W - 120 - 110, 20);
-    g_ui.folder = add(L"BUTTON", L"Change...", BS_PUSHBUTTON | WS_TABSTOP, W - 20 - 100, 238, 100, 26, ID_FOLDER);
-    g_ui.bar = CreateWindowExW(0, PROGRESS_CLASSW, nullptr, WS_CHILD, 20, 278, W - 40, 18, g_ui.wnd, nullptr, inst, nullptr);
+    add(L"STATIC", L"Install to:", 0, 20, 240, 100, 20);
+    g_ui.target = add(L"EDIT", g_ui.root.c_str(), WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, 20, 262, W - 40 - 110, 24, ID_TARGET);
+    g_ui.folder = add(L"BUTTON", L"Browse...", BS_PUSHBUTTON | WS_TABSTOP, W - 20 - 100, 261, 100, 26, ID_FOLDER);
+    g_ui.bar = CreateWindowExW(0, PROGRESS_CLASSW, nullptr, WS_CHILD, 20, 300, W - 40, 18, g_ui.wnd, nullptr, inst, nullptr);
     SendMessageW(g_ui.bar, PBM_SETRANGE32, 0, 1000);
-    g_ui.step = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | SS_PATHELLIPSIS, 20, 300, W - 40, 20, g_ui.wnd, nullptr, inst, nullptr);
+    g_ui.step = CreateWindowExW(0, L"STATIC", L"", WS_CHILD | SS_PATHELLIPSIS, 20, 322, W - 40, 20, g_ui.wnd, nullptr, inst, nullptr);
     SendMessageW(g_ui.step, WM_SETFONT, (WPARAM)g_ui.font, TRUE);
     g_ui.shortcut = add(L"BUTTON", L"Create a shortcut on the desktop", BS_AUTOCHECKBOX | WS_TABSTOP, 20, H - 42, 300, 22, ID_SHORTCUT);
     SendMessageW(g_ui.shortcut, BM_SETCHECK, BST_CHECKED, 0);
     g_ui.install = add(L"BUTTON", L"Install", BS_DEFPUSHBUTTON | WS_TABSTOP | WS_DISABLED, W - 20 - 210, H - 46, 100, 28, ID_INSTALL);
     g_ui.cancel = add(L"BUTTON", L"Exit", BS_PUSHBUTTON | WS_TABSTOP, W - 20 - 100, H - 46, 100, 28, ID_CANCEL);
 
-    // HP2_SETUP_ISO: the image already chosen, HP2_SETUP_AUTO: and Install pressed (the tests' screenshots)
+    // HP2_SETUP_ISO: the image already chosen, HP2_SETUP_DIR: and the folder, HP2_SETUP_AUTO: and Install pressed (the tests' screenshots)
+    if (const char *dir = getenv("HP2_SETUP_DIR")) SetWindowTextW(g_ui.target, widen(dir).c_str());
     if (const char *pre = getenv("HP2_SETUP_ISO")) {
         g_ui.iso = widen(pre);
         SetWindowTextW(g_ui.path, g_ui.iso.c_str());
@@ -384,14 +445,23 @@ SetupResult setup_start()
 
     const fs::path exe = exe_path(), dir = exe.parent_path();
     if (is_game_folder(dir)) return SETUP_PLAY;
-    // the game was installed beside this exe: it starts from its folder
-    const fs::path beside = dir / L"nfshp2port";
+    // The game is installed already: it starts from its folder. Looked for where it was installed last (the folder remembered), then beside this
+    // exe under the folder's usual name, and under nfshp2port, the name the first releases made. HP2_SETUP_FRESH: the window anyway (the tests).
     std::error_code ec;
-    if (is_game_folder(beside) && fs::exists(beside / L"speed.exe", ec)) {
-        if (!start_exe(beside / L"speed.exe")) MessageBoxW(nullptr, L"The game in nfshp2port could not be started.", L"Need for Speed: Hot Pursuit 2", MB_ICONERROR);
-        return SETUP_EXIT;
-    }
+    std::vector<fs::path> known;
+    const std::wstring remembered = remembered_folder();
+    if (!remembered.empty()) known.push_back(remembered);
+    known.push_back(dir / kGameFolder);
+    known.push_back(dir / L"nfshp2port");
+    if (!getenv("HP2_SETUP_FRESH"))
+        for (const fs::path &at : known)
+            if (is_game_folder(at) && fs::exists(at / L"speed.exe", ec)) {
+                if (!start_exe(at / L"speed.exe"))
+                    MessageBoxW(nullptr, (L"The game in\n" + at.wstring() + L"\ncould not be started.").c_str(), L"Need for Speed: Hot Pursuit 2", MB_ICONERROR);
+                return SETUP_EXIT;
+            }
     if (!run_window(dir)) return SETUP_EXIT;
+    remember_folder(g_ui.root);
     const fs::path game = fs::path(g_ui.root) / L"speed.exe";
     if (g_ui.want_shortcut && !getenv("HP2_SETUP_NOSHORTCUT")) make_shortcut(game);
     if (!start_exe(game)) MessageBoxW(nullptr, L"The game is installed but could not be started. Start speed.exe in its folder.", L"Need for Speed: Hot Pursuit 2", MB_ICONERROR);

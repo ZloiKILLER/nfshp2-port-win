@@ -627,6 +627,24 @@ static void add_strip(u32 data, u32 qwords, u32 flags)
                     g_frame.draws.size(), g_draw_target, g_texture ? (const char *)host(g_texture + 8) : "-", flags, d.blend, d.blend_fix, d.tfx, d.alpha_test,
                     d.depth_write, g_light, g_mode, tri_n ? tri[0].a : -1, g_texture ? LB(g_texture + 0x6f) : -1, g_texture ? LB(g_texture + 0x70) : -1,
                     d.tex ? d.tex->levels : 0);
+        if (dumping() && g_light >= 0 && (flags & 0x100)) {      // the light a reflecting strip has: colours, ambient, material
+            const NativeLight &l = g_frame.lights[g_light];
+            float f[22][4];
+            memcpy(f, l.q, sizeof f);
+            fprintf(g_hle_log, "dump light %d frame %u vertex colour %d %d %d:", g_light, g_frame_no, tri_n ? tri[0].r : -1, tri_n ? tri[0].g : -1, tri_n ? tri[0].b : -1);
+            for (int q : {0, 1, 2, 3, 18, 19, 20, 21}) fprintf(g_hle_log, " [%d] %.4g %.4g %.4g %.4g", q, f[q][0], f[q][1], f[q][2], f[q][3]);
+            fputc(10, g_hle_log);
+            if (g_light_mat) {                      // eLightMaterial: its head, then the frontend's and the race's data (20 floats each)
+                const u32 m = g_light_mat - (LW(g_pc_ctx->r[28].w[0] - 21424) ? 256 : 192);
+                fprintf(g_hle_log, "dump material %08x head", m);
+                for (u32 i = 0; i < 8; i++) fprintf(g_hle_log, " %08x", LW(m + i * 4));
+                for (u32 blk : {0x20u, 0x70u}) {
+                    fprintf(g_hle_log, " | +%x:", blk);
+                    for (u32 i = 0; i < 20; i++) fprintf(g_hle_log, " %.4g", *(float *)host(m + blk + i * 4));
+                }
+                fputc(10, g_hle_log);
+            }
+        }
         d.snap_x = (float)(LW(g_target_ptr + 0x1c) / 2);
         d.snap_y = (float)(LW(g_target_ptr + 0x20) / 2);
         g_frame.draws.push_back(d);
@@ -710,6 +728,10 @@ bool native_dumping_now() { return g_dump_at == g_frame_no; }
 static bool dumping()
 {
     static const int at = getenv("HP2_NATIVEDUMP") ? atoi(getenv("HP2_NATIVEDUMP")) : -1;
+    // HP2_NATIVEDUMPEVERY=<n>[,<from>]: every n-th frame from that one on
+    static const char *every_env = getenv("HP2_NATIVEDUMPEVERY");
+    static const int every = every_env ? atoi(every_env) : 0, from = every_env && strchr(every_env, ',') ? atoi(strchr(every_env, ',') + 1) : 0;
+    if (every > 0 && (int)g_frame_no >= from && g_frame_no % every == 0) return true;
     return (at >= 0 && (int)g_frame_no == at) || g_dump_at == g_frame_no;
 }
 
@@ -992,6 +1014,12 @@ void native_read_list(u32 list)
             g_target = data;
             g_target_ptr = data;
             g_mode = LH(node + 6);
+            if (dumping())                          // the target's GS registers, as the game sends them
+                if (u32 block = LW(data + 0x7c + (g_mode & 3) * 4)) {
+                    fprintf(g_hle_log, "dump target %u mode %u regs", LW(data), g_mode);
+                    for (u32 q = 1; q < 14; q++) fprintf(g_hle_log, " %02x=%08x%08x", LB(block + q * 16 + 8), LW(block + q * 16 + 4), LW(block + q * 16));
+                    fputc(10, g_hle_log);
+                }
             update_clip();
             g_clip_new = true;
             break;
@@ -1412,8 +1440,11 @@ void HOOK_Render__12FlailerStripP5eView(Ctx &c, void (*orig)(Ctx &))
     g_strip_spans.clear();
 }
 
+static u32 g_added_strips;                  // strips handed to the lists: HP2_LODLOG takes a car's share of them
+
 void HOOK_AddData__12eDmaDataListUsPvUsUs(Ctx &c, void (*orig)(Ctx &))
 {
+    if ((c.r[5].w[0] & 0xffff) == EDMA_STRIP) g_added_strips++;
     if (!g_strip_spans.empty() && (c.r[5].w[0] & 0xffff) == EDMA_DIRECT) g_packet_spans[c.r[6].w[0]] = g_strip_spans;
     orig(c);
 }
@@ -1655,7 +1686,85 @@ void HOOK_TreeCull__20ScenerySectionHeaderP15SceneryCullInfo(Ctx &c, void (*orig
 // pSceneryInstance +28; SceneryInstance 48 bytes, the kind at +12; SceneryInfo 40 bytes, FarClipSize[3] int16 at +12, pModel[3] at +20.
 // HP2_LODFLIP: Maximum and Original by turns, 60 frames each, and the vertices and draws of each in the log: the setting measured on the
 // same scenes
+
+// TEMP (HP2_LODLOG=1): what is still drawn below its best model. Scenery: the kinds with no first model, which go by their size as on the
+// PS2 (each kind once, and the counts every 600 frames). Cars: every 20th frame each car of the player's view, with its size on the screen
+// (the game's own GetPixelSize for a sphere of 3), the strips its Render handed over and the two Force tweakables as Render found them.
 static bool max_detail_now() { return g_lod_flip_now >= 0 ? g_lod_flip_now != 0 : g_cfg.max_detail != 0; }
+static const bool g_lod_log = getenv("HP2_LODLOG") != nullptr;
+static u64 g_lod_scenery, g_lod_scenery_bare;
+
+// A car under 18 pixels of the GS's is drawn without its reflections: CarRenderInfo::Render (0x121258) hands eModel::Render the flag 1,
+// which RenderStrips (0x10ddac) turns into the mask 0x100, the sphere map's pass. Those are the PS2's pixels: at 1080 lines such a car is 43
+// high, and it goes dull in plain sight. With Level of Detail at Maximum the flag is taken off again, unless the caller of Render asked
+// for it itself (its own flags, the tenth argument).
+void F_00107600(Ctx &c);
+static bool g_in_car_render, g_car_asked_plain;
+static bool g_car_size_next;                // the next GetPixelSize is CarRenderInfo::Render's own, of the car
+
+// A car is not drawn under 4 pixels of the GS's (0x120f90). The draw distance takes the size as larger for the players' views, as it does
+// for the scenery, so a car shows as far as the things around it. Its levels of detail are forced or go the better way with it.
+void HOOK_GetPixelSize__5eViewPC8bVector3f(Ctx &c, void (*orig)(Ctx &))
+{
+    const bool car = g_car_size_next;
+    g_car_size_next = false;
+    const u32 view = c.r[4].w[0];
+    orig(c);
+    if (!car || g_cfg.draw_distance == 100 || !view) return;
+    const u32 id = LW(view);
+    if (id < 1 || id > 3) return;
+    c.r[2].d[0] = (u64)(s64)((s64)(s32)c.r[2].w[0] * g_cfg.draw_distance / 100);
+}
+static u64 g_lod_kept_reflections;
+
+void HOOK_Render__6eModelP8bMatrix4P13eLightContextUi(Ctx &c, void (*orig)(Ctx &))
+{
+    if (g_in_car_render && !g_car_asked_plain && (c.r[7].w[0] & 1) && max_detail_now()) {
+        c.r[7].d[0] = c.r[7].w[0] & ~1u;
+        g_lod_kept_reflections++;
+    }
+    orig(c);
+}
+
+void HOOK_Render__13CarRenderInfoP5eViewPC8bVector3PC8bMatrix4P8bMatrix4T4Uii(Ctx &c, void (*orig)(Ctx &))
+{
+    const bool was_in = g_in_car_render, was_plain = g_car_asked_plain;
+    g_in_car_render = true;
+    g_car_asked_plain = (c.r[10].w[0] & 1) != 0;
+    struct Leave {
+        bool in, plain;
+        ~Leave() { g_in_car_render = in, g_car_asked_plain = plain; }
+    } leave{was_in, was_plain};
+    if (!g_lod_log) {
+        g_car_size_next = true;
+        orig(c);
+        g_car_size_next = false;
+        return;
+    }
+    const u32 info = c.r[4].w[0], view = c.r[5].w[0], pos = c.r[6].w[0];
+    const u32 id = view ? LW(view) : 0, type = LW(info + 8), car = LW(info);
+    const s32 force_car = (s32)LW(0x32fc60), force_tire = (s32)LW(0x32fc64);
+    int size = -1;
+    if (id == 1 && g_frame_no % 20 == 0) {
+        Ctx t = c;
+        t.r[4].d[0] = view;
+        t.r[5].d[0] = pos;
+        t.f[12].f = 3.0f;
+        g_car_size_next = false;
+        F_00107600(t);                      // through the hook above, as any other caller's: the game's own size
+        size = (int)t.r[2].w[0];
+    }
+    const u32 before = g_added_strips;
+    g_car_size_next = true;
+    orig(c);
+    g_car_size_next = false;
+    if (size >= 0 || (id == 1 && (force_car != 0 || force_tire != 0))) {
+        float p[3];
+        memcpy(p, host(pos), 12);
+        fprintf(g_hle_log, "lodlog: car frame %u info %08x type %08x car %08x size %d strips %u force %d %d kept %llu at %.0f %.0f %.0f\n", g_frame_no, info, type, car, size,
+                g_added_strips - before, force_car, force_tire, (unsigned long long)g_lod_kept_reflections, p[0], p[1], p[2]);
+    }
+}
 
 void HOOK_DrawAScenery__20ScenerySectionHeaderiP15SceneryCullInfoi(Ctx &c, void (*orig)(Ctx &))
 {
@@ -1666,6 +1775,22 @@ void HOOK_DrawAScenery__20ScenerySectionHeaderiP15SceneryCullInfoi(Ctx &c, void 
     const u32 header = c.r[4].w[0], index = c.r[5].w[0];
     const u32 instances = LW(header + 28), infos = LW(header + 20);
     const u32 info = instances && infos ? infos + 40 * (u32)LH(instances + 48 * index + 12) : 0;
+    if (g_lod_log) {
+        g_lod_scenery++;
+        if (info && !LW(info + 20)) {
+            g_lod_scenery_bare++;
+            static std::vector<u32> told;
+            if (std::find(told.begin(), told.end(), info) == told.end() && told.size() < 4000) {
+                told.push_back(info);
+                fprintf(g_hle_log, "lodlog: scenery kind %08x section %u has no first model: names %08x %08x %08x, far clips %d %d %d, models %08x %08x %08x\n", info,
+                        LW(header + 8), LW(info), LW(info + 4), LW(info + 8), (s16)LH(info + 12), (s16)LH(info + 14), (s16)LH(info + 16), LW(info + 20),
+                        LW(info + 24), LW(info + 28));
+            }
+        }
+        if (g_lod_scenery % 200000 == 0)
+            fprintf(g_hle_log, "lodlog: scenery frame %u: %llu drawn so far, %llu of them of a kind with no first model\n", g_frame_no,
+                    (unsigned long long)g_lod_scenery, (unsigned long long)g_lod_scenery_bare);
+    }
     if (!info || !LW(info + 20)) {
         orig(c);
         return;
@@ -1684,6 +1809,9 @@ static void car_detail()
     const u32 car = 0x32fc60, tire = 0x32fc64;
     static const bool flip = getenv("HP2_LODFLIP") != nullptr;
     if (flip) g_lod_flip_now = (int)(g_frame_no / 60 % 2);
+    // 0x32fc30 (gp-0x5cc0), read only by CarRenderInfo::Render (0x121acc): not zero, and a car that renders its driver does so at any size,
+    // not only over 50, 75 or 100 pixels of the GS's. The driver's own level of detail still goes by the size.
+    SW(0x32fc30, max_detail_now() ? 1 : 0);
     if (max_detail_now()) {
         if ((s32)LW(car) == -1 && (s32)LW(tire) == -1) {
             SW(car, 0);

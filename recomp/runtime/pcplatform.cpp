@@ -752,12 +752,67 @@ void HOOK_bGetTickerDifference__FUiUi(Ctx &c, void (*orig)(Ctx &))
     static const bool nowait = getenv("HP2_REPLAYNOWAIT") != nullptr;
     orig(c);
     if (nowait && g_in_gettimestep) c.f[0].f = 1e9f;
+    // The game spins here, a core kept busy, till the step is due: GetTimestep's loop is while (difference * $f22 < $f20), both registers
+    // its own and still set in this call. While more than 2.5 ms are left the thread sleeps a millisecond (the timer's resolution is 1 ms,
+    // iop_kernel.cpp), and the loop asks again; the end of the wait is the game's own spin, as exact as before. HP2_SPINWAIT=1: as it was.
+    static const bool spin = getenv("HP2_SPINWAIT") != nullptr;
+    if (g_in_gettimestep && !spin && !nowait) {
+        const float left = c.f[20].f - c.f[0].f * c.f[22].f;
+        if (left > 0.0025f && left < 1.0f) Sleep(1);
+    }
 }
+#ifdef EE_COUNT
+uint64_t g_ee_count[8];
+// where the divisions and multiplications outside the world's step are made: return addresses, the most frequent to the log
+static bool g_in_step;
+static struct Site { void *at; uint64_t n; } g_sites[2][65536];
+__attribute__((noinline)) void ee_count_site(int kind)
+{
+    if (g_in_step) return;
+    void *ra = __builtin_return_address(0);
+    Site &e = g_sites[kind][((uintptr_t)ra * 0x9E3779B97F4A7C15ull) >> 48];
+    if (e.at != ra) e.at = ra, e.n = 0;
+    e.n++;
+}
+static void ee_sites_log()
+{
+    for (int kind = 0; kind < 2; kind++)
+        for (int k = 0; k < 12; k++) {
+            Site *best = nullptr;
+            for (Site &e : g_sites[kind])
+                if (e.n && (!best || e.n > best->n)) best = &e;
+            if (!best) break;
+            fprintf(g_hle_log, "site: %s at image + %llx: %llu\n", kind ? "mul" : "div", (unsigned long long)((uintptr_t)best->at - (uintptr_t)GetModuleHandleA(nullptr)), (unsigned long long)best->n);
+            best->n = 0;
+        }
+    memset(g_sites, 0, sizeof g_sites);
+}
+#endif
 void HOOK_DoTimestep__5Worldf(Ctx &c, void (*orig)(Ctx &))
 {
     const double t0 = now_ms();
+#ifdef EE_COUNT
+    uint64_t at_entry[8];
+    memcpy(at_entry, g_ee_count, sizeof at_entry);
+    g_in_step = true;
+#endif
     orig(c);
     g_t_dotimestep += now_ms() - t0;
+#ifdef EE_COUNT
+    g_in_step = false;
+    if ((g_t_steps + 1) % 900 == 0) ee_sites_log();
+    {
+        static uint64_t in_step[8], before[8];
+        for (int i = 0; i < 8; i++) in_step[i] += g_ee_count[i] - at_entry[i];
+        if ((g_t_steps + 1) % 300 == 0) {
+            fprintf(g_hle_log, "count: a step: add %.0f mul %.0f div %.0f sqrt %.0f add4 %.0f mul4 %.0f recurrences %.0f; outside the step, a step: add %.0f mul %.0f div %.0f sqrt %.0f add4 %.0f mul4 %.0f\n",
+                    in_step[0] / 300.0, in_step[1] / 300.0, in_step[2] / 300.0, in_step[3] / 300.0, in_step[4] / 300.0, in_step[5] / 300.0, in_step[6] / 300.0,
+                    (g_ee_count[0] - before[0] - in_step[0]) / 300.0, (g_ee_count[1] - before[1] - in_step[1]) / 300.0, (g_ee_count[2] - before[2] - in_step[2]) / 300.0,
+                    (g_ee_count[3] - before[3] - in_step[3]) / 300.0, (g_ee_count[4] - before[4] - in_step[4]) / 300.0, (g_ee_count[5] - before[5] - in_step[5]) / 300.0);
+            for (int i = 0; i < 8; i++) before[i] = g_ee_count[i], in_step[i] = 0;
+        }
+    }
+#endif
     if (++g_t_steps % 300 == 0 && diag_on()) {
         fprintf(g_hle_log, "timing: %u steps: GetTimestep %.2f ms a step, DoTimestep %.2f ms a step\n", g_t_steps, g_t_gettimestep / 300, g_t_dotimestep / 300);
         fflush(g_hle_log);

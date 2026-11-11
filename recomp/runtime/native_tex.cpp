@@ -384,7 +384,40 @@ static NativeTexture *native_texture_now(uint32_t info, uint32_t frame)
         out += (size_t)tw * th;
         raw += (size_t)iw * ih * bpp / 8;
     }
+    // TEMP (HP2_TEXSTAT): a car skin's level 0 as decoded: the mean colour, and its alpha (the gloss map)
+    if (getenv("HP2_TEXSTAT") && info == LW(0x32f6d8)) {     // the showroom's reflection map: its brightness by an 8x8 grid, and its alpha
+        fprintf(stderr, "texstat: env %s frame %u bpp %d %dx%d\n", (const char *)host(info + 8), frame, bpp, w, h);
+        if (FILE *f = fopen(getenv("HP2_TEXSTAT"), "wb")) fwrite(t.px.data(), 4, (size_t)t.w * t.h, f), fclose(f);
+        for (int gy = 0; gy < 8; gy++) {
+            for (int gx = 0; gx < 8; gx++) {
+                unsigned long long sr = 0, sg = 0, sb = 0, sa = 0, n = 0;
+                for (int y = gy * t.h / 8; y < (gy + 1) * t.h / 8; y++)
+                    for (int x = gx * t.w / 8; x < (gx + 1) * t.w / 8; x++) {
+                        const u32 v = t.px[(size_t)y * t.w + x];
+                        sr += v & 255, sg += v >> 8 & 255, sb += v >> 16 & 255, sa += v >> 24, n++;
+                    }
+                fprintf(stderr, " %3llu,%3llu,%3llu/%3llu", sr / n, sg / n, sb / n, sa / n);
+            }
+            fputc(10, stderr);
+        }
+    }
+    if (getenv("HP2_TEXSTAT") && strstr((const char *)host(info + 8), "SKIN")) {
+        unsigned long long sr = 0, sg = 0, sb = 0, sa = 0;
+        u32 amin = 255, amax = 0, hist[9] = {};
+        const size_t n = (size_t)t.w * t.h;
+        for (size_t i = 0; i < n; i++) {
+            const u32 v = t.px[i], al = v >> 24;
+            sr += v & 255, sg += v >> 8 & 255, sb += v >> 16 & 255, sa += al;
+            amin = al < amin ? al : amin, amax = al > amax ? al : amax;
+            hist[al >> 5 > 8 ? 8 : al >> 5]++;
+        }
+        fprintf(stderr, "texstat: %s frame %u bpp %d %dx%d mean %llu %llu %llu alpha mean %llu min %u max %u, by 32:", (const char *)host(info + 8), frame, bpp, w, h,
+                sr / n, sg / n, sb / n, sa / n, amin, amax);
+        for (u32 k = 0; k < 8; k++) fprintf(stderr, " %u", (u32)(hist[k] * 100 / n));
+        fputc(10, stderr);
+    }
     t.upscaled = false;
+    snprintf(t.name, sizeof t.name, "%s", (const char *)host(info + 8));
     if (replay_bar && w == 640 && h >= 62) pc_replay_bar_retouch(t.px.data(), t.w);
     replace_texture(t, (const char *)host(info + 8), px, bytes, pal, pal_bytes, w, h);
     if (!strncmp((const char *)host(info + 8), "FONT_", 5)) {

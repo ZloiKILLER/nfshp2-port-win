@@ -16,7 +16,9 @@ struct PcConfig {
     int fullscreen = 0;         // borderless fullscreen
     int smooth = 1;             // the picture is scaled smooth (else sharp)
     int aspect = 0;             // the race's picture: 0 4:3, 1 16:10, 2 16:9. The menus stay 4:3
-    int aa = 0;                 // multisampling: 0 off, 2, 4, 8
+    int aa_mode = 0;            // anti-aliasing: 0 off, 1 MSAA (the scene in samples), 2 SMAA (the finished picture's edges)
+    int aa_level = 4;           // 2 or 4: MSAA's samples, SMAA's quality
+    int msaa() const { return aa_mode == 1 ? aa_level : 0; }
     int aniso = 0;              // anisotropic filtering: 0 off (the GS's own sampling), 2, 4, 8, 16
     int brightness = 0;         // percent added, -50..50
     int contrast = 100;         // percent, 50..150

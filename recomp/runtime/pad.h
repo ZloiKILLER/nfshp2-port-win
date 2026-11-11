@@ -10,9 +10,10 @@ struct PadState {
     uint8_t sticks[4] = {0x80, 0x80, 0x80, 0x80};   // RX RY LX LY as a DualShock's: 0..255, up 0
 };
 
-// slot 0 or 1. From the game's thread
+// slot 0 or 1. From any thread: what the gamepads' own thread (pad.cpp) saw last, never a call into SDL
 PadState pad_read(int slot = 0);
 int pad_count();                                    // how many are connected
 bool pad_is_playstation(int slot = 0);              // that pad has PlayStation's buttons
 void pad_rumble(int slot, int small_on, int large); // large 0..255
 void pad_virtual(int slot, bool south, bool right_trigger);     // HP2_VPADS: presses on a test pad
+void pad_settle(int ms);                            // waits, that long at most, until the pads' motors are as last asked: before the program ends

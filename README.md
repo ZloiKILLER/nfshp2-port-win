@@ -11,11 +11,11 @@ renderer, with PC controls, menus, profiles and settings. Ported by ZloiKILLER.
 ## Playing
 
 1. Download `speed.exe` from [Releases](../../releases).
-2. Start it. The first time it asks for your disc image and where to install, checks the image, and makes the folder `nfshp2port` there with
-   everything the game needs (about 3.6 GB; the disc image is only read). Then the game starts.
-3. From then on start `nfshp2port\speed.exe` (or the shortcut on the desktop).
+2. Start it. The first time it asks for your disc image and for the folder to install into (any folder you like), checks the image, and puts
+   everything the game needs there (about 3.6 GB; the disc image is only read). Then the game starts.
+3. From then on start `speed.exe` in that folder (or the shortcut on the desktop). The downloaded `speed.exe` finds the installed game too.
 
-`README.txt` in `nfshp2port` has the controls and the settings.
+`README.txt` in the game's folder has the controls and the settings.
 
 Needs: Windows 10 or 11, 64-bit, a graphics card with Vulkan.
 
@@ -60,5 +60,6 @@ The same tools give the same `speed.exe` as in Releases, and with the same disc 
 | `recomp/docs/` | notes on the data files, the menus and the languages |
 | `tools/recomp/` | the recompiler (`gen.py`) and the language files' source (`make_lang.py`) |
 | `third_party/` | SDL3 (zlib license), for gamepads |
+| `recomp/runtime/shaders/smaa/`, `recomp/runtime/smaa/` | SMAA by Jorge Jimenez and others (MIT license, `LICENSE.txt` there): the antialiasing shader and its tables |
 
 Need for Speed and Hot Pursuit are trademarks of Electronic Arts. This project is not affiliated with Electronic Arts.

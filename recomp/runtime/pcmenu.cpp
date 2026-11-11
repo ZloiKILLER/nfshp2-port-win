@@ -12,6 +12,8 @@
 #include "pcconfig.h"
 #include "pclang.h"
 #include <map>
+#include <chrono>
+#include <cmath>
 
 #include <cstdio>
 #include <cstdlib>
@@ -38,6 +40,18 @@ u32 pc_call(u32 fn, u32 a0, u32 a1, u32 a2, u32 a3, u32 t0)
     return r;
 }
 
+// the same with one float argument after the first integer one (f12)
+static void pc_call_f(u32 fn, u32 a0, float f12)
+{
+    Ctx &c = *g_pc_ctx;
+    Ctx saved = c;
+    c.r[4].d[0] = sx32(a0);
+    c.f[12].f = f12;
+    c.r[29].d[0] -= 0x200;
+    ps2_call(c, fn);
+    c = saved;
+}
+
 std::string pc_str(u32 a)
 {
     std::string s;
@@ -53,6 +67,8 @@ const u32 bFree = 0x257850;                 // bFree(ptr)
 const u32 bStringHash = 0x2534a8;
 const u32 SetString = 0x140e20;             // FlailerTextChunk::SetString(chunk, str)
 const u32 SetVisibility = 0x140728;         // FlailerObjectChunk::SetVisibility(chunk, vis)
+const u32 SetY = 0x140a48;                  // FlailerObjectChunk::SetY(chunk, y), a float: what the game's scrolling list moves a row with
+const u32 SetAlpha = 0x1406d8;              // FlailerObjectChunk::SetAlpha(chunk, 0..128): a text's or a bitmap's
 const u32 UpdateLanguageText = 0x1402a0;    // FlailerScreenChunk::UpdateLanguageText(screen)
 const u32 ChangeToScreen = 0x14cc78;        // ChangeToScreen(name, push current)
 const u32 GrayMenuItem = 0x16d198;          // GrayMenuItem(item hash, mode, screen hash)
@@ -84,11 +100,13 @@ static u32 galloc(u32 size)
 
 static std::map<u32, std::string> g_texts;     // the port's texts on screen objects, in English (set_text)
 
+static void g_row_home_clear();
 static void free_pages()
 {
     for (u32 p : g_page_mem) pc_call(fn::bFree, p);
     g_page_mem.clear();
     g_texts.clear();
+    g_row_home_clear();
 }
 
 // a guest copy of a string; the slot is reused after 16 more
@@ -427,6 +445,8 @@ static u32 value_object(u32 screen, int k)
     return find_object(screen, pc_hash(("PC_VALUE_" + std::to_string(k)).c_str()), 1);
 }
 
+static float row_home(u32 obj);
+
 // the values and the arrows of the page on screen
 static void page_refresh(PcPage &pg)
 {
@@ -439,7 +459,10 @@ static void page_refresh(PcPage &pg)
     for (int k = 1; k <= total && k <= 7; k++) {
         PcRow &r = pg.rows[(size_t)(pg.top + k - 1)];
         if (u32 label = find_object(s, menuitem_hash(k), 1)) set_text(label, r.label);
-        if (u32 v = value_object(s, k)) set_text(v, r.value ? r.value() : "");
+        if (u32 v = value_object(s, k)) {
+            set_text(v, r.value ? r.value() : "");
+            pc_call(fn::SetAlpha, v, r.disabled && r.disabled() ? 40 : 128);   // a greyed row's value goes dim with it
+        }
     }
     for (int k = total + 1; k <= 7; k++)
         if (u32 v = value_object(s, k)) set_text(v, "");
@@ -451,13 +474,114 @@ static void page_refresh(PcPage &pg)
     u32 item = pg.cur ? find_object(s, menuitem_hash(pg.cur), 1) : 0;
     for (u32 a : {la, ra}) {
         if (!a) continue;
-        if (arrows && item) set_fl(a + 52, fl(item + 52) + 8.0f), SB(a + 43, 4);
+        if (arrows && item) set_fl(a + 52, row_home(item) + 8.0f), SB(a + 43, 4);
         pc_call(fn::SetVisibility, a, arrows && item ? 1 : 0);
     }
 }
 
 static PcPage *g_current_page;
 static u32 g_current_self;      // the page's tOptionsScreen object
+
+// ---- a list that scrolls, as Audio's does --------------------------------------------------
+// The game's own list (tScrollingMenuList) slides its rows to their new places and pulses its two arrows' alpha by a sine
+// (tfeSineWave: up to 128, 10 radians a second). The port's lists are seven slots whose texts change, so the same is shown with what
+// they have: after a step the seven rows start a row away from their places and slide home, the one that comes in fading up, and the
+// arrows pulse while they show.
+static std::map<u32, float> g_row_home;     // a row's text or value: its own Y on the screen
+static float g_slide;                       // rows: where the texts are from home now, in rows; 0 at rest
+static double g_slide_from;                 // when the slide began, seconds
+static int g_slide_dir;
+static const float kRowStep = 37.0f;        // between two rows of the Options screen
+static const double kSlideSeconds = 0.2;
+
+static void g_row_home_clear() { g_row_home.clear(); }
+
+static double menu_seconds()
+{
+    static const auto start = std::chrono::steady_clock::now();
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+}
+
+static float row_home(u32 obj)
+{
+    auto it = g_row_home.find(obj);
+    if (it == g_row_home.end()) it = g_row_home.emplace(obj, fl(obj + 52)).first;
+    return it->second;
+}
+
+// the list on the screen stepped a row: down, and the rows come up from below
+static void slide_start(bool down)
+{
+    g_slide_dir = down ? 1 : -1;
+    g_slide = (float)g_slide_dir;
+    g_slide_from = menu_seconds();
+}
+
+// each frame of the frontend: the rows of the screen that is up to where the slide has them, and its arrows' pulse
+static void list_frame()
+{
+    // the tOptionsScreen that is live (gp-16888) is a page's or the Options screen's own; its first word is its screen's hash
+    const u32 live = LW(gp() - 16888), hash = live ? LW(live) : 0;
+    PcPage *pg = hash ? page_by_hash(hash) : nullptr;
+    u32 project = find_project(FRONTB_PROJECT), s = project && (pg || hash == OPTIONS_SCREEN) ? find_screen(project, hash) : 0;
+    static u32 sliding;                     // the screen whose rows are away from home
+    if (sliding && sliding != s) {          // it went while they were: home, for when it comes back
+        for (int k = 1; k <= 7; k++)
+            for (u32 o : {find_object(sliding, menuitem_hash(k), 1), value_object(sliding, k)})
+                if (o) pc_call_f(fn::SetY, o, row_home(o));
+        sliding = 0;
+        g_slide = 0;
+    }
+    if (!s) {
+        g_slide = 0;
+        return;
+    }
+    const double now = menu_seconds();
+    const int alpha = 32 + (int)(96.0 * (1.0 + sin(now * 10.0)) * 0.5);
+    for (u32 h : {SCROLL_UP_ARROW, SCROLL_DOWN_ARROW})
+        if (u32 a = find_object(s, h, 2)) pc_call(fn::SetAlpha, a, (u32)alpha);
+    if (g_slide == 0) return;
+    float t = (float)((now - g_slide_from) / kSlideSeconds);
+    if (t >= 1) t = 1;
+    const float left = (1 - t) * (1 - t) * (1 - t);     // fast, then easing in: the cubic of the game's own
+    g_slide = t >= 1 ? 0 : left * (float)g_slide_dir;
+    sliding = g_slide != 0 ? s : 0;
+    const int entering = g_slide_dir > 0 ? 7 : 1;
+    for (int k = 1; k <= 7; k++) {
+        u32 objs[2] = {find_object(s, menuitem_hash(k), 1), pg ? value_object(s, k) : 0};
+        for (u32 o : objs) {
+            if (!o) continue;
+            pc_call_f(fn::SetY, o, row_home(o) + g_slide * kRowStep);   // not the field alone: the text is laid out again only when told
+        }
+        if (k == entering && objs[1]) {
+            const PcRow *r = pg && pg->top + k - 1 < (int)pg->rows.size() ? &pg->rows[(size_t)(pg->top + k - 1)] : nullptr;
+            const int full = r && r->disabled && r->disabled() ? 40 : 128;
+            pc_call(fn::SetAlpha, objs[1], (u32)(full * (1 - left)));
+        }
+    }
+}
+
+// The slots' states as GrayMenuItem takes them: 1 as usual, 0 greyed (a row that is disabled now), 2 hidden (no row). Told to the game only
+// when one changes: a row can go grey or come back by what another row was set to.
+static void page_gray(PcPage &pg, bool all)
+{
+    static u32 last_hash;
+    static int last[8];
+    const u32 hash = page_hash(pg);
+    if (hash != last_hash) all = true;
+    last_hash = hash;
+    const int total = (int)pg.rows.size();
+    for (int k = 1; k <= 7; k++) {
+        int mode = 2;
+        if (k <= total) {
+            const PcRow &r = pg.rows[(size_t)(pg.top + k - 1 < total ? pg.top + k - 1 : total - 1)];
+            mode = r.disabled && r.disabled() ? 0 : 1;
+        }
+        if (!all && last[k] == mode) continue;
+        last[k] = mode;
+        pc_call(fn::GrayMenuItem, menuitem_hash(k), (u32)mode, hash);
+    }
+}
 
 static std::vector<std::function<void()>> g_frame_fns;
 void pc_on_frame(std::function<void()> fn) { g_frame_fns.push_back(std::move(fn)); }
@@ -483,7 +607,7 @@ static bool press_up_soon;
 static void page_shape(PcPage &pg)
 {
     const u32 hash = page_hash(pg);
-    for (int k = 1; k <= 7; k++) pc_call(fn::GrayMenuItem, menuitem_hash(k), k <= (int)pg.rows.size() ? 1 : 2, hash);
+    page_gray(pg, true);
     u32 project = find_project(FRONTB_PROJECT), s = project ? find_screen(project, hash) : 0;
     if (!s) return;
     for (const char *name : {"PC_BACK_ICON", "PC_BACK_TEXT"})
@@ -522,6 +646,8 @@ static bool page_event(PcPage &pg, u32 self, u32 msg, u32 data)
             blurb_text(self + 100, pg.rows[(size_t)(pg.top + slot) - 1].blurb);
             pc_call(fn::BlurbAnimate, self + 100);
             page_refresh(pg);
+            page_gray(pg, false);
+            slide_start(down);
         } else if (down ? slot == 7 : slot == 1) {
             pg.top = down ? 0 : total - 7;      // round: the game's menu goes to the other end
         }
@@ -532,9 +658,11 @@ static bool page_event(PcPage &pg, u32 self, u32 msg, u32 data)
         PcRow &r = pg.rows[(size_t)row - 1];
         int dir = msg == 6 ? -1 : msg == 7 ? 1 : (r.value ? 1 : 0);
         if (msg != 1 && (!r.value || r.select_only)) return true;
+        if (r.disabled && r.disabled()) return true;
         if (r.change) r.change(dir);
         if (msg != 1) SW(data + 12, msg == 6 ? 1 : 2);      // the sound of Left and Right
         page_refresh(pg);
+        if (g_current_page == &pg) page_gray(pg, false);
         return true;
     }
     case 18:                                // SCREEN_TICK: the game's own animation
@@ -608,6 +736,7 @@ static bool options_event(u32 self, u32 msg, u32 data, Ctx &c, void (*orig)(Ctx 
             g_opt_top += down ? 1 : -1;
             SW(data + 8, 1);                // Param 1: the highlight stays on its slot
             options_refresh();
+            slide_start(down);
             blurb_text(self + 100, kOptions[g_opt_top + slot - 1].blurb);
             pc_call(fn::BlurbAnimate, self + 100);
             return true;
@@ -905,6 +1034,12 @@ void HOOK___14tOptionsScreeni(Ctx &c, void (*orig)(Ctx &))
         g_current_page = pg;
         g_current_self = self;
         pg->cur = 0;
+        if (!pg->on_open)
+            for (const PcRow &r : pg->rows)
+                if (r.disabled) {
+                    page_gray(*pg, true);       // a page with a row that can be greyed: the slots' states as they are now
+                    break;
+                }
         page_refresh(*pg);
     }
     (void)self;
@@ -1036,10 +1171,24 @@ static void mouse_frame()
     u32 menu = screen && screen != screens ? LW(screen + 8) : 0;
     u32 chunk = menu ? find_menu_screen(LW(menu + 20)) : 0;
     int count = 0, current = -1, hovered = -1;
+    unsigned long long usable = 0;          // by the item's place in the menu: it can be chosen
     if (chunk) {
         float best = 1e9f;
+        static const bool diag = getenv("HP2_DIAG") != nullptr;
+        static u32 diag_menu;
+        if (diag && diag_menu != LW(menu + 20)) {
+            diag_menu = LW(menu + 20);
+            fprintf(stderr, "menu %08x: the items' states", LW(menu + 20));
+            for (u32 item = LW(menu); item && item != menu; item = LW(item)) fprintf(stderr, " %x", LW(item + 8));
+            fprintf(stderr, "\n");
+        }
         for (u32 item = LW(menu); item && item != menu; item = LW(item), count++) {
             if (item == LW(menu + 8)) current = count;
+            // A greyed item (View Replay in the first second of a race) is not the pointer's to pick: the game steps over it, the selection
+            // never gets there and went back and forth instead. FlailerMenuItem::State +8, bit 0: the item can be chosen; GrayMenuItem
+            // (0x16d198) clears it for "grey" and for "hidden" and sets it for "as usual".
+            if (!(LW(item + 8) & 1)) continue;
+            if (count < 64) usable |= 1ull << count;
             u32 o = find_object(chunk, LW(item + 12));
             if (!o || (s8)LB(o + 41) != 1) continue;
             // Flailer's 640 x 480 in the 512 x 448, measured on the screens: the middle of a text's line
@@ -1110,8 +1259,19 @@ static void mouse_frame()
         return;
     }
     if (pending >= 0 && count && current >= 0 && pending != current && tries > 0) {
-        int down = (pending - current + count) % count;
-        g_mouse_out = 1 << (down <= count / 2 ? PCB_DOWN : PCB_UP);
+        // The shorter way round, in presses: the game steps over what cannot be chosen (greyed, hidden), so only the items that can are
+        // counted. By places alone, from Quit back up to Options past a greyed View Replay looked the longer way and the selection went
+        // down, round over the top.
+        int down = 0, up = 0;
+        for (int i = current; i != pending;) {
+            i = (i + 1) % count;
+            if (i >= 64 || (usable >> i & 1)) down++;
+        }
+        for (int i = current; i != pending;) {
+            i = (i + count - 1) % count;
+            if (i >= 64 || (usable >> i & 1)) up++;
+        }
+        g_mouse_out = 1 << (down <= up ? PCB_DOWN : PCB_UP);
         g_mouse_wait = 4;
         tries--;
         return;
@@ -1265,6 +1425,7 @@ void HOOK_Tick__17FlailerScreenList(Ctx &c, void (*orig)(Ctx &))
     pc_language_apply();                    // hp2.ini's language, once the frontend runs
     pc_paint_buttons();
     mouse_frame();
+    list_frame();
     for (auto &f : g_frame_fns) f();
     if (g_pc_ui_dirty.exchange(false)) pc_refresh_page();
     if (go && ++tick == (strchr(go, ',') ? atoi(strchr(go, ',') + 1) : 900)) {

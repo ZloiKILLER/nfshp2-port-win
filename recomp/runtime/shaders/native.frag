@@ -84,7 +84,8 @@ void main()
         float lod = u.pass == 2 ? 0.0 : log2(1.0 / gl_FragCoord.w) * pow(2.0, u.lod_l) + (u.pass == 0 ? v_k : 0.0);
         // the setting's anisotropic filter: the level goes by how the texture lies on the screen, not by Q
         vec4 t = (u.tex_mode & 32) != 0 ? texture(tex, v_st) * 255.0 : sample_tex(lod);
-        if (u.pass == 2) t.a = 128.0;       // the sphere map: its alpha is 1
+        // the sphere map: its alpha is 1. The showroom's own map (bit 64) is 32 bits, and its alpha goes into As as any texture's
+        if (u.pass == 2 && (u.tex_mode & 64) == 0) t.a = 128.0;
         if (u.tfx == 1) {                   // DECAL
             rgb = t.rgb / 255.0;
             a8 = t.a;
@@ -102,7 +103,8 @@ void main()
     if (ALPHA_TEST && u.alpha_test > 0.5 && a8 <= 48.0) discard;
     if (u.bits16 != 0) {                    // what such a target keeps
         rgb = floor(rgb * 255.0 / 8.0 + 1e-3) * 8.0 / 255.0;
-        if (u.blend_alpha < -1.5) a8 = a8 >= 128.0 ? 128.0 : 0.0;
+        // the env map's views have FBA 1 in their register block: whatever is drawn there sets the alpha bit, the clear's grey has it clear
+        if (u.blend_alpha < -1.5) a8 = 128.0;
     }
     // The frame's alpha holds As as it is, a byte. Cs Ad, with 0x80 as 1.0, comes to twice Cs Ad / 256: drawn twice, -3.
     if (u.blend_alpha < -3.5) {
