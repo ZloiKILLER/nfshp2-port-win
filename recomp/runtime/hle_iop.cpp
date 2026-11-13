@@ -207,7 +207,7 @@ void HLE_sceSifRebootIop(Ctx &c) { LOG("IOP reboot: %s\n", guest_str(A0).c_str()
 void HLE_sceSifSyncIop(Ctx &c) { RET(1); }
 void HLE_sceSifIsAliveIop(Ctx &c) { RET(1); }
 
-// The sound driver runs for real on the IOP interpreter (iop.h); HP2_NOSOUND keeps it
+// The sound driver runs for real, its code translated ahead of time (iop.h); HP2_NOSOUND keeps it
 // at the old zero-answer HLE.
 static bool runs_on_iop(const std::string &path)
 {
@@ -231,7 +231,7 @@ void HLE_sceSifLoadModule(Ctx &c)
     std::string path = guest_str(A0);
     bool iop = runs_on_iop(path);
     int r = iop ? start_on_iop(path) : 0;
-    LOG("IOP module %s -> id %d%s\n", path.c_str(), g_next_module, iop ? " (interpreted)" : "");
+    LOG("IOP module %s -> id %d%s\n", path.c_str(), g_next_module, iop ? " (its own code)" : "");
     if (r < 0) LOG("IOP module %s failed to start\n", path.c_str());
     RET(g_next_module++);
 }
@@ -240,7 +240,7 @@ void HLE_sceSifLoadStartModule(Ctx &c)
     std::string path = guest_str(A0);
     bool iop = runs_on_iop(path);
     int r = iop ? start_on_iop(path) : 0;
-    LOG("IOP module %s (start) -> id %d%s\n", path.c_str(), g_next_module, iop ? " (interpreted)" : "");
+    LOG("IOP module %s (start) -> id %d%s\n", path.c_str(), g_next_module, iop ? " (its own code)" : "");
     // int *result is the 4th argument
     if (A3) SW(A3, (u32)r);
     RET(g_next_module++);
@@ -544,6 +544,8 @@ void window_rumble_port(int port, int small, int large);
 void HLE_scePadSetActDirect(Ctx &c)
 {
     if (A0 < 2 && A2) window_rumble_port(A0, LB(A2), LB(A2 + 1));
+    static const bool log = getenv("HP2_RUMBLELOG") != nullptr;     // what the game asks of the motors, as it asks
+    if (log && A0 < 2 && A2) LOG("rumble: port %u small %u large %u\n", A0, LB(A2), LB(A2 + 1));
     RET(1);
 }
 void HLE_scePadInfoPressMode(Ctx &c) { RET(1); }
@@ -649,7 +651,8 @@ static std::string g_mc_base;
 bool mc_profiles_enabled()
 {
     mc_setup();
-    return !getenv("HP2_MEMCARD") && !g_mc.root.empty();
+    static const bool forced = getenv("HP2_MEMCARD") != nullptr;
+    return !forced && !g_mc.root.empty();
 }
 
 std::string mc_profile_dir(const std::string &name)
@@ -1038,14 +1041,14 @@ void HLE_sceMcClose(Ctx &c)
 void HLE_sceMcRead(Ctx &c)
 {
     s32 r = mc_rw(c, (s32)A0, A1, A2, false);
-    MCLOG("sceMcRead %d %u bytes -> %d\n", (s32)A0, A2, r);
+    MCLOG("sceMcRead %d %u bytes to %08x -> %d\n", (s32)A0, A2, A1, r);
     mc_request(c, MCF_READ, r);
 }
 
 void HLE_sceMcWrite(Ctx &c)
 {
     s32 r = mc_rw(c, (s32)A0, A1, A2, true);
-    MCLOG("sceMcWrite %d %u bytes -> %d\n", (s32)A0, A2, r);
+    MCLOG("sceMcWrite %d %u bytes from %08x -> %d\n", (s32)A0, A2, A1, r);
     mc_request(c, MCF_WRITE, r);
 }
 

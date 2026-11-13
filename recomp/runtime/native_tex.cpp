@@ -4,6 +4,7 @@
 
 #include "host.h"
 #include "ps2.h"
+#include "memwatch.h"
 
 #include <chrono>
 #include <cstdio>
@@ -313,14 +314,44 @@ void native_texture_take_time(double &ms, uint32_t &decoded)
 }
 
 static NativeTexture *native_texture_now(uint32_t info, uint32_t frame);
+static uint64_t g_tex_vouched, g_tex_summed, g_tex_vouched_bad;     // textures asked for: known unchanged by their pages, summed
+
+void native_texture_watch_stats(uint64_t *vouched, uint64_t *summed, uint64_t *bad) { *vouched = g_tex_vouched, *summed = g_tex_summed, *bad = g_tex_vouched_bad; }
+
+std::mutex g_native_tex_mutex;
+static std::vector<NativeTexUpload> g_uploads;
+
+void native_texture_take_uploads(std::vector<NativeTexUpload> &out)
+{
+    for (NativeTexUpload &u : g_uploads) out.push_back(std::move(u));
+    g_uploads.clear();
+}
+
+uint16_t native_tex_mode(const NativeTexture &t)
+{
+    return (uint16_t)((t.repeat_s ? 1 : 0) | (t.repeat_t ? 2 : 0) | (t.mag_linear ? 4 : 0) | (t.min_linear ? 8 : 0) | (t.mip_linear ? 16 : 0) | (t.levels - 1) << 8);
+}
 
 // what decodes a texture is timed: a frame that waited on it shows in HP2_NATIVELOG's long frames
 NativeTexture *native_texture(uint32_t info, uint32_t frame)
 {
+    // Asked for again in the same frame (every draw asks): the answer is the same texture while the info's image, palette and depth
+    // are what they were, which is all native_texture_now would look at before it gave the same one back. No map, no clock.
+    struct Asked {
+        uint32_t info, image, palette, frame;
+        int bpp;
+        NativeTexture *tex;
+    };
+    static Asked asked[1024];
+    Asked &was = asked[info >> 4 & 1023];
+    if (info && was.tex && was.info == info && was.frame == frame && was.image == LW(info + 0x90) && was.palette == LW(info + 0x94) &&
+        was.bpp == (int)LB(info + 0x28))
+        return was.tex;
     const auto t0 = std::chrono::steady_clock::now();
     const uint32_t before = g_decoded;
     NativeTexture *t = native_texture_now(info, frame);
     if (g_decoded != before) g_decode_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (t && t->frame == frame && t->w) was = {info, LW(info + 0x90), LW(info + 0x94), frame, (int)LB(info + 0x28), t};
     return t;
 }
 
@@ -332,15 +363,43 @@ static NativeTexture *native_texture_now(uint32_t info, uint32_t frame)
     if (!image || (bpp != 4 && bpp != 8 && bpp != 32) || (bpp != 32 && !palette)) return nullptr;
     NativeTexture &t = cache[(u64)image << 32 | palette];
     if (t.frame == frame && t.w) return &t;
-    t.frame = frame;
+    bool on_gpu;
+    {   // the stamp and the look in one: the renderer lets a texture go only by a stamp it reads under the same lock
+        std::lock_guard<std::mutex> hold(g_native_tex_mutex);
+        t.frame = frame;
+        on_gpu = t.loaded;
+    }
     int w = LH(info + 0x24), h = LH(info + 0x26);
     if (w <= 0 || h <= 0 || w > 2048 || h > 2048) return nullptr;
     size_t bytes = (size_t)w * h * bpp / 8, pal_bytes = bpp == 8 ? 1024 : bpp == 4 ? 64 : 0;
     const u8 *px = host(image), *pal = pal_bytes ? host(palette) : nullptr;
     // A streamed or animated texture changes in place: the palette whole, the pixels by a sample. A movie's frames all of them. The step is
     // odd so that it walks across the rows: one that is a multiple of the width sees a single column, which on a white movie never changes.
-    const bool movie = !strncmp((const char *)host(info + 8), "MOVIE_", 6);
-    u32 sum = checksum(px, bytes, bytes > 4096 && !movie ? (bytes / 512) | 1 : 1) ^ (pal ? checksum(pal, pal_bytes, 1) * 31 : 0);
+    // That sum reads 512 bytes all over the pixels, for every texture of every frame, and nearly all of them are the track's, which
+    // nothing writes once loaded. So the pixels' and the palette's pages are watched for writes (memwatch.h): while none has had one
+    // since the sum was made under the watch, the bytes are those and so is the sum, and nothing is read. A texture on pages that are
+    // written all the time (the watch is refused there) is summed every frame, as before. HP2_TEXWATCHCHECK=1: summed anyway, and compared.
+    static const bool watch_check = getenv("HP2_TEXWATCHCHECK") != nullptr;
+    const u32 raw_bytes = (u32)bytes;
+    const auto raw_stamp = [&] { return memwatch_sum(image, raw_bytes) + (pal ? memwatch_sum(palette, (u32)pal_bytes) * 0x100000001ull : 0); };
+    const auto raw_sum = [&] {
+        const bool movie = !strncmp((const char *)host(info + 8), "MOVIE_", 6);
+        return checksum(px, bytes, bytes > 4096 && !movie ? (bytes / 512) | 1 : 1) ^ (pal ? checksum(pal, pal_bytes, 1) * 31 : 0);
+    };
+    u32 sum;
+    if (t.raw_watched && t.raw_bytes == raw_bytes && t.raw_stamp == raw_stamp()) {
+        sum = t.raw_sum;
+        g_tex_vouched++;
+        if (watch_check && raw_sum() != sum && g_tex_vouched_bad++ < 10)
+            fprintf(stderr, "texwatch: %s: its pages were not written, its sum is another\n", (const char *)host(info + 8));
+    } else {
+        t.raw_watched = image < 0x02000000u && memwatch_watch_range(image, raw_bytes) && (!pal || memwatch_watch_range(palette, (u32)pal_bytes));
+        t.raw_stamp = t.raw_watched ? raw_stamp() : 0;
+        sum = raw_sum();
+        t.raw_sum = sum;
+        t.raw_bytes = raw_bytes;
+        g_tex_summed++;
+    }
     // the two that show the keys: a sample of the pixels can miss one key's name changing
     const bool replay_bar = !strcmp((const char *)host(info + 8), "REPLAYBOTTOM_NEW");
     if (replay_bar || !strcmp((const char *)host(info + 8), "BUTTONSOUT")) sum ^= pc_replay_bar_stamp() * 0x9e3779b1u;
@@ -351,7 +410,7 @@ static NativeTexture *native_texture_now(uint32_t info, uint32_t frame)
     t.mag_linear = LB(info + 0x6f) != 0;
     t.min_linear = mmin == 1 || mmin == 4 || mmin == 5;
     t.mip_linear = mmin == 3 || mmin == 5;
-    if (t.image_w == w && t.image_h == h && t.sum == sum && t.vk) return &t;
+    if (t.image_w == w && t.image_h == h && t.sum == sum && on_gpu) return &t;
     t.image_w = w;
     t.image_h = h;
     t.w = 1 << LB(info + 0x48);
@@ -424,7 +483,16 @@ static NativeTexture *native_texture_now(uint32_t info, uint32_t frame)
         t.font_alpha.resize((size_t)t.w * t.h);
         for (size_t i = 0; i < t.font_alpha.size(); i++) t.font_alpha[i] = (u8)(t.px[i] >> 24);
     }
-    t.dirty = true;
+    {   // the pixels go with the frame; the next decoding of this texture starts from an empty px
+        NativeTexUpload up;
+        up.tex = &t;
+        up.px.swap(t.px);
+        up.w = t.w, up.h = t.h, up.levels = t.levels;
+        up.repeat_s = t.repeat_s, up.repeat_t = t.repeat_t, up.mag_linear = t.mag_linear, up.min_linear = t.min_linear, up.mip_linear = t.mip_linear;
+        g_uploads.push_back(std::move(up));
+        std::lock_guard<std::mutex> hold(g_native_tex_mutex);
+        t.loaded = true;
+    }
     g_decoded++;
     return &t;
 }

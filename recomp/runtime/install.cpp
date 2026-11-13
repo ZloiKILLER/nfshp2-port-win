@@ -130,7 +130,8 @@ bool load_names(std::unordered_map<uint32_t, std::string> &names, std::string &w
         if (bstring_hash(name) != h) return why = "The table of names is wrong at " + name + ".", false;
         names[h] = name;
     }
-    for (const char *extra : {"SOUND\\JUKEBOX.JBC", "SOUND\\SNDDATA.BIN", "SOUND\\SNDHDR.BIN", "REPLAY\\JUL23\\T22REDCORVETTE.BIN", "NFS.TAG"})
+    for (const char *extra : {"SOUND\\JUKEBOX.JBC", "SOUND\\SNDDATA.BIN", "SOUND\\SNDHDR.BIN", "REPLAY\\JUL23\\T22REDCORVETTE.BIN", "NFS.TAG",
+                              "HOTCHUNK.TAG"})     // the Europe v2.00 disc's one file more: a line of text its build tool left
         names[bstring_hash(extra)] = extra;
     return true;
 }
@@ -187,9 +188,17 @@ std::string unnamed_place(uint32_t h, const std::vector<uint8_t> &head)
     return "unknown/" + hex8(h) + ".dat";
 }
 
+// Where a file of the archive goes in data\. The archive's compressed files (.LZC, a COMP container) are written unpacked: the game's
+// loader (ResourceFile::LoadResourceIfFileTransferFinished, 0x1994f0) unpacks only what begins with COMP and takes anything else as it
+// is, and it finds a file by the hash of its name, so the plain data under the compressed file's hash is all it needs. They get the name
+// of what they hold, .BUN (chunks) or .geo (a car's geometry). For 58 of the 81 the disc has that plain file as well, under its own
+// name and never asked for: it is the same bytes, so it is not written a second time, and its line of the index names the one file.
+// packed: this one is to be unpacked; twin: this one is the plain copy, in the index only.
 std::string place(uint32_t h, const std::unordered_map<uint32_t, std::string> &names, const std::set<std::string> &all_names,
-                  const std::vector<uint8_t> &head)
+                  const std::vector<uint8_t> &head, bool *packed = nullptr, bool *is_twin = nullptr)
 {
+    if (packed) *packed = false;
+    if (is_twin) *is_twin = false;
     static const std::regex textures("^(CARS/TEXTURES|GLOBAL/(DYNTEX|HUDTEX|DRIVTEX)|FRONTEND/TSELECT|TRACKS/TEX\\d+(TRACK|LOCATION))\\.BIN$");
     static const std::regex geometry("^(CARS/[^/]+/(GEOMETRY|DASHGEOM)|GLOBAL/CHARACTERSA)\\.BIN$");
     static const std::pair<std::regex, const char *> kinds[] = {
@@ -209,12 +218,17 @@ std::string place(uint32_t h, const std::unordered_map<uint32_t, std::string> &n
     splitext(rel, stem, ext);
     const std::string ue = upper(ext);
     const bool twin = (ue == ".BIN" || ue == ".BUN") && all_names.count(upper(stem) + ".LZC");
+    if (ue == ".LZC" || twin) {
+        if (packed) *packed = !twin;
+        if (is_twin) *is_twin = twin;
+        return stem + (std::regex_match(stem + ".BIN", geometry) ? ".geo" : ".BUN");
+    }
     for (const auto &k : kinds)
         if (std::regex_match(rel, k.first)) {
             rel = stem + k.second;
             break;
         }
-    return twin ? "unused/" + rel : rel;
+    return rel;
 }
 
 // ---- LZ: lzdecompress.py ---------------------------------------------------------------------------------
@@ -586,7 +600,7 @@ bool export_textures(const fs::path &data, const std::vector<std::string> &index
         splitext(r, stem, ext);
         std::string e = ext;
         for (char &c : e) c = (char)tolower((unsigned char)c);
-        if ((e == ".tex" || e == ".geo" || e == ".nis" || e == ".bun" || e == ".lzc") && r.compare(0, 7, "unused/")) files.insert(r);
+        if ((e == ".tex" || e == ".geo" || e == ".nis" || e == ".bun" || e == ".lzc") && r.compare(0, 7, "unused/")) files.insert(r);     // .lzc, unused/: a folder of before
     }
     std::error_code ec;
     fs::create_directories(data / L"textures", ec);
@@ -769,6 +783,9 @@ bool write_port_files(const fs::path &root)
 
 }   // namespace
 
+bool install_port_files(const std::wstring &root) { return write_port_files(root); }
+bool install_write_png(const std::wstring &path, int w, int h, const std::vector<uint8_t> &rgba) { return write_png(path, w, h, rgba); }
+
 bool install_exports(const std::wstring &data_dir, InstallSteps &steps)
 {
     const fs::path data = data_dir;
@@ -790,6 +807,53 @@ bool install_exports(const std::wstring &data_dir, InstallSteps &steps)
     return true;
 }
 
+// The disc's program as the one the code was recompiled from. For the discs that have it already, nothing. For the others the patch of
+// make_disc_patch.py: "HP2P1", the two SHA-1s, the size, the shifts (bytes moved up to make room for what that link left out), then runs of
+// the result's bytes, each after a gap. What comes out is the USA program to the bit, or the install stops.
+static bool usa_program(std::vector<uint8_t> &b, std::string &why)
+{
+    const std::string have = sha1_hex(b.data(), b.size());
+    const KnownDisc *disc = nullptr;
+    for (const KnownDisc &k : kKnownDiscs)
+        if (have == k.elf_sha1) disc = &k;
+    if (!disc) return why = "This disc is not supported yet.", false;
+    if (!disc->patch) return true;
+    const uint8_t *p;
+    size_t n;
+    if (!resource(disc->patch, p, n) || n < 60 || memcmp(p, "HP2P1\0\0", 8)) return why = "The exe has no patch for this disc's program.", false;
+    auto u32at = [&](size_t at) { return (uint32_t)p[at] | (uint32_t)p[at + 1] << 8 | (uint32_t)p[at + 2] << 16 | (uint32_t)p[at + 3] << 24; };
+    const uint32_t size = u32at(48), shifts = u32at(52), runs = u32at(56);
+    if (size != b.size() || 60 + (size_t)shifts * 12 > n) return why = "The patch does not fit this disc's program.", false;
+    const std::vector<uint8_t> src = b;
+    size_t at = 60;
+    for (uint32_t i = 0; i < shifts; i++, at += 12) {
+        const uint32_t pos = u32at(at), count = u32at(at + 4), end = u32at(at + 8);
+        if (pos + count > end || end > size) return why = "The patch does not fit this disc's program.", false;
+        memcpy(&b[pos + count], &src[pos], end - pos - count);
+        memset(&b[pos], 0, count);
+    }
+    auto varint = [&](uint32_t &v) {
+        v = 0;
+        for (int shift = 0; at < n && shift < 35; shift += 7) {
+            const uint8_t c = p[at++];
+            v |= (uint32_t)(c & 0x7f) << shift;
+            if (!(c & 0x80)) return true;
+        }
+        return false;
+    };
+    size_t out = 0;
+    for (uint32_t i = 0; i < runs; i++) {
+        uint32_t gap, len;
+        if (!varint(gap) || !varint(len) || out + gap + len > size || at + len > n) return why = "The patch for this disc's program is damaged.", false;
+        out += gap;
+        memcpy(&b[out], &p[at], len);
+        out += len;
+        at += len;
+    }
+    if (sha1_hex(b.data(), b.size()) != kKnownDiscs[0].elf_sha1) return why = "This disc's program did not come out as the one the game runs.", false;
+    return true;
+}
+
 bool install_game(Iso &iso, const std::wstring &root_dir, InstallSteps &steps)
 {
     const fs::path root = root_dir, data = root / L"data";
@@ -800,11 +864,12 @@ bool install_game(Iso &iso, const std::wstring &root_dir, InstallSteps &steps)
                     *irx = iso.find("/NFSHP2/IRX253/STREAM.IRX");
     if (!elf || !zdir_f || !zz || !irx) return steps.why = "The disc image lacks the game's files.", false;
 
-    // the program and the sound module, as they are
+    // the program and the sound module, as they are; but a disc whose program is another link of it (Asia, Korea): made the USA one first
     for (auto &x : {std::make_pair(elf, std::string("SLUS_203.62")), std::make_pair(irx, std::string("IRX253/STREAM.IRX"))}) {
         std::vector<uint8_t> b((size_t)x.first->size);
-        if (!iso.read_file(*x.first, 0, b.data(), b.size()) || !write_file(under(data, x.second), b.data(), b.size()))
-            return steps.why = "The disc image cannot be read, or the folder cannot be written.", false;
+        if (!iso.read_file(*x.first, 0, b.data(), b.size())) return steps.why = "The disc image cannot be read.", false;
+        if (x.first == elf && !usa_program(b, steps.why)) return false;
+        if (!write_file(under(data, x.second), b.data(), b.size())) return steps.why = "The folder cannot be written.", false;
     }
 
     // the archive: its files one after another, each from a new sector, in ZDIR's order
@@ -839,11 +904,19 @@ bool install_game(Iso &iso, const std::wstring &root_dir, InstallSteps &steps)
         if (e.hash == 0xbf0a6606) continue;
         std::vector<uint8_t> head(std::min<uint32_t>(e.size, 64));
         if (!head.empty() && !iso.read_file(*zz, (uint64_t)e.at * SECTOR, head.data(), head.size())) return steps.why = "The disc image cannot be read.", false;
-        const std::string rel = place(e.hash, names, all_names, head);
+        bool packed, twin;
+        const std::string rel = place(e.hash, names, all_names, head, &packed, &twin);
         steps.progress((int)(700 * written / std::max<uint64_t>(total, 1)), L"Unpacking " + latin1_w(rel));
-        buf.resize(e.size);
-        if (e.size && !iso.read_file(*zz, (uint64_t)e.at * SECTOR, buf.data(), buf.size())) return steps.why = "The disc image cannot be read.", false;
-        if (!write_file(under(data, rel), buf.data(), buf.size())) return steps.why = "The folder cannot be written (free space?).", false;
+        if (!twin) {
+            buf.resize(e.size);
+            if (e.size && !iso.read_file(*zz, (uint64_t)e.at * SECTOR, buf.data(), buf.size())) return steps.why = "The disc image cannot be read.", false;
+            if (packed && buf.size() >= 4 && !memcmp(buf.data(), "COMP", 4)) {
+                std::vector<uint8_t> plain;
+                if (!lz_decompress(buf, plain)) return steps.why = "A compressed file of the disc image cannot be unpacked: " + rel, false;
+                buf.swap(plain);
+            }
+            if (!write_file(under(data, rel), buf.data(), buf.size())) return steps.why = "The folder cannot be written (free space?).", false;
+        }
         written += e.size;
         index += hex8(e.hash) + " " + rel + "\n";
         paths.push_back(rel);
@@ -860,6 +933,8 @@ bool install_game(Iso &iso, const std::wstring &root_dir, InstallSteps &steps)
 }
 
 #else
+bool install_port_files(const std::wstring &) { return false; }
+bool install_write_png(const std::wstring &, int, int, const std::vector<uint8_t> &) { return false; }
 bool install_game(Iso &, const std::wstring &, InstallSteps &s) { return s.why = "Windows only for now.", false; }
 bool install_exports(const std::wstring &, InstallSteps &s) { return s.why = "Windows only for now.", false; }
 #endif

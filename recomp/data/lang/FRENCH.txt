@@ -67,6 +67,9 @@ Draw Distance	Distance de vue
 How far away scenery still shows. 100% is the PS2's.	Jusqu'où le décor reste visible. 100 % : comme sur PS2.
 Level of Detail	Niveau de détail
 Maximum: scenery and cars always at their most detailed models. Original: as on the PS2.	Maximum : décor et voitures toujours avec leurs modèles les plus détaillés. Original : comme sur PS2.
+Reflections	Reflets
+High	Élevé
+The reflections on the cars. Advanced: new every frame. High: new every frame, at twice the resolution.	Les reflets sur les voitures. Avancé : renouvelés à chaque image. Élevé : à chaque image, en résolution doublée.
 Show FPS	Afficher les IPS
 Frames per second in the corner of the picture.	Les images par seconde dans un coin de l'image.
 Advanced	Avancé
@@ -218,3 +221,21 @@ R Stick	Stick D
 #900005	Veuillez brancher@une manette pour@le joueur %d.
 #900011	Veuillez brancher une manette.
 #940001	Appuyez sur \x80 pour participer à cette épreuve.
+Select, then press the key for it. Esc cancels.	Sélectionnez, puis appuyez sur la touche. Échap annule.
+Zone Freeze	Zone : arrêt sur image
+Zone Zoom	Zone : zoom
+Select, then type its name. A gamepad gets the letter grid.	Sélectionnez, puis tapez son nom. Avec une manette, une grille de lettres s'affiche.
+Capitals	Majuscules
+Delete the profile %s? Its save and its controls will be gone.	Supprimer le profil %s ? Sa sauvegarde et ses commandes seront perdues.
+The profile is made. Select it to play as it.	Le profil est créé. Sélectionnez-le pour jouer avec.
+Antialiasing	Anticrénelage
+Smoother edges: off, MSAA or SMAA.	Des bords plus lisses : désactivé, MSAA ou SMAA.
+Off, MSAA (the scene drawn in samples) or SMAA (the picture's edges smoothed).	Désactivé, MSAA (la scène dessinée en échantillons) ou SMAA (les bords de l'image lissés).
+Quality	Qualité
+MSAA: samples a pixel. SMAA: how far it looks along an edge.	MSAA : échantillons par pixel. SMAA : la distance examinée le long d'un bord.
+This graphics card has no more samples for the game.	Cette carte graphique n'a pas plus d'échantillons pour le jeu.
+The buttons for driving and the stick.	Les boutons pour conduire et le stick.
+The gamepad's layouts, A to D: what each button does in a race.	Les configurations de la manette, A à D : le rôle de chaque bouton en course.
+Leave the game?	Quitter le jeu ?
+Pick the letters. The last key of the grid makes it.	Choisissez les lettres. La dernière touche de la grille valide.
+Type the new name. Enter sets it, Esc leaves it.	Tapez le nouveau nom. Entrée valide, Échap annule.

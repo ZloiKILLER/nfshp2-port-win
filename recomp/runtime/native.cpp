@@ -5,6 +5,7 @@
 #include "hw.h"
 #include "pcconfig.h"
 #include "pcmenu.h"
+#include "memwatch.h"
 
 #include <atomic>
 #include <chrono>
@@ -13,6 +14,9 @@
 #include <cstdlib>
 #include <unordered_map>
 #include <cstring>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 
 extern FILE *g_hle_log;
 
@@ -230,8 +234,11 @@ static void set_draw_state(NativeDraw &d)
     if (g_texture == g_rvm_texture) d.rt = NATIVE_RT_MIRROR;
     else if (g_texture == g_prev_texture) d.rt = NATIVE_RT_PREVIOUS;
     else d.tex = native_texture(g_texture, g_frame_no);
+    if (d.tex) d.tex_mode = native_tex_mode(*d.tex), d.tex_upscaled = d.tex->upscaled, d.tex_min_linear = d.tex->min_linear;
 }
 static float g_clip[16];
+static bool g_clip_stale;                   // the target, the pack or the local-world changed since g_clip was made (update_clip)
+static void clip_now();
 static bool g_clip_new = true;
 static struct { u64 strips, bad, verts, tris, lists; } g_stat;
 
@@ -516,31 +523,112 @@ struct StripKeyHash {
 struct CachedStrip {
     u32 base, count, n;
 };
-static std::unordered_map<StripKey, CachedStrip, StripKeyHash> g_strip_cache;
+// The cache's table: open addressing in one block, a slot 32 bytes, so a strip seen before costs one miss of the CPU's cache where the
+// standard map cost two or three (a heavy frame asks for some 60 thousand strips). A slot is in use while its generation is the table's:
+// emptying the cache is one increment.
+struct StripSlot {
+    StripKey key;
+    CachedStrip strip;
+    u32 generation;
+};
+static std::vector<StripSlot> g_strip_slots;
+static u32 g_strip_generation = 1, g_strip_count;
 static std::unordered_map<StripKey, std::vector<NativeVertex>, StripKeyHash> g_strip_check;
 static u32 g_cache_top, g_cache_cap;
 static u64 g_cache_hits, g_cache_misses, g_cache_flushes, g_cache_check_bad;
 static const bool g_cache_off = getenv("HP2_NOVCACHE") != nullptr, g_cache_checking = getenv("HP2_VCACHECHECK") != nullptr;
 
+static StripSlot *strip_slot(const StripKey &key)
+{
+    if (g_strip_slots.empty()) g_strip_slots.resize(1u << 17);
+    const size_t mask = g_strip_slots.size() - 1;
+    for (size_t i = StripKeyHash()(key) >> 20 & mask;; i = (i + 1) & mask) {
+        StripSlot &s = g_strip_slots[i];
+        if (s.generation != g_strip_generation || s.key == key) return &s;
+    }
+}
+
+static const CachedStrip *strip_find(const StripKey &key)
+{
+    const StripSlot *s = strip_slot(key);
+    return s->generation == g_strip_generation ? &s->strip : nullptr;
+}
+
+static void strip_put(const StripKey &key, const CachedStrip &strip)
+{
+    if ((g_strip_count + 1) * 2 > g_strip_slots.size()) {       // half full: twice the room, the strips put again
+        std::vector<StripSlot> old(g_strip_slots.empty() ? (size_t)1 << 16 : g_strip_slots.size() * 2);
+        old.swap(g_strip_slots);
+        for (const StripSlot &o : old)
+            if (o.generation == g_strip_generation) *strip_slot(o.key) = o;
+    }
+    StripSlot *s = strip_slot(key);
+    if (s->generation != g_strip_generation) g_strip_count++;
+    *s = {key, strip, g_strip_generation};
+}
+
+// The key: two 64-bit hashes of the packet's bytes, each of every word. Each goes in four lanes, a lane a word of every four, so the
+// multiplications of a step do not wait for one another (a packet is a multiple of 16 bytes); the lanes meet at the end.
+static inline u64 strip_mix_a(u64 h, u64 w)
+{
+    h = (h ^ w) * 0x9E3779B97F4A7C15ull;
+    return h ^ h >> 29;
+}
+static inline u64 strip_mix_b(u64 h, u64 w)
+{
+    h = (h + w) * 0xBF58476D1CE4E5B9ull;
+    return h ^ h >> 31;
+}
 static StripKey strip_key(u32 data, u32 qwords)
 {
     const u8 *p = host(data);
     const size_t n = (size_t)qwords * 16;
-    u64 a = 0x9E3779B97F4A7C15ull ^ n, b = 0xC2B2AE3D27D4EB4Full + n;
-    for (size_t i = 0; i < n; i += 8) {
-        u64 w;
-        memcpy(&w, p + i, 8);
-        a = (a ^ w) * 0x9E3779B97F4A7C15ull;
-        a ^= a >> 29;
-        b = (b + w) * 0xBF58476D1CE4E5B9ull;
-        b ^= b >> 31;
+    u64 a[4] = {0x9E3779B97F4A7C15ull ^ n, 0xD6E8FEB86659FD93ull, 0xA0761D6478BD642Full, 0xE7037ED1A0B428DBull};
+    u64 b[4] = {0xC2B2AE3D27D4EB4Full + n, 0x8EBC6AF09C88C6E3ull, 0x589965CC75374CC3ull, 0x1D8E4E27C47D124Full};
+    size_t i = 0;
+    for (; i + 32 <= n; i += 32) {
+        u64 w[4];
+        memcpy(w, p + i, 32);
+        for (int k = 0; k < 4; k++) a[k] = strip_mix_a(a[k], w[k]), b[k] = strip_mix_b(b[k], w[k]);
     }
-    return {a, b};
+    if (i < n) {
+        u64 w[2];
+        memcpy(w, p + i, 16);
+        for (int k = 0; k < 2; k++) a[k] = strip_mix_a(a[k], w[k]), b[k] = strip_mix_b(b[k], w[k]);
+    }
+    u64 ha = a[0], hb = b[0];
+    for (int k = 1; k < 4; k++) ha = strip_mix_a(ha, a[k]), hb = strip_mix_b(hb, b[k]);
+    return {ha, hb};
+}
+
+// A strip by its address. The key above costs a read of the whole packet, every frame, and a heavy frame has 40 MB of packets; but nearly
+// all of them are the track's models, which nothing writes once they are loaded. So a packet whose key came out the same a few frames
+// running has its pages watched (memwatch.h), the key made once more under the watch, and from then on, while the pages' generations
+// stand, its place in the cache is taken from here by the address alone. One slot an address: a packet that shares its slot with
+// another seen as often just goes the long way. HP2_NOMEMWATCH: all of them do.
+struct alignas(64) StripSeen {              // one line of the CPU's cache
+    u32 data, qwords;
+    StripKey key;
+    CachedStrip strip;
+    u64 stamp;                              // memwatch_stamp when the key was made under the watch
+    u32 generation;                         // the cache's, when strip was its
+    u8 same;                                // frames running the packet gave this key
+    bool fast;
+};
+static std::vector<StripSeen> g_strip_seen;
+static u64 g_seen_hits;
+static inline StripSeen *strip_seen(u32 data)
+{
+    if (g_strip_seen.empty()) g_strip_seen.resize(1u << 18);
+    // by the address itself, 128 bytes a slot over the 32 MB: a model's strips lie one after another in memory, so their slots do in
+    // the table, and the CPU's own read-ahead sees the run. Two strips in one 128 bytes share a slot (the long way for one of them)
+    return &g_strip_seen[data >> 7 & ((1u << 18) - 1)];
 }
 
 static void cache_flush()
 {
-    g_strip_cache.clear();
+    g_strip_generation++;
+    g_strip_count = 0;
     g_strip_check.clear();
     g_cache_top = 0;
     g_cache_flushes++;
@@ -551,10 +639,16 @@ static void add_strip(u32 data, u32 qwords, u32 flags)
     const bool caching = g_cache_cap && !g_cache_off;
     StripKey key = {};
     const CachedStrip *hit = nullptr;
-    if (caching) {
+    StripSeen *seen = caching ? strip_seen(data) : nullptr;
+    const bool known = seen && seen->fast && seen->data == data && seen->qwords == qwords && seen->generation == g_strip_generation &&
+                       seen->stamp == memwatch_stamp(data, qwords * 16);
+    if (known) {
+        key = seen->key;
+        hit = &seen->strip;
+        g_seen_hits++;
+    } else if (caching) {
         key = strip_key(data, qwords);
-        auto found = g_strip_cache.find(key);
-        if (found != g_strip_cache.end()) hit = &found->second;
+        hit = strip_find(key);
     }
     NativeVertex tri[84];                   // 28 triangles at most
     u32 tri_n = 0, n = 0;
@@ -617,6 +711,7 @@ static void add_strip(u32 data, u32 qwords, u32 flags)
     if (g_clip_new || !prev || !prev->indexed || prev->flags != (u16)flags || prev->light != g_light || prev->target != (u8)g_draw_target) {
         g_strip_flags = flags;
         NativeDraw d;
+        clip_now();
         memcpy(d.clip, g_clip, sizeof d.clip);
         d.first = (u32)g_frame.indices.size();
         d.count = 0;
@@ -666,7 +761,7 @@ static void add_strip(u32 data, u32 qwords, u32 flags)
         else
             g_frame.fresh_runs.push_back({base, (u32)g_frame.fresh.size(), tri_n});
         g_frame.fresh.insert(g_frame.fresh.end(), tri, tri + tri_n);
-        g_strip_cache[key] = {base, tri_n, n};
+        strip_put(key, {base, tri_n, n});
         if (g_cache_checking) g_strip_check[key].assign(tri, tri + tri_n);
         g_cache_misses++;
     } else {
@@ -674,7 +769,28 @@ static void add_strip(u32 data, u32 qwords, u32 flags)
         base = g_frame.dyn_base + (u32)g_frame.vertices.size();
         g_frame.vertices.insert(g_frame.vertices.end(), tri, tri + tri_n);
     }
-    for (u32 i = 0; i < tri_n; i++) g_frame.indices.push_back(base + i);
+    // what the address is remembered by: the key that keeps coming out the same gets its pages watched
+    if (seen && !known && (hit || (caching && base < g_cache_cap))) {
+        const bool again = seen->data == data && seen->qwords == qwords && seen->key == key;
+        seen->same = again ? (u8)std::min<u32>(seen->same + 1, 255) : 0;
+        seen->data = data;
+        seen->qwords = qwords;
+        seen->key = key;
+        seen->strip = {base, tri_n, n};
+        seen->generation = g_strip_generation;
+        seen->fast = false;
+        if (seen->same >= 2 && memwatch_watch(data, qwords * 16)) {
+            const u64 stamp = memwatch_stamp(data, qwords * 16);
+            if (strip_key(data, qwords) == key) {
+                seen->stamp = stamp;
+                seen->fast = true;
+            }
+        }
+    }
+    {   // the strip's indices, one after another: room first (not cleared), then a loop the compiler can do several at a time
+        u32 *out = g_frame.indices.grow(tri_n);
+        for (u32 i = 0; i < tri_n; i++) out[i] = base + i;
+    }
     d.count += tri_n;
     g_stat.tris += tri_n / 3;
     g_stat.strips++;
@@ -686,6 +802,7 @@ enum { EDMA_STRIP = 0, EDMA_SETTARGET = 1, EDMA_LIGHTMATERIAL = 2, EDMA_LIGHTCON
        EDMA_SET_MATRIX_PACK = 9, EDMA_SET_LOCAL_WORLD = 12 };
 
 static u32 g_target, g_pack, g_local;
+static const bool g_native_stats = getenv("HP2_NATIVESTATS") != nullptr;
 static u32 g_nodes_seen[16], g_prims_seen[8];
 static struct { u64 strips, direct; u32 pack, target; } g_by_target[16];
 
@@ -725,7 +842,16 @@ void native_dump_next()
     fprintf(g_hle_log, "native: F11, dumping frame %u\n", g_frame_no + 2);
 }
 bool native_dumping_now() { return g_dump_at == g_frame_no; }
+static bool dumping_now();
+// asked for at every new draw: the answer is a frame's, made once for it
 static bool dumping()
+{
+    static u32 frame = ~0u;
+    static bool now;
+    if (frame != g_frame_no) frame = g_frame_no, now = dumping_now();
+    return now;
+}
+static bool dumping_now()
 {
     static const int at = getenv("HP2_NATIVEDUMP") ? atoi(getenv("HP2_NATIVEDUMP")) : -1;
     // HP2_NATIVEDUMPEVERY=<n>[,<from>]: every n-th frame from that one on
@@ -996,19 +1122,43 @@ static void add_direct(u32 data, u32 qwords)
     g_clip_new = true;
 }
 
+// The matrix a strip is drawn with, for the target, pack and local-world in force. Each of them comes as a node of its own and most
+// objects change the last only, but a list has runs of such nodes with no strip between them (an object culled after its matrix was set,
+// the other views), so the matrix is made when a strip is about to use it (clip_now), not at each node. g_clip_new is raised at the
+// node as before: it is what starts a new draw.
 static void update_clip()
 {
     if (!g_target || !g_pack || !g_local) return;
-    clip_matrix(g_clip, g_pack, g_local, LW(g_target + 0x1c) / 2, LW(g_target + 0x20) / 2, depth_scale(g_target));
+    g_clip_stale = true;
     g_clip_new = true;
+}
+
+static void clip_now()
+{
+    if (!g_clip_stale) return;
+    g_clip_stale = false;
+    clip_matrix(g_clip, g_pack, g_local, LW(g_target + 0x1c) / 2, LW(g_target + 0x20) / 2, depth_scale(g_target));
 }
 
 void native_read_list(u32 list)
 {
     g_stat.lists++;
+    // A strip is known by its address from a table of 16 MB (strip_seen), a line of the CPU's cache a strip, and a heavy frame asks for
+    // 65 thousand of them all over it: each was a wait for memory. So the line of the strip four nodes on is asked for now, and the
+    // wait is over by the strip's turn. (RenderStrips makes a node a strip.)
+    const bool by_address = g_cache_cap && !g_cache_off;
+    u32 ahead = LW(list);
+    const auto ask = [&] {
+        if (!ahead || !by_address) return;
+        const u32 t = LH(ahead + 4);
+        if (t == EDMA_STRIP || t == EDMA_POLY3D) __builtin_prefetch(strip_seen(LW(ahead + 12)));
+    };
+    ask();
+    for (int i = 0; i < 3 && ahead; i++) ahead = LW(ahead), ask();
     for (u32 node = LW(list); node; node = LW(node)) {
+        if (ahead) ahead = LW(ahead), ask();
         u32 type = LH(node + 4), data = LW(node + 12);
-        g_nodes_seen[type & 15]++;
+        if (g_native_stats) g_nodes_seen[type & 15]++;
         switch (type) {
         case EDMA_SETTARGET:
             g_target = data;
@@ -1046,13 +1196,13 @@ void native_read_list(u32 list)
             break;
         case EDMA_POLY3D:                   // the same packet as a strip's: ePoly::Render3D, eEndStrip
         case EDMA_STRIP:
-            if (g_target && LW(g_target) < 16) {
+            if (g_native_stats && g_target && LW(g_target) < 16) {      // HP2_NATIVESTATS's numbers
                 auto &t = g_by_target[LW(g_target)];
                 t.strips += LH(node + 8);
                 t.pack = g_pack;
                 t.target = g_target;
             }
-            if (dumping() && type == EDMA_POLY3D) {
+            if (type == EDMA_POLY3D && dumping()) {
                 float m[16], pq[24];
                 read_quads(g_local, m, 4);
                 read_quads(g_pack, pq, 6);
@@ -1068,8 +1218,20 @@ void native_read_list(u32 list)
             if (main_target() && g_pack && g_local) {
                 g_draw_target = LW(g_target);
                 u32 count = LH(node + 8);
-                for (u32 i = 0; i < count; i++)
+                // The packets are all over the game's memory, and a heavy frame reads some 40 MB of them: the next strip's first lines and
+                // the next node are asked for while this strip is worked on, so the memory's wait runs beside the work, not before it
+                if (const u32 next = LW(node))
+                    if (const u8 *p = host(next)) __builtin_prefetch(p);
+                for (u32 i = 0; i < count; i++) {
+                    if (i + 1 < count)
+                        if (const u8 *p = host(LW(node + 12 + (i + 1) * 8))) {
+                            __builtin_prefetch(p);
+                            __builtin_prefetch(p + 64);
+                            __builtin_prefetch(p + 128);
+                            __builtin_prefetch(p + 192);
+                        }
                     add_strip(LW(node + 12 + i * 8), LH(node + 10 + i * 8), LH(node + 6));
+                }
             }
             break;
         }
@@ -1122,6 +1284,65 @@ static void log_frame()
 
 static int g_lod_flip_now = -1;            // HP2_LODFLIP's: 0 Original, 1 Maximum, -1 the setting's
 
+// ---- the renderer's thread ----------------------------------------------------------------------------
+// The lists are read on the game's thread, as they are handed over (native_read_list): they point all over the game's live data. What
+// comes of them, the frame (NativeFrame: vertices, indices, draws, the textures decoded for it), is all the Vulkan side needs, and it
+// reads nothing of the game's. So the finished frame goes to a thread that records and submits it while the game's thread is already at
+// the next one. One frame in hand at most: the game's thread waits for the renderer's before it hands over another, and before it asks
+// for the last frame's depth (the sun's flare). HP2_RENDERSYNC=1: drawn on the game's thread, as it was.
+static NativeFrame g_out;                   // what the renderer's thread has: g_frame as it was at the hand-over
+static std::mutex g_render_mx;
+static std::condition_variable g_render_cv;
+static bool g_render_busy, g_render_started;
+static const bool g_render_sync = getenv("HP2_RENDERSYNC") != nullptr;
+static u32 g_seen_epoch;                    // g_native_epoch as this thread last took note of it
+void ee_float_mode_here();
+void pc_heap_report(u32 frame);
+
+static void render_thread()
+{
+    ee_float_mode_here();                   // the Vulkan side's own sums as they were on the game's thread: cut toward zero
+    for (;;) {
+        {
+            std::unique_lock<std::mutex> lock(g_render_mx);
+            g_render_cv.wait(lock, [] { return g_render_busy; });
+        }
+        native_vk_draw(g_out);
+        {
+            std::lock_guard<std::mutex> lock(g_render_mx);
+            g_render_busy = false;
+        }
+        g_render_cv.notify_all();
+    }
+}
+
+void native_render_wait()
+{
+    if (!g_render_started) return;
+    std::unique_lock<std::mutex> lock(g_render_mx);
+    g_render_cv.wait(lock, [] { return !g_render_busy; });
+}
+
+// the frame to the renderer; g_frame is then the one before it, to be emptied and filled again
+static void hand_over()
+{
+    if (g_render_sync) {
+        native_vk_draw(g_frame);
+        return;
+    }
+    native_render_wait();
+    std::swap(g_frame, g_out);
+    if (!g_render_started) {
+        g_render_started = true;
+        std::thread(render_thread).detach();
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_render_mx);
+        g_render_busy = true;
+    }
+    g_render_cv.notify_all();
+}
+
 void native_end_frame()
 {
     log_frame();
@@ -1132,20 +1353,22 @@ void native_end_frame()
     g_prev_texture = g_prev_target ? pc_call(0x105aa0, g_prev_target) : 0;
     u32 falloff = LW(0x32f6d0);             // pTextureInfoSpecularFalloff
     g_frame.road_specular = falloff ? native_texture(falloff, g_frame_no) : nullptr;
+    g_frame.road_mode = g_frame.road_specular ? native_tex_mode(*g_frame.road_specular) : 0;
     // eDisplayFrame's ESTAGE_FECARS: in the frontend (CurrentGameFlowState 3) the game downloads pTextureInfoCarSelectEnvMap to VRAM 10240 every
     // frame and the cars' environment pass reads it, not the sphere map a race left behind
     u32 car_env = LW(0x330544) == 3 ? LW(0x32f6d8) : 0;      // CurrentGameFlowState (gp-21420), pTextureInfoCarSelectEnvMap (gp-25112)
     g_frame.env_override = car_env ? native_texture(car_env, g_frame_no) : nullptr;
+    g_frame.env_mode = g_frame.env_override ? native_tex_mode(*g_frame.env_override) : 0;
     u32 env = pc_call(0x105848, 8);
     u32 env_info = env ? pc_call(0x105aa0, env) : 0;
     g_frame.env_linear = !env_info || LB(env_info + 0x6f) != 0;
-    g_frame.samples = host(0x2d7130);       // ReflectionSamples
+    memcpy(g_frame.samples, host(0x2d7130), sizeof g_frame.samples);            // ReflectionSamples
     // The rects StuffSun asked for this frame: gp-24684 is this frame's queue by now (ExecuteRenderStageQueue swapped them)
     g_frame.depth_rects.clear();
     u32 stage_head = LW(g_pc_ctx->r[28].w[0] - 24684) + 2128;
     for (u32 n = LW(stage_head); n != stage_head && g_frame.depth_rects.size() < 16; n = LW(n))
         g_frame.depth_rects.push_back({(int)LH(n + 20), (int)LH(n + 22), (int)LH(n + 24), (int)LH(n + 26)});
-    g_frame.back_samples = host(0x2d9158);  // BackReflectionSamples
+    memcpy(g_frame.back_samples, host(0x2d9158), sizeof g_frame.back_samples);  // BackReflectionSamples
     native_texture_take_time(g_frame.tex_ms, g_frame.tex_decoded);
     if (g_lod_flip_now >= 0 && pc_racing()) {
         static double verts[2], draws[2];
@@ -1162,10 +1385,21 @@ void native_end_frame()
     }
     resolve_wide_2d();
     window_cursor_frame();
-    native_vk_draw(g_frame);
+    native_texture_take_uploads(g_frame.uploads);
+    g_frame.number = g_frame_no;
+    g_frame.dumping = native_dumping_now();
+    g_frame.epoch = g_seen_epoch;
+    hand_over();
+    memwatch_frame();
+    pc_heap_report(g_frame_no);             // HP2_HEAPLOG
     g_aspect_now = pc_aspect();
     g_frame.list_ms = 0;
-    if (!g_frame.uploaded) cache_flush();
+    // the GPU's cache is not what this thread took it for (a frame did not reach it): this side of it emptied. The frames made
+    // meanwhile are not drawn (NativeFrame::epoch).
+    if (const u32 epoch = g_native_epoch.load(); epoch != g_seen_epoch) {
+        cache_flush();
+        g_seen_epoch = epoch;
+    }
     // the next frame's cache: emptied before it can fill up within a frame
     const u32 cap = native_vk_cache_vertices();
     const u32 margin = std::min<u32>(1536 * 1024, cap / 2);
@@ -1174,13 +1408,23 @@ void native_end_frame()
         g_cache_cap = cap;
     }
     g_frame.dyn_base = g_cache_cap;
-    g_frame.uploaded = false;
+    g_frame.uploads.clear();
     g_frame.indices.clear();
     g_frame.fresh.clear();
     g_frame.fresh_runs.clear();
     if (g_frame_no % 600 == 0 && getenv("HP2_NATIVELOG")) {
         fprintf(g_hle_log, "native: vertex cache %u of %u vertices used, %llu hits, %llu new, %llu emptyings%s\n", g_cache_top, g_cache_cap,
                 (unsigned long long)g_cache_hits, (unsigned long long)g_cache_misses, (unsigned long long)g_cache_flushes, g_cache_off ? " (off)" : "");
+        u64 faults;
+        u32 watched, busy;
+        memwatch_stats(&faults, &watched, &busy);
+        fprintf(g_hle_log, "native: strips by address: %llu of the hits; %u pages watched, %u left alone, %llu watches taken off by writes\n",
+                (unsigned long long)g_seen_hits, watched, busy, (unsigned long long)faults);
+        u64 tex_vouched, tex_summed, tex_bad;
+        native_texture_watch_stats(&tex_vouched, &tex_summed, &tex_bad);
+        fprintf(g_hle_log, "native: textures asked for: %llu known unchanged by their pages, %llu summed", (unsigned long long)tex_vouched, (unsigned long long)tex_summed);
+        if (getenv("HP2_TEXWATCHCHECK")) fprintf(g_hle_log, "; texwatchcheck: %llu not what their sum says", (unsigned long long)tex_bad);
+        fputc(10, g_hle_log);
         if (g_cache_checking) fprintf(g_hle_log, "native: vcachecheck: %llu hits not what they should be\n", (unsigned long long)g_cache_check_bad);
     }
     g_frame_no++;
@@ -1329,6 +1573,7 @@ void HOOK_FetchVRAM__FP12eRenderStage(Ctx &c, void (*orig)(Ctx &))
         NativeDepthRect r = {(int)LH(n + 20), (int)LH(n + 22), (int)LH(n + 24), (int)LH(n + 26)};
         static std::vector<uint32_t> words;
         words.resize((size_t)r.w * r.h);
+        native_render_wait();               // the last frame is the one handed over a moment ago: till it is with the GPU
         if (!words.empty() && native_vk_depth(r, words.data())) memcpy(host(LW(n + 8)), words.data(), words.size() * 4);
     }
 }
@@ -1450,10 +1695,299 @@ void HOOK_AddData__12eDmaDataListUsPvUsUs(Ctx &c, void (*orig)(Ctx &))
 }
 
 // Wider than the PS2's: the projection takes less of x for the same pixels, and the clip volume, which the game culls by, takes more.
+// ---- eModel::RenderStrips (0x10dd58) ---------------------------------------------------------------
+// The game's loop that hands a model's visible strips to the lists, a strip at a time: on a far view with every object at its most
+// detailed model that is 65 thousand strips a frame, and as generated code (registers in memory, a call for each list entry) it was the
+// heaviest function of the game's thread. Here it is as the port's own code, statement for statement what the game's does: the same
+// reads, the same writes in the same order, the game's own functions called for everything that is not the loop itself (the textures'
+// lists, the alpha keys and their depth, the blended copies). eDmaDataList's AddData, SetLocalWorldMatrix, SetLightContext and
+// SetLightMaterial (0x104a20, 0x104b88, 0x104c18, 0x104bd0) are done in place, with their counters and frame memory as theirs.
+// HP2_NORSNATIVE=1: the game's code. HP2_RSCHECK=<n>: every n-th call runs both on the same memory and compares all of it after
+// (run it with HP2_NOMEMWATCH=1: the check writes every page back).
+void F_0010c878(Ctx &c);                    // eModel::ApplyReplacementTextureTable
+void F_00105838(Ctx &c);                    // eGetCurrentRenderTarget
+void F_00107ca8(Ctx &c);                    // eGetCurrentView
+void F_00116a68(Ctx &c);                    // elGetDefaultLightMaterial
+void F_00104df0(Ctx &c);                    // eCreateActiveTexture(TextureInfo *)
+void F_00105158(Ctx &c);                    // eNewAlphaSortKey
+void F_0010cbf8(Ctx &c);                    // GetAABBZDepth(out, min, max, local world, view)
+void F_00250288(Ctx &c);                    // bMemCpy
+void F_0010d778(Ctx &c);                    // DoBlendingOnStrip(solid, strip, copy, matrix)
+
+static u64 g_rs_alpha, g_rs_blend, g_rs_made, g_rs_replaced, g_rs_no_key;    // HP2_RSCHECK: the rarer ways through, so far
+static inline void rs_arg(Ctx &c, int r, u32 v) { c.r[r].d[0] = (u64)(s64)(s32)v; }
+
+// eDmaDataList::AddData, with what HOOK_AddData counts
+static inline void rs_add_data(u32 gp, u32 list, u32 type, u32 data, u32 qwords, u32 parameter)
+{
+    if (type == EDMA_STRIP) g_added_strips++;
+    const u32 pos = LW(gp - 19388), end = LW(gp - 19384), next = pos + 16;
+    if (!((u64)(s64)(s32)next < (u64)(s64)(s32)end)) {       // FRAME_MALLOC's failure
+        const u32 failed = LW(gp - 19368);
+        SW(gp - 19372, 1);
+        SW(gp - 19368, failed + 16);
+        return;
+    }
+    SW(gp - 19388, next);
+    const u32 tail = LW(list + 4);
+    SH(pos + 4, (u16)type);
+    SW(tail, pos);
+    SH(pos + 6, (u16)parameter);
+    SH(pos + 8, 1);
+    SH(pos + 10, (u16)qwords);
+    SW(pos + 12, data);
+    SW(list + 4, pos);
+    SW(pos, 0);
+}
+
+// SetLocalWorldMatrix, SetLightContext, SetLightMaterial: the list's field at `field`, the call counted at `stat` and the hit at +4
+static inline void rs_set(u32 gp, u32 list, u32 field, u32 stat, u32 value, u32 type, u32 qwords, u32 parameter)
+{
+    const u32 calls = LW(stat), was = LW(list + field);
+    SW(stat, calls + 1);
+    if (was == value) {
+        SW(stat + 4, LW(stat + 4) + 1);
+        return;
+    }
+    SW(list + field, value);
+    rs_add_data(gp, list, type, value, qwords, parameter);
+}
+
+static void render_strips_native(Ctx &c)
+{
+    const u32 self = c.r[4].w[0], local_world = c.r[5].w[0], light_context = c.r[6].w[0], flags = c.r[7].w[0], blend = c.r[8].w[0];
+    const u32 gp = c.r[28].w[0], sp = c.r[29].w[0] - 256;
+    const u64 ra = c.r[31].d[0];
+    const u32 solid = LW(self + 12);
+    if (!solid) {
+        c.r[2].d[0] = 0;
+        return;
+    }
+    rs_arg(c, 29, sp);
+    u32 mask = 0;
+    if (!LW(gp - 25040) || (flags & 1)) mask = 256;
+    if (flags & 2) mask |= 128;
+    if (!light_context) mask |= 448;
+    if (LW(self + 16)) {
+        g_rs_replaced++;
+        rs_arg(c, 4, self);
+        c.r[31].d[0] = 0x10de00;
+        F_0010c878(c);
+    }
+    c.r[31].d[0] = 0x10de08;
+    F_00105838(c);
+    const u32 target = c.r[2].w[0], target_id = LW(target);
+    const u32 opaque_off = (flags & 16) ? 1 : LW(target + 84);      // with it, a strip of an alpha texture is left out
+    const u32 alpha_only = (flags & 8) ? 1 : 0;                     // with it, a strip of any other
+    c.r[31].d[0] = 0x10de48;
+    F_00107ca8(c);
+    const u32 view_matrix = LW(c.r[2].w[0] + 68);
+    c.r[31].d[0] = 0x10de54;
+    F_00116a68(c);
+    const u32 default_material = c.r[2].w[0];
+    const u32 textures = LW(solid + 184);
+    u32 run = 0x2d0c80, strip = LW(run), count = 0, last_active = 0;
+    const u32 alpha_list = 0x2c94a8 + target_id * 12, list_off = (target_id << 5) + 16;
+    while (strip) {
+        const u32 info = LW(textures + ((u32)(s32)(s8)LB(strip) << 3) + 4);
+        const u32 data = LW(strip + 8);
+        const u32 strip_flags = LH(strip + 14), qwords = LH(strip + 12);
+        const u32 left = (u32)LH(run + 6) - 1;
+        const bool alpha = (s8)LB(info + 77) != 0;
+        const u32 tex_bit = (s8)LB(info + 116) ? 4 : 0;
+        const u32 pass = LH(run + 4);
+        SH(run + 6, (u16)left);
+        u32 next;
+        if (left & 0xffff) {
+            next = strip + 64;
+        } else {
+            run += 8;
+            next = LW(run);
+        }
+        bool draw = !(strip_flags & 1024);
+        if (opaque_off && alpha) draw = false;
+        if (alpha_only && !alpha) draw = false;
+        if (draw) {
+            u32 active = LW(info + 152);
+            if (!active) {
+                g_rs_made++;
+                rs_arg(c, 4, info);
+                c.r[31].d[0] = 0x10df6c;
+                F_00104df0(c);
+                active = c.r[2].w[0];
+            }
+            u32 list = active + list_off;
+            if (alpha) {
+                c.r[31].d[0] = 0x10df84;
+                F_00105158(c);
+                const u32 key = c.r[2].w[0];
+                if (key) {
+                    g_rs_alpha++;
+                    rs_arg(c, 4, sp);
+                    rs_arg(c, 5, strip + 16);
+                    rs_arg(c, 6, strip + 32);
+                    rs_arg(c, 7, local_world);
+                    rs_arg(c, 8, view_matrix);
+                    c.r[31].d[0] = 0x10dfa4;
+                    F_0010cbf8(c);
+                    const u32 tail = LW(alpha_list + 4), keys = LW(alpha_list + 8), depth = LW(sp);
+                    SW(tail, key);
+                    SW(key + 12, depth);
+                    SW(alpha_list + 8, keys + 1);
+                    list = LW(key + 4);
+                    SW(key + 8, active);
+                    SW(key, 0);
+                    SW(alpha_list + 4, key);
+                } else {
+                    g_rs_no_key++;
+                    list = 0;
+                }
+            }
+            if (list) {
+                if (active != last_active || alpha) {
+                    rs_set(gp, list, 16, 0x2c85f0, local_world, EDMA_SET_LOCAL_WORLD, 4, 840);
+                    if (light_context) rs_set(gp, list, 12, 0x2c85e0, light_context, EDMA_LIGHTCONTEXT, 18, 860);
+                    last_active = active;
+                }
+                u32 material = default_material;
+                if (const u32 materials = LW(solid + 188)) {
+                    const s32 index = (s8)LB(strip + 31);
+                    if (index >= 0 && index < (s32)(s16)LH(solid + 174)) material = LW(materials + ((u32)index << 3) + 4);
+                }
+                rs_set(gp, list, 8, 0x2c85d0, material, EDMA_LIGHTMATERIAL, 4, 852);
+                const u32 parameter = (strip_flags | tex_bit | (pass == 1 ? 512 : 0)) & ~mask;
+                if (blend) {
+                    // a copy of the strip in the frame's memory, blended there
+                    const u32 bytes = qwords << 4, pos = LW(gp - 19388), end = LW(gp - 19384), top = pos + bytes;
+                    if ((u64)(s64)(s32)top < (u64)(s64)(s32)end) {
+                        g_rs_blend++;
+                        SW(gp - 19388, top);
+                        rs_arg(c, 4, pos);
+                        rs_arg(c, 5, data);
+                        rs_arg(c, 6, bytes);
+                        c.r[31].d[0] = 0x10e0cc;
+                        F_00250288(c);
+                        rs_arg(c, 4, solid);
+                        rs_arg(c, 5, strip);
+                        rs_arg(c, 6, pos);
+                        rs_arg(c, 7, blend);
+                        c.r[31].d[0] = 0x10e0e0;
+                        F_0010d778(c);
+                        rs_add_data(gp, list, EDMA_STRIP, pos, qwords, parameter);
+                    } else {
+                        const u32 failed = LW(gp - 19368);
+                        SW(gp - 19372, 1);
+                        SW(gp - 19368, failed + bytes);
+                    }
+                } else {
+                    rs_add_data(gp, list, EDMA_STRIP, data, qwords, parameter);
+                }
+            }
+        }
+        strip = next;
+        count++;
+        if ((s32)count > 999998) break;
+    }
+    rs_arg(c, 29, sp + 256);
+    c.r[31].d[0] = ra;
+    rs_arg(c, 2, count);
+}
+
+// Both on the same memory: the game's first, then everything put back and the port's, and the two outcomes compared, the game's 32 MB
+// and the PC's memory past them whole. The dead stack below the frame is the one thing that may differ (the callees save other
+// registers there). The game goes on with its own outcome.
+extern bool g_eie;
+static void render_strips_check(Ctx &c, void (*orig)(Ctx &))
+{
+    static std::vector<u8> before, after;
+    static u8 spr_before[0x4000], spr_after[0x4000];
+    static u64 checks, bad;
+    const size_t total = 0x02000000 + (size_t)g_ext_size;
+    before.resize(total);
+    after.resize(total);
+    const Ctx c0 = c;
+    const u32 strips0 = g_added_strips, sp = c.r[29].w[0];
+    const bool eie = g_eie;
+    g_eie = false;                          // no interrupt's handler in between: it would be in one outcome and not the other
+    memcpy(before.data(), g_ram, total);
+    memcpy(spr_before, g_spr, sizeof spr_before);
+    orig(c);
+    const Ctx c1 = c;
+    memcpy(after.data(), g_ram, total);
+    memcpy(spr_after, g_spr, sizeof spr_after);
+    memcpy(g_ram, before.data(), total);
+    memcpy(g_spr, spr_before, sizeof spr_before);
+    c = c0;
+    g_added_strips = strips0;
+    render_strips_native(c);
+    checks++;
+    // the stack's dead part: below the caller's sp, wherever the stack is
+    const u8 *stack = host(sp);
+    auto dead = [&](const u8 *p) { return stack && p < stack && p >= stack - 0x1800; };
+    u32 differ = 0;
+    auto compare = [&](const u8 *mine, const u8 *game, size_t n, u32 guest, const char *name) {
+        if (!memcmp(mine, game, n)) return;
+        for (size_t i = 0; i < n; i += 4) {
+            if (!memcmp(mine + i, game + i, 4) || dead(mine + i)) continue;
+            if (differ++ < 8) {
+                u32 a, b;
+                memcpy(&a, mine + i, 4), memcpy(&b, game + i, 4);
+                fprintf(g_hle_log, "rscheck: %s %08x: the port's %08x, the game's %08x\n", name, guest + (u32)i, a, b);
+            }
+        }
+    };
+    compare(g_ram, after.data(), total, 0, "memory");
+    compare(g_spr, spr_after, sizeof spr_after, 0x70000000, "scratchpad");
+    bool regs = c.r[2].d[0] == c1.r[2].d[0];
+    for (int r : {16, 17, 18, 19, 20, 21, 22, 23, 28, 29, 30, 31}) regs = regs && c.r[r].d[0] == c1.r[r].d[0];
+    if (!regs) {
+        differ++;
+        fprintf(g_hle_log, "rscheck: registers: the port's count %08x sp %08x, the game's %08x %08x\n", c.r[2].w[0], c.r[29].w[0], c1.r[2].w[0], c1.r[29].w[0]);
+    }
+    if (differ) bad++;
+    if (differ || checks % 50 == 0)
+        fprintf(g_hle_log, "rscheck: %llu calls compared, %llu not the same (this one: %u words, %u strips); so far %llu alpha strips, %llu blended, "
+                           "%llu textures' lists made, %llu calls with replaced textures, %llu without a key\n",
+                (unsigned long long)checks, (unsigned long long)bad, differ, c1.r[2].w[0], (unsigned long long)g_rs_alpha, (unsigned long long)g_rs_blend,
+                (unsigned long long)g_rs_made, (unsigned long long)g_rs_replaced, (unsigned long long)g_rs_no_key),
+            fflush(g_hle_log);
+    memcpy(g_ram, after.data(), total);
+    memcpy(g_spr, spr_after, sizeof spr_after);
+    c = c1;
+    g_eie = eie;
+}
+
+void HOOK_RenderStrips__6eModelP8bMatrix4P13eLightContextUiT1(Ctx &c, void (*orig)(Ctx &))
+{
+    static const bool off = getenv("HP2_NORSNATIVE") != nullptr;
+    static const int check = getenv("HP2_RSCHECK") ? atoi(getenv("HP2_RSCHECK")) : 0;
+    if (off) {
+        orig(c);
+        return;
+    }
+    if (check > 0) {
+        static u64 calls;
+        if (++calls % (u64)check == 0) {
+            render_strips_check(c, orig);
+            return;
+        }
+    }
+    render_strips_native(c);
+}
+
 void HOOK_CreateViewMatricies__FP5eViewP8bMatrix4T1T1T1T1T1fff(Ctx &c, void (*orig)(Ctx &))
 {
     g_pc_ctx = &c;
     u32 view = c.r[4].w[0], target = view ? LW(view + 48) : 0, id = target ? LW(target) : 99;
+    // The mirror's far plane. Its camera has 192 m (RearViewMirrorCameraMover::Update, 0x1590e4: near 0.75, far 192), the players' have
+    // 10000, so the mirror lost everything past 192 m to the frustum whatever its size, and the draw distance changed nothing in it. The
+    // far plane goes with the setting: the function's own farz (f13), which overrides the camera's when it is not 0. Camera: FarZ +128.
+    if (g_cfg.draw_distance != 100 && view && LW(view) == 3 && c.f[13].u << 1 == 0 && LW(view + 56)) {
+        float far_z;
+        memcpy(&far_z, host(LW(view + 56) + 128), 4);
+        far_z = far_z * (float)g_cfg.draw_distance / 100.0f;
+        if (far_z > 0 && far_z < 10000.0f) memcpy(&c.f[13].u, &far_z, 4);
+    }
     float f = native_narrow();
     if (f >= 1 || id > 2 || !pc_racing()) {
         orig(c);
@@ -1611,6 +2145,47 @@ static void speed_log(Ctx &c)
 // So a racer thinks every 8 frames, every 0.27 s at the 30 frames the game was made for. A racer far from the players rides a BeltMover, which each think
 // starts again from the car's speed and gains speed by it. At 60 frames there are twice the thinks. Keep the 30 turns a second, by the world's clock,
 // whatever the frame rate. Think alone sees the counter so made; the collisions and the replay use the real one.
+static s32 g_think_seen = -1;               // the world's loop the count below was last made in
+static s64 g_think_tick, g_think_prev;      // the clock in thirtieths of a second at that loop, and at the one before
+long long native_think_state() { return g_think_tick; }
+void native_think_restore(long long tick)
+{
+    g_think_tick = tick;
+    g_think_seen = -1;                      // the next think makes the count anew from it, as the one after the snapshot did
+}
+
+// The player's steering at 60 frames. RealDriver::DoSteering moves the steering toward the stick by 9 a second times a factor that
+// falls with the car's speed (1 down to 0.34), times the step, but never by less than 0.173 a step (the float at gp-31548, which
+// nothing else reads). At the PS2's 30 steps a second that least step matters only above some 300 km/h; at 60 the steps are half as
+// long and it is always the larger, so the steering turned in faster than made, by 15 % at low speed and 80 % at 250 km/h, the same
+// at every speed. Here the least step is as long as the step is against a thirtieth of a second, which gives the same turn a second
+// as at 30. Only at 60 frames and never for the attract demo (a PS2 recording); at 30 the function runs untouched.
+void HOOK_DoSteering__10RealDriverf12JoystickPort(Ctx &c, void (*orig)(Ctx &))
+{
+    const u32 gp = c.r[28].w[0], rc = LW(gp - 22216);
+    static const bool off = getenv("HP2_NOSTEERFIX") != nullptr;
+    if (off || g_cfg.frame_rate != 60 || (rc && LW(rc) == 9)) {
+        orig(c);
+        return;
+    }
+    const u32 at = gp - 31548, was = LW(at);
+    float least;
+    memcpy(&least, &was, 4);
+    const float scaled = least * (c.f[12].f * 30.0f);
+    if (scaled < least) {
+        u32 w;
+        memcpy(&w, &scaled, 4);
+        SW(at, w);
+    }
+    static bool told;
+    if (!told && scaled < least) {
+        told = true;
+        fprintf(stderr, "steering: 60 frames, the least step %.4f for a step of %.5f s (%.4f at 30 frames)\n", scaled, c.f[12].f, least);
+    }
+    orig(c);
+    SW(at, was);
+}
+
 void HOOK_Think__15AICarControllerf(Ctx &c, void (*orig)(Ctx &))
 {
     const u32 gp = c.r[28].w[0], rc = LW(gp - 22216);
@@ -1633,15 +2208,20 @@ void HOOK_Think__15AICarControllerf(Ctx &c, void (*orig)(Ctx &))
     u32 uw = LW(gp - 19572);
     float wt;
     memcpy(&wt, &uw, 4);
-    static s32 seen = -1;
-    static s64 tick, prev;
-    if (real != seen) {
-        seen = real;
-        prev = tick;
-        tick = (s64)(wt * 30.0f);
+    // Whose turn: the thirtieths of a second the world's clock has passed since the frame before. That frame's count is kept
+    // (g_think_tick), and a replay must go on from the count the race had there: a replay starts from a snapshot, and with the count
+    // left from wherever the race had got to, its first step gave a racer a turn the recording had not given, or took one away. A
+    // racer that thinks at another step drives a little differently, the world leaves the recording, and the game closes the replay.
+    // So the count is kept with each snapshot of the race and put back when a replay starts from it (native_think_state,
+    // native_think_restore; the snapshot hooks of pcplatform.cpp).
+    if (real != g_think_seen) {
+        g_think_seen = real;
+        g_think_prev = g_think_tick;
+        g_think_tick = (s64)(wt * 30.0f);
     }
+    const s64 tick = g_think_tick, prev = g_think_prev;
     bool turn = false;
-    if (tick < prev) turn = tick % 8 == me;             // a replay went back
+    if (tick < prev) turn = tick % 8 == me;             // the clock went back: another race
     else if (tick - prev >= 8) turn = true;
     else
         for (s64 t = prev + 1; t <= tick; t++)
@@ -1766,10 +2346,297 @@ void HOOK_Render__13CarRenderInfoP5eViewPC8bVector3PC8bMatrix4P8bMatrix4T4Uii(Ct
     }
 }
 
+// ---- ScenerySectionHeader::DrawAScenery (0x14fe18) ---------------------------------------------------
+// Called for every object of the scenery in sight: is it large enough on the screen, which of its models, and its matrix into the
+// frame's memory. As generated code it was a few per cent of the game's thread, and twice that again in the EE's exact square root and
+// division it makes for the size in pixels, both of the slow kind (a table of 2 MB, the divider's 25 steps).
+// Here: the same statements for the vectors (the same VU0 and FPU helpers), the port's own code for the rest, and the size in pixels
+// by das_pixels below. HP2_NODASNATIVE=1: the game's code. HP2_DASCHECK=<n>: every n-th call runs both on the same memory and
+// compares it all (with HP2_NOMEMWATCH=1), and every size in pixels is made both ways and compared.
+void F_0010ccb0(Ctx &c);                    // ClassifyAABB(min, max, matrix)
+void F_0014fda8(Ctx &c);                    // CreateFacadeMatrix(out, position, camera)
+
+static inline s32 das_cvt(float v) { return (s32)(v >= 2147483647.0f ? 0x7FFFFFFFu : v <= -2147483648.0f ? 0x80000000u : (u32)(s32)v); }
+static inline bool das_normal(float f) { return (ee_bits(f) >> 23 & 255) - 1 < 254; }
+static u64 g_das_quick, g_das_exact, g_das_wrong;
+
+// The size as the game has it: (int)(h * reach / (sqrt(len2) - reach)), or (int)h when the object is nearer than twice its reach, with
+// the EE's root, subtraction, multiplication and division.
+static s32 das_pixels_exact(float len2, float reach, float h)
+{
+    const float away = ee_sub(ee_sqrt(len2), reach);
+    return das_cvt(EE_LT(reach, away) ? ee_div(ee_mul(reach, h), away) : h);
+}
+
+// The same number without the EE's root and divider. Each of the two gives the host's result cut toward zero or one unit in the last
+// place more (eefloat.h), so there are at most four values the EE's size can be, all cheap; the size is a whole number, and unless one
+// of them falls on the other side of a whole number (once in tens of thousands) they all say the same. Then that is the answer, and
+// else the exact way is taken.
+static s32 das_pixels(float len2, float reach, float h)
+{
+    static const bool verify = getenv("HP2_DASCHECK") != nullptr;
+    s32 quick = 0;
+    bool sure = das_normal(len2) && das_normal(reach) && das_normal(h);
+    if (sure) {
+        const float root = std::sqrt(std::fabs(len2));     // this thread rounds toward zero
+        bool first = true;
+        auto take = [&](s32 v) {
+            if (first) quick = v, first = false;
+            else if (v != quick) sure = false;
+        };
+        for (u32 up = 0; up < 2 && sure; up++) {
+            const float away = ee_sub(ee_float(ee_bits(root) + up), reach);
+            if (!EE_LT(reach, away)) {
+                take(das_cvt(h));
+                continue;
+            }
+            const float top = ee_mul(reach, h);
+            if (!das_normal(away) || !das_normal(top)) {
+                sure = false;
+                break;
+            }
+            const float q = top / away;
+            if (!das_normal(q) || !das_normal(ee_float(ee_bits(q) + 1))) {
+                sure = false;
+                break;
+            }
+            take(das_cvt(q));
+            take(das_cvt(ee_float(ee_bits(q) + 1)));
+        }
+    }
+    if (sure && !verify) {
+        g_das_quick++;
+        return quick;
+    }
+    const s32 exact = das_pixels_exact(len2, reach, h);
+    if (sure) {
+        g_das_quick++;
+        if (exact != quick && g_das_wrong++ < 20)
+            fprintf(g_hle_log, "dascheck: size %d, the exact way %d (len2 %08x reach %08x h %08x)\n", quick, exact, ee_bits(len2), ee_bits(reach), ee_bits(h));
+    } else {
+        g_das_exact++;
+    }
+    return exact;
+}
+
+static void draw_a_scenery_native(Ctx &c)
+{
+    const u32 header = c.r[4].w[0], index = c.r[5].w[0], cull = c.r[6].w[0];
+    const u32 gp = c.r[28].w[0], sp = c.r[29].w[0] - 128;
+    const u64 ra = c.r[31].d[0];
+    u32 state = c.r[7].w[0];
+    const bool classify = c.r[7].d[0] == 1;
+    const u32 inst = LW(header + 28) + index * 48;
+    rs_arg(c, 29, sp);
+    auto leave = [&] {
+        rs_arg(c, 29, sp + 128);
+        c.r[31].d[0] = ra;
+    };
+    if (classify) {
+        // the object's box against the view: 1 partly in sight, 2 wholly, 0 not
+        for (u32 i = 0; i < 3; i++) {
+            const float lo = (float)(s32)(s16)LH(inst + i * 2), hi = (float)(s32)(s16)LH(inst + 6 + i * 2);
+            SW(sp + i * 4, ee_bits(lo));
+            SW(sp + 16 + i * 4, ee_bits(hi));
+        }
+        rs_arg(c, 4, sp);
+        rs_arg(c, 5, sp + 16);
+        rs_arg(c, 6, cull + 64);
+        c.r[31].d[0] = 0x14fee0;
+        F_0010ccb0(c);
+        state = c.r[2].w[0];
+        if (!c.r[2].d[0]) return leave();
+    }
+    const u32 kind = LW(header + 20) + (u32)((s32)(s16)LH(inst + 12) * 40);
+    const u32 flags = (u32)(s32)(s16)LH(inst + 14);
+    if (flags & LW(cull + 132) & 255) return leave();
+    // the way from the camera to the object, along the view and in length: the game's statements
+    op_lqc2(c, 1, cull + 160);
+    op_lqc2(c, 3, inst + 16);
+    c.f[1].u = LW(kind + 36);
+    VU_vsub(c, 0x4be118ecu);
+    c.f[0].u = 0x40800000u;
+    op_lqc2(c, 2, cull + 176);
+    SQ(sp, c.vf[3].q);
+    FPU_add_s(c, 2, 1, 0);
+    op_lqc2(c, 3, sp);
+    VU_vmul(c, 0x4bc218aau);
+    VU_vaddy(c, 0x4b021041u);
+    VU_vaddz(c, 0x4b020842u);
+    FPU_neg_s(c, 1, 2, 0);
+    c.f[0].u = ee_bits(c.vf[1].f[0]);
+    FPU_c_lt_s(c, 0, 0, 1);
+    s32 pixels = 0;
+    if (!(c.fcr31 & FCR31_C)) {
+        VU_vmul(c, 0x4bc3186au);
+        VU_vaddy(c, 0x4b010881u);
+        VU_vaddz(c, 0x4b011082u);
+        pixels = das_pixels(c.vf[2].f[0], ee_float(c.f[2].u), ee_float(LW(cull + 192)));
+    }
+    if (pixels < 2) return leave();
+    // the first of the three models the object is large enough for, and has
+    u32 model = 0;
+    s32 lod = -1;
+    if (!(pixels < (s32)(s16)LH(kind + 12)) && LW(kind + 20)) {
+        model = LW(kind + 20);
+        lod = 0;
+    } else {
+        for (s32 i = 1; i < 3; i++) {
+            if (pixels < (s32)(s16)LH(kind + 12 + (u32)i * 2)) continue;
+            const u32 m = LW(kind + 20 + (u32)i * 4);
+            if (!m) continue;
+            model = m;
+            lod = i;
+            break;
+        }
+    }
+    if (!model) return leave();
+    auto less = [](u32 a, u32 b) { return (u64)(s64)(s32)a < (u64)(s64)(s32)b; };
+    if (LH(inst + 14) & 512) {              // drawn where it stands, without a matrix of its own
+        const u32 slot = LW(cull + 140);
+        if (less(slot, LW(cull + 144))) {
+            SW(cull + 140, slot + 8);
+            SW(slot, model + state);
+            SW(slot + 4, 0);
+        }
+        return leave();
+    }
+    const u32 pos = LW(gp - 19388), top = pos + 64;
+    if (!less(top, LW(gp - 19384))) {       // FRAME_MALLOC's failure
+        const u32 failed = LW(gp - 19368);
+        SW(gp - 19372, 1);
+        SW(gp - 19368, failed + 64);
+        return leave();
+    }
+    SW(gp - 19388, top);
+    const u32 matrix = pos;
+    if ((s8)LB(kind + (u32)lod + 32)) {
+        op_lqc2(c, 1, inst + 16);
+        SQ(sp, c.vf[1].q);
+        rs_arg(c, 4, matrix);
+        rs_arg(c, 5, sp);
+        rs_arg(c, 6, cull + 160);
+        c.r[31].d[0] = 0x1500d0;
+        F_0014fda8(c);
+    } else {
+        const float unit = ee_float(0x38800000u);       // 2^-14
+        for (u32 row = 0; row < 3; row++) {
+            SW(matrix + row * 16 + 12, 0);
+            for (u32 col = 0; col < 3; col++)
+                SW(matrix + row * 16 + col * 4, ee_bits(ee_mul((float)(s32)(s16)LH(inst + 28 + row * 6 + col * 2), unit)));
+        }
+    }
+    op_lqc2(c, 1, inst + 16);
+    SQ(matrix + 48, c.vf[1].q);
+    SW(matrix + 60, 0x3f800000u);
+    if ((u32)(s32)(s16)LH(inst + 14) & LW(cull + 132) & 256) SW(matrix + 56, ee_bits(ee_add(ee_float(LW(matrix + 56)), 2.0f)));
+    const u32 slot = LW(cull + 140);
+    if (less(slot, LW(cull + 144))) {
+        SW(cull + 140, slot + 8);
+        SW(slot + 4, matrix);
+        SW(slot, model + state);
+    }
+    leave();
+}
+
+// Both ways on the same memory, as render_strips_check: the game's code first, everything put back, the port's, and the game's 32 MB,
+// the PC's memory past them and the scratchpad compared whole but for the dead stack under the frame.
+static void native_ab_check(Ctx &c, void (*orig)(Ctx &), void (*mine)(Ctx &), const char *name)
+{
+    static std::vector<u8> before, after;
+    static u8 spr_before[0x4000], spr_after[0x4000];
+    static u64 checks, bad;
+    const size_t total = 0x02000000 + (size_t)g_ext_size;
+    before.resize(total);
+    after.resize(total);
+    const Ctx c0 = c;
+    const u32 sp = c.r[29].w[0];
+    const bool eie = g_eie;
+    g_eie = false;
+    memcpy(before.data(), g_ram, total);
+    memcpy(spr_before, g_spr, sizeof spr_before);
+    orig(c);
+    const Ctx c1 = c;
+    memcpy(after.data(), g_ram, total);
+    memcpy(spr_after, g_spr, sizeof spr_after);
+    memcpy(g_ram, before.data(), total);
+    memcpy(g_spr, spr_before, sizeof spr_before);
+    c = c0;
+    mine(c);
+    checks++;
+    const u8 *stack = host(sp);
+    auto dead = [&](const u8 *p) { return stack && p < stack && p >= stack - 0x1800; };
+    u32 differ = 0;
+    auto compare = [&](const u8 *got, const u8 *game, size_t n, u32 guest, const char *what) {
+        if (!memcmp(got, game, n)) return;
+        for (size_t i = 0; i < n; i += 4) {
+            if (!memcmp(got + i, game + i, 4) || dead(got + i)) continue;
+            if (differ++ < 8) {
+                u32 a, b;
+                memcpy(&a, got + i, 4), memcpy(&b, game + i, 4);
+                fprintf(g_hle_log, "abcheck: %s: %s %08x: the port's %08x, the game's %08x\n", name, what, guest + (u32)i, a, b);
+            }
+        }
+    };
+    compare(g_ram, after.data(), total, 0, "memory");
+    compare(g_spr, spr_after, sizeof spr_after, 0x70000000, "scratchpad");
+    for (int r : {16, 17, 18, 19, 20, 21, 22, 23, 28, 29, 30, 31})
+        if (c.r[r].d[0] != c1.r[r].d[0]) {
+            differ++;
+            fprintf(g_hle_log, "abcheck: %s: register %d: the port's %08x, the game's %08x\n", name, r, c.r[r].w[0], c1.r[r].w[0]);
+        }
+    if (differ) bad++;
+    if (differ || checks % 200 == 0)
+        fprintf(g_hle_log, "abcheck: %s: %llu calls compared, %llu not the same; sizes in pixels: %llu the quick way, %llu the exact, %llu wrong\n", name,
+                (unsigned long long)checks, (unsigned long long)bad, (unsigned long long)g_das_quick, (unsigned long long)g_das_exact,
+                (unsigned long long)g_das_wrong),
+            fflush(g_hle_log);
+    memcpy(g_ram, after.data(), total);
+    memcpy(g_spr, spr_after, sizeof spr_after);
+    c = c1;
+    g_eie = eie;
+}
+
+static void draw_a_scenery(Ctx &c, void (*orig)(Ctx &))
+{
+    static const bool off = getenv("HP2_NODASNATIVE") != nullptr;
+    static const int check = getenv("HP2_DASCHECK") ? atoi(getenv("HP2_DASCHECK")) : 0;
+    if (off) {
+        orig(c);
+        return;
+    }
+    if (check > 0) {
+        static u64 calls;
+        if (!calls) {
+            // the quick size against the exact one on numbers of every kind, the near ones (the object almost at its reach) most of all:
+            // das_pixels compares the two itself and counts
+            u32 seed = 12345;
+            auto rnd = [&] { return seed = seed * 1664525u + 1013904223u; };
+            auto in = [&](float lo, float hi) { return lo + (hi - lo) * (float)(rnd() >> 8) * (1.0f / 16777216.0f); };
+            const u64 quick0 = g_das_quick, exact0 = g_das_exact, wrong0 = g_das_wrong;
+            for (int i = 0; i < 6000000; i++) {
+                const float reach = in(0.3f, 400.0f), h = in(50.0f, 6000.0f);
+                const int kind = i % 4;
+                const float away = kind == 0 ? in(0.0f, 4000.0f) : kind == 1 ? reach * in(0.99f, 1.01f) : kind == 2 ? reach * in(1.0f, 3.0f) : in(0.0f, 30.0f);
+                const float dist = reach + away;
+                das_pixels(dist * dist, reach, h);
+            }
+            fprintf(g_hle_log, "dascheck: 6000000 made-up sizes: %llu the quick way, %llu the exact, %llu wrong\n", (unsigned long long)(g_das_quick - quick0),
+                    (unsigned long long)(g_das_exact - exact0), (unsigned long long)(g_das_wrong - wrong0));
+            fflush(g_hle_log);
+        }
+        if (++calls % (u64)check == 0) {
+            native_ab_check(c, orig, draw_a_scenery_native, "DrawAScenery");
+            return;
+        }
+    }
+    draw_a_scenery_native(c);
+}
+
 void HOOK_DrawAScenery__20ScenerySectionHeaderiP15SceneryCullInfoi(Ctx &c, void (*orig)(Ctx &))
 {
     if (!max_detail_now()) {
-        orig(c);
+        draw_a_scenery(c, orig);
         return;
     }
     const u32 header = c.r[4].w[0], index = c.r[5].w[0];
@@ -1792,13 +2659,32 @@ void HOOK_DrawAScenery__20ScenerySectionHeaderiP15SceneryCullInfoi(Ctx &c, void 
                     (unsigned long long)g_lod_scenery, (unsigned long long)g_lod_scenery_bare);
     }
     if (!info || !LW(info + 20)) {
-        orig(c);
+        draw_a_scenery(c, orig);
         return;
     }
     const u16 was = LH(info + 12);
     SH(info + 12, 0);
-    orig(c);
+    draw_a_scenery(c, orig);
     SH(info + 12, was);
+}
+
+// The cars' reflections (Graphics, Reflections). The game draws the six views round the car by a table: a row of six words a phase at
+// 0x2D6FD0, the frame's number modulo 4 picks the row with one view on the screen (the six rows from the table's start) and modulo 6 on
+// a split screen (the six rows 144 bytes on); eEnvMap::UpdateCameras (0x1175c8) makes a view active where its word is above 0. The
+// game's rows: ahead and below every frame with one of the other four in turn, and one view a frame on a split screen. Advanced
+// and High: all six in every row. Our fold takes the views a frame drew, so nothing else is to change.
+static void reflections_schedule()
+{
+    static const u32 table = 0x2d6fd0;
+    static const bool exact = getenv("HP2_NATIVEEXACT") != nullptr;
+    static u32 game[72];
+    static int applied = -1;
+    if (applied < 0)
+        for (u32 i = 0; i < 72; i++) game[i] = LW(table + i * 4);
+    const int want = g_cfg.reflections && !exact ? 1 : 0;
+    if (want == applied) return;
+    for (u32 i = 0; i < 72; i++) SW(table + i * 4, want ? 1 : game[i]);
+    applied = want;
 }
 
 // ForceCarLOD, ForceTireLOD (carrender.c): -1 the game's choice by the car's size, else that level. The car screens set and put them back
@@ -1868,8 +2754,24 @@ void HOOK_CullView__20GrandSceneryCullInfoP15SceneryCullInfo(Ctx &c, void (*orig
         const u32 cur = LW(cull + 140);
         if (cur >= table && cur < end) SW(cull + 144, end);
     }
+    const u32 before_cur = LW(cull + 140);
     orig(c);
     const u32 cur = LW(cull + 140);
+    {   // TEMP: HP2_VIEWLOG=1, each view's planes and what the culling kept for it
+        static const bool on = getenv("HP2_VIEWLOG") != nullptr;
+        const u32 view = LW(cull + 128);
+        if (on && view && g_frame_no % 120 == 0) {
+            float h, hi, nz, fz, fov;
+            u32 w;
+            w = LW(view + 8), memcpy(&h, &w, 4);
+            w = LW(cull + 192), memcpy(&hi, &w, 4);
+            w = LW(view + 12), memcpy(&nz, &w, 4);
+            w = LW(view + 16), memcpy(&fz, &w, 4);
+            w = LW(view + 24), memcpy(&fov, &w, 4);
+            fprintf(g_hle_log, "view: frame %u id %u H %g (info %g) near %g far %g fov %g kept %u flags %x\n", g_frame_no, LW(view), h, hi, nz, fz, fov,
+                    (cur - before_cur) / 8, LW(cull + 196));
+        }
+    }
     if (cur >= table && cur <= end) {
         const u32 used = (cur - table) / 8;
         if (used > g_draw_table_peak) g_draw_table_peak = used;
@@ -1953,6 +2855,7 @@ void HOOK_eDisplayFrame__Fv(Ctx &c, void (*orig)(Ctx &))
     pc_paint_buttons();         // the device changes in a race too
     g_frame.wide = native_narrow() < 1 && pc_racing();
     car_detail();
+    reflections_schedule();
     // TEMP diagnostics (HP2_FRAMEMEM=1): the frame malloc buffer and the mirror's draws, for the mirror that shows only the sky
     static const bool diag = getenv("HP2_FRAMEMEM") != nullptr;
     if (diag) {

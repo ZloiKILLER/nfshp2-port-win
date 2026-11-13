@@ -31,7 +31,11 @@ std::mutex g_lock;          // g_seen
 Raw g_seen[2];
 std::atomic<int> g_count{0};
 std::atomic<int> g_want_rumble[2];      // what the game asked for last: small << 8 | large, -1 before any
-std::atomic<int> g_done_rumble[2];      // what the pad was told last
+std::atomic<int> g_done_rumble[2];      // the request the pad's motors were last set by
+std::atomic<bool> g_rumble_quiet;       // the window is not the one in front: no motor runs
+std::atomic<bool> g_rumble_off[2];      // this pad is not the one its player is using
+long long g_sent_rumble[2] = {-1, -1};  // what the pad was told last, and when (the pad's thread only)
+Uint64 g_sent_rumble_at[2];
 std::atomic<int> g_virtual_press[2];    // HP2_VPADS: bit 0 south, bit 1 the right trigger
 std::atomic<bool> g_started{false};
 
@@ -76,6 +80,7 @@ void refresh()
             SDL_CloseGamepad(p);
             p = nullptr;
             g_done_rumble[slot] = -1;
+            g_sent_rumble[slot] = -1;
         }
     }
     if (g_pads[0] && g_pads[1]) return;
@@ -154,9 +159,20 @@ void pad_thread()
             r.axis[2] = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTX);
             r.axis[3] = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTY);
             // the motors: the game keeps asking while it wants them; a stop is a request like any other
+            // The game's two numbers are a DualShock's: the big motor 0..255, the small one on or off; the big goes to the low frequency
+            // as it is, the small to the high at full. SDL stops a rumble after the time given, so one that lasts is told again.
             const int want = g_want_rumble[slot];
-            if (want >= 0 && want != g_done_rumble[slot]) {
-                SDL_RumbleGamepad(pad, (Uint16)((want & 255) * 257), want & 0x100 ? 0xFFFF : 0, want ? 0xFFFF : 0);
+            if (want >= 0) {
+                int large = want & 255, small = want >> 8 & 1;
+                if (g_rumble_quiet || g_rumble_off[slot]) large = small = 0;
+                const Uint16 low = (Uint16)(large * 257), high = (Uint16)(small ? 0xFFFF : 0);
+                const long long say = (long long)low << 16 | high;
+                const Uint64 at = SDL_GetTicks();
+                if (say != g_sent_rumble[slot] || (say && at - g_sent_rumble_at[slot] > 30000)) {
+                    SDL_RumbleGamepad(pad, low, high, say ? 0xFFFF : 0);
+                    g_sent_rumble[slot] = say;
+                    g_sent_rumble_at[slot] = at;
+                }
                 g_done_rumble[slot] = want;
             }
         }
@@ -227,9 +243,12 @@ PadState pad_read(int slot)
 
 bool pad_is_playstation(int slot) { return seen(slot).playstation; }
 
+void pad_rumble_quiet(bool quiet) { g_rumble_quiet = quiet; }
+void pad_rumble_gate(int slot, bool on) { g_rumble_off[slot & 1] = !on; }
+
 void pad_rumble(int slot, int small_on, int large)
 {
-    g_want_rumble[slot] = g_cfg.pad_vibration ? (small_on ? 0x100 : 0) | (large & 255) : 0;
+    g_want_rumble[slot] = (small_on ? 0x100 : 0) | (large & 255);
 }
 
 void pad_settle(int ms)

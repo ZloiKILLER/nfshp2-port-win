@@ -30,6 +30,7 @@ int pc_aspect()
 }
 
 int g_pad_playstation;
+int g_layout_playstation = 1;
 int g_pad_steering_now = 100;
 
 // XInput masks (xinput.h); the triggers are made-up bits above the real ones
@@ -67,6 +68,7 @@ void PcConfig::default_keys2()
     set(PCB_R3, 0xA2, 0);                   // VK_LCONTROL
     set(PCB_START, 0, 0);
     set(PCB_SELECT, 'B', 0);
+    memset(key2_zone, 0, sizeof key2_zone);
 }
 
 // driving, in the game's controller layout A: the buttons' jobs are in kActions
@@ -91,6 +93,8 @@ void PcConfig::default_keys()
     set(PCB_R3, 0xA0, 0);                   // VK_LSHIFT
     set(PCB_START, 0, 0);                   // Esc pauses, always
     set(PCB_SELECT, 'R', 0);
+    key_zone[0][0] = 'F', key_zone[0][1] = 0;
+    key_zone[1][0] = 'G', key_zone[1][1] = 0;
 }
 
 // The DualShock 2's buttons where any pad has them: Cross is A, Square X, Circle B, Triangle Y, L1/R1 the bumpers, L2/R2 the triggers, R3 the right
@@ -105,7 +109,6 @@ void PcConfig::default_pad()
     memcpy(pad, kPadDefault, sizeof pad);
     pad_deadzone = 24;
     pad_steering = 100;
-    pad_vibration = 1;
 }
 
 // the menus: the arrows, Enter and Esc (window_pad), a key for each of the game's other menu buttons
@@ -142,7 +145,7 @@ const char *pc_button_name(int b) { return b >= 0 && b < PCB_COUNT ? kButtons[b]
 // what each does in the game's default controller layout (A)
 static const char *kActions[PCB_COUNT] = {"Cycle HUD", "-", "Steer Left", "Steer Right", "Accelerate",
                                           "Brake / Reverse", "Horn / Siren", "Change View", "Look Back",
-                                          "Handbrake", "Shift Down / Freeze", "Shift Up / Zoom", "Speed Boost",
+                                          "Handbrake", "Shift Down", "Shift Up", "Speed Boost",
                                           "Pause", "Reset Car"};
 const char *pc_button_action(int b) { return b >= 0 && b < PCB_COUNT ? kActions[b] : "?"; }
 
@@ -208,39 +211,60 @@ static std::string ini_path()
 
 static int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
 
+// log=on, off (or 1, 0, yes, no); anything else is on
+static int log_value(const char *val)
+{
+    while (*val == ' ' || *val == '\t') val++;
+    return !(!_strnicmp(val, "off", 3) || !_strnicmp(val, "no", 2) || *val == '0');
+}
+
+bool pc_config_log()
+{
+    FILE *f = fopen(ini_path().c_str(), "r");
+    if (!f) return true;
+    char line[256];
+    bool on = true;
+    while (fgets(line, sizeof line, f)) {
+        if (char *c = strchr(line, ';')) *c = 0;
+        char *key = line;
+        while (*key == ' ' || *key == '\t') key++;
+        if (!_strnicmp(key, "log", 3)) {
+            const char *eq = key + 3;
+            while (*eq == ' ' || *eq == '\t') eq++;
+            if (*eq == '=') on = log_value(eq + 1) != 0;
+        }
+    }
+    fclose(f);
+    return on;
+}
+
 static std::string g_controls_path;
 
 // the keyboard, player 2 and the gamepad: a section of hp2.ini, and the profile's own file
 static void write_controls(FILE *f)
 {
-    fprintf(f, "[keyboard]       ; while driving: two virtual-key codes (0 = none)\n");
+    fprintf(f, "[keyboard]       ; while driving: the virtual-key code of each action's key (0 = none)\n");
     fprintf(f, "controls=2\n");
     for (int b = 0; b < PCB_COUNT; b++) {
         std::string n = pc_button_name(b);
         for (char &ch : n) ch = (char)tolower((unsigned char)ch);
-        fprintf(f, "key_%s=%d,%d      ; %s | %s | %s\n", n.c_str(), g_cfg.key[b][0], g_cfg.key[b][1], pc_button_action(b),
-                pc_key_name(g_cfg.key[b][0]).c_str(), pc_key_name(g_cfg.key[b][1]).c_str());
+        fprintf(f, "key_%s=%d      ; %s | %s\n", n.c_str(), g_cfg.key[b][0], pc_button_action(b), pc_key_name(g_cfg.key[b][0]).c_str());
     }
+    fprintf(f, "key_zone_freeze=%d      ; Zone Freeze\n", g_cfg.key_zone[0][0]);
+    fprintf(f, "key_zone_zoom=%d      ; Zone Zoom\n", g_cfg.key_zone[1][0]);
     fprintf(f, "\n[player2]\n");
     fprintf(f, "player2=%d          ; 0 = the second gamepad, or half of the keyboard; 1 = the first gamepad, player 1 has the keyboard\n", g_cfg.player2);
     for (int b = 0; b < PCB_COUNT; b++) {
         std::string n = pc_button_name(b);
         for (char &ch : n) ch = (char)tolower((unsigned char)ch);
-        fprintf(f, "key2_%s=%d,%d      ; %s | %s | %s\n", n.c_str(), g_cfg.key2[b][0], g_cfg.key2[b][1], pc_button_action(b),
-                pc_key_name(g_cfg.key2[b][0]).c_str(), pc_key_name(g_cfg.key2[b][1]).c_str());
+        fprintf(f, "key2_%s=%d      ; %s | %s\n", n.c_str(), g_cfg.key2[b][0], pc_button_action(b), pc_key_name(g_cfg.key2[b][0]).c_str());
     }
-    fprintf(f, "\n[gamepad]        ; while driving: XInput button masks (0 = none)\n");
+    fprintf(f, "key2_zone_freeze=%d\n", g_cfg.key2_zone[0][0]);
+    fprintf(f, "key2_zone_zoom=%d\n", g_cfg.key2_zone[1][0]);
+    fprintf(f, "\n[gamepad]        ; its buttons are the DualShock 2's where the pad has them; what each does is the game's layout (A to D)\n");
     fprintf(f, "deadzone=%d         ; the left stick, percent\n", g_cfg.pad_deadzone);
     fprintf(f, "steering=%d        ; percent, above 100 sharper near the center\n", g_cfg.pad_steering);
-    fprintf(f, "vibration=%d\n", g_cfg.pad_vibration);
     fprintf(f, "icons=%d            ; 0 by the pad, 1 Xbox, 2 PlayStation\n", g_cfg.pad_icons);
-    fprintf(f, "pad_layout=2        ; the DualShock 2's buttons where the pad has them\n");
-    for (int b = 0; b < PCB_COUNT; b++) {
-        std::string n = pc_button_name(b);
-        for (char &ch : n) ch = (char)tolower((unsigned char)ch);
-        fprintf(f, "pad_%s=%d      ; %s | %s\n", n.c_str(), g_cfg.pad[b], pc_button_action(b),
-                pc_pad_names(g_cfg.pad[b]).c_str());
-    }
 }
 
 // the keys of the file, in the order they are written
@@ -275,7 +299,9 @@ void pc_config_save()
     fprintf(f, "language=%s     ; ENGLISH, FRENCH, GERMAN, ITALIAN, SPANISH, SWEDISH, or one of data\\lang\\\n", g_cfg.language);
     fprintf(f, "show_fps=%d\n", g_cfg.show_fps);
     fprintf(f, "max_detail=%d       ; 1 = every object at its most detailed model, 0 = the PS2's levels of detail\n", g_cfg.max_detail);
+    fprintf(f, "reflections=%d      ; the cars' reflections: 0 = the PS2's, 1 = advanced (new every frame), 2 = high (new every frame, twice the resolution)\n", g_cfg.reflections);
     fprintf(f, "\n");
+    fprintf(f, "log=%s             ; on = the game writes speed.log (4 MB at most: its first and its last 2 MB), off = it writes no log at all\n", g_cfg.log ? "on" : "off");
     fprintf(f, "[audio]\nvolume=%d           ; percent\n\n", g_cfg.volume);
     write_controls(f);
     fclose(f);
@@ -330,25 +356,40 @@ static bool read_settings(const std::string &path, bool &old_controls)
         else if (!strcmp(key, "draw_distance")) g_cfg.draw_distance = clampi(n, 100, 400);
         else if (!strcmp(key, "show_fps")) g_cfg.show_fps = n != 0;
         else if (!strcmp(key, "max_detail")) g_cfg.max_detail = n != 0;
+        else if (!strcmp(key, "reflections")) g_cfg.reflections = clampi(n, 0, 2);
+        else if (!strcmp(key, "log")) g_cfg.log = log_value(val);
         else if (!strcmp(key, "volume")) g_cfg.volume = clampi(n, 0, 100);
         else if (!strcmp(key, "deadzone")) g_cfg.pad_deadzone = clampi(n, 0, 50);
         else if (!strcmp(key, "steering")) g_cfg.pad_steering = clampi(n, 50, 200);
-        else if (!strcmp(key, "vibration")) g_cfg.pad_vibration = n != 0;
         else if (!strcmp(key, "icons")) g_cfg.pad_icons = clampi(n, 0, 2);
         else if (!strcmp(key, "player2")) g_cfg.player2 = clampi(n, 0, 1);
         else if (!strcmp(key, "window")) sscanf(val, "%d,%d", &g_cfg.win_w, &g_cfg.win_h);
+        else if (!strcmp(key, "key_zone_freeze")) sscanf(val, "%d,%d", &g_cfg.key_zone[0][0], &g_cfg.key_zone[0][1]);
+        else if (!strcmp(key, "key_zone_zoom")) sscanf(val, "%d,%d", &g_cfg.key_zone[1][0], &g_cfg.key_zone[1][1]);
+        else if (!strcmp(key, "key2_zone_freeze")) sscanf(val, "%d,%d", &g_cfg.key2_zone[0][0], &g_cfg.key2_zone[0][1]);
+        else if (!strcmp(key, "key2_zone_zoom")) sscanf(val, "%d,%d", &g_cfg.key2_zone[1][0], &g_cfg.key2_zone[1][1]);
         else
             for (int b = 0; b < PCB_COUNT; b++) {
                 std::string name = pc_button_name(b);
                 for (char &ch : name) ch = (char)tolower((unsigned char)ch);
                 if ("key_" + name == key) sscanf(val, "%d,%d", &g_cfg.key[b][0], &g_cfg.key[b][1]);
                 if ("key2_" + name == key) sscanf(val, "%d,%d", &g_cfg.key2[b][0], &g_cfg.key2[b][1]);
-                if ("pad_" + name == key) g_cfg.pad[b] = n;
             }
     }
     fclose(f);
-    // the gamepad as the port had it before: the PS2's buttons where they are now. One changed by hand stays
-    if (g_pad_layout_old && !memcmp(g_cfg.pad, kPadBefore, sizeof g_cfg.pad)) memcpy(g_cfg.pad, kPadDefault, sizeof g_cfg.pad);
+    // one key an action: the second of an older file's pair goes (if it was the only one, it is the key)
+    for (auto *keys : {g_cfg.key, g_cfg.key2})
+        for (int b = 0; b < PCB_COUNT; b++) {
+            if (!keys[b][0]) keys[b][0] = keys[b][1];
+            keys[b][1] = 0;
+        }
+    for (auto *keys : {g_cfg.key_zone, g_cfg.key2_zone})
+        for (int z = 0; z < 2; z++) {
+            if (!keys[z][0]) keys[z][0] = keys[z][1];
+            keys[z][1] = 0;
+        }
+    // the gamepad's buttons are not the port's to move any more: the game's layouts say what each does
+    memcpy(g_cfg.pad, kPadDefault, sizeof g_cfg.pad);
     return true;
 }
 

@@ -67,6 +67,9 @@ Draw Distance	Distancia de dibujado
 How far away scenery still shows. 100% is the PS2's.	Hasta dónde se ve el escenario. 100% es el de PS2.
 Level of Detail	Nivel de detalle
 Maximum: scenery and cars always at their most detailed models. Original: as on the PS2.	Máximo: escenario y coches siempre con sus modelos más detallados. Original: como en PS2.
+Reflections	Reflejos
+High	Alto
+The reflections on the cars. Advanced: new every frame. High: new every frame, at twice the resolution.	Los reflejos en los coches. Avanzado: actualizados en cada fotograma. Alto: en cada fotograma, al doble de resolución.
 Show FPS	Mostrar FPS
 Frames per second in the corner of the picture.	Fotogramas por segundo en una esquina de la imagen.
 Advanced	Avanzado
@@ -218,3 +221,21 @@ R Stick	Stick der
 #900005	Conecta un mando@para el@jugador %d.
 #900011	Conecta un mando.
 #940001	Pulsa \x80 para entrar en esta prueba.
+Select, then press the key for it. Esc cancels.	Selecciona y pulsa la tecla. Esc cancela.
+Zone Freeze	Zona: congelar
+Zone Zoom	Zona: zoom
+Select, then type its name. A gamepad gets the letter grid.	Selecciona y escribe su nombre. Con un mando aparece la cuadrícula de letras.
+Capitals	Mayúsculas
+Delete the profile %s? Its save and its controls will be gone.	¿Borrar el perfil %s? Su partida y sus controles se perderán.
+The profile is made. Select it to play as it.	El perfil está creado. Selecciónalo para jugar con él.
+Antialiasing	Antialiasing
+Smoother edges: off, MSAA or SMAA.	Bordes más suaves: no, MSAA o SMAA.
+Off, MSAA (the scene drawn in samples) or SMAA (the picture's edges smoothed).	No, MSAA (la escena dibujada en muestras) o SMAA (los bordes de la imagen suavizados).
+Quality	Calidad
+MSAA: samples a pixel. SMAA: how far it looks along an edge.	MSAA: muestras por píxel. SMAA: hasta dónde mira a lo largo de un borde.
+This graphics card has no more samples for the game.	Esta tarjeta gráfica no tiene más muestras para el juego.
+The buttons for driving and the stick.	Los botones para conducir y el stick.
+The gamepad's layouts, A to D: what each button does in a race.	Los esquemas del mando, de A a D: qué hace cada botón en carrera.
+Leave the game?	¿Salir del juego?
+Pick the letters. The last key of the grid makes it.	Elige las letras. La última tecla de la cuadrícula lo confirma.
+Type the new name. Enter sets it, Esc leaves it.	Escribe el nombre nuevo. Intro lo guarda, Esc lo deja.

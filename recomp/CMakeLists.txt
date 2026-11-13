@@ -46,7 +46,7 @@ foreach(s native.vert native.frag)
 endforeach()
 add_custom_target(native_shaders DEPENDS ${SHADER_HEADERS})
 
-# Sound: STREAM.IRX on the IOP interpreter, libsd on the software SPU2, host output
+# Sound: STREAM.IRX translated ahead of time (tools/recomp/gen_iop.py, iop_stream_*.cpp in the generated folder), libsd on the software SPU2, host output
 set(SOUND_SOURCES runtime/iop_cpu.cpp runtime/iop_kernel.cpp runtime/iop_libsd.cpp runtime/spu2.cpp runtime/audio_wasapi.cpp)
 
 # The game's program is not in the exe: data/SLUS_203.62, from the player's disc (setup.cpp, install.cpp)
@@ -76,7 +76,7 @@ if(NOT EXISTS ${SDL3_SOURCE}/CMakeLists.txt)
 endif()
 add_subdirectory(${SDL3_SOURCE} ${CMAKE_CURRENT_BINARY_DIR}/sdl3 EXCLUDE_FROM_ALL)
 
-add_executable(hp2recomp runtime/ps2.cpp runtime/pcmenu.cpp runtime/pcsettings.cpp runtime/pclang.cpp runtime/setup.cpp runtime/install.cpp runtime/pcplatform.cpp runtime/pad.cpp runtime/native.cpp runtime/native_tex.cpp runtime/native_vk.cpp runtime/hle_iop.cpp runtime/dma.cpp runtime/vif.cpp runtime/profile.cpp runtime/hot_math.cpp runtime/native_mem.cpp runtime/native_movie.cpp runtime/gs_regs.cpp runtime/pcconfig.cpp runtime/window.cpp ${SOUND_SOURCES} ${HOST_SOURCES} ${GEN_SOURCES})
+add_executable(hp2recomp runtime/ps2.cpp runtime/mem_block.cpp runtime/pcmenu.cpp runtime/pcsettings.cpp runtime/pclang.cpp runtime/setup.cpp runtime/install.cpp runtime/pcplatform.cpp runtime/pad.cpp runtime/native.cpp runtime/native_tex.cpp runtime/native_vk.cpp runtime/hle_iop.cpp runtime/dma.cpp runtime/vif.cpp runtime/profile.cpp runtime/hot_math.cpp runtime/native_mem.cpp runtime/memwatch.cpp runtime/native_movie.cpp runtime/gs_regs.cpp runtime/pcconfig.cpp runtime/window.cpp ${SOUND_SOURCES} ${HOST_SOURCES} ${GEN_SOURCES})
 target_include_directories(hp2recomp PRIVATE runtime ${GEN_DIR} ${VULKAN_INCLUDE} ${SHADER_OUT})
 # the playable build is recompwin/speed.exe, next to data/, hp2.ini and saves/
 if(NOT HP2_NAME)
@@ -91,9 +91,54 @@ if(WIN32)
 endif()
 add_dependencies(hp2recomp native_shaders)
 # -O1 keeps the 20+ MB of generated code compiling in reasonable time
+# Every text of the port's menus has its line in each language file, or the build stops (tools/recomp/check_lang.py); where there is a Python.
+find_package(Python3 COMPONENTS Interpreter)
+if(Python3_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../tools/recomp/check_lang.py")
+    add_custom_target(check_lang ALL COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/../tools/recomp/check_lang.py" VERBATIM)
+    add_dependencies(hp2recomp check_lang)
+endif()
+
+# HP2_MEM4G: the game's 4 GB of addresses in one piece (runtime/ps2.h), for code generated with gen.py --direct. The image is then at a
+# fixed place, never moved: the 4 GB begin in it (g_ram, runtime/mem_block.cpp) and go on after it (mem_reserve, runtime/ps2.cpp), and
+# nothing else may be loaded there. Off for the build that is released: such an exe has no address randomization.
+# (tools/recomp/profrip.py and its kin take the image's base for 0x140000000, the default; with this option it is 0x1000000000.)
+option(HP2_MEM4G "The game's address space as one piece of the host's (gen.py --direct needs it)" OFF)
+if(HP2_MEM4G)
+    target_compile_definitions(hp2recomp PRIVATE HP2_MEM4G)
+    target_link_options(hp2recomp PRIVATE -Wl,/base:0x1000000000 -Wl,/dynamicbase:no -Wl,/fixed)
+endif()
 target_link_options(hp2recomp PRIVATE "-Wl,/map:${CMAKE_BINARY_DIR}/speed.map")   # names for tools/recomp/profrip.py
 target_compile_options(hp2recomp PRIVATE -O2 -w -fno-strict-aliasing)
 set_source_files_properties(runtime/iop_cpu.cpp runtime/spu2.cpp runtime/native.cpp runtime/native_tex.cpp PROPERTIES COMPILE_OPTIONS "-O2")
-set_source_files_properties(runtime/hot_math.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")     # no fused multiply-add: its rounding is not the game's
+# HP2_SYMBOLS=ON: debug information for the renderer's and the maths' sources and a PDB beside the exe, so that a profile (HP2_PROFRIP) can be
+# read by source line (tools/recomp/proflines.py). For measuring only: the exe then names its PDB by this machine's path, so not for a release.
+option(HP2_SYMBOLS "debug info for native.cpp, native_tex.cpp, hot_math.cpp and a PDB" OFF)
+if(HP2_SYMBOLS)
+    set_source_files_properties(runtime/native.cpp runtime/native_tex.cpp PROPERTIES COMPILE_OPTIONS "-O2;-g;-gcodeview")
+    set_source_files_properties(runtime/hot_math.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off;-g;-gcodeview")
+    target_link_options(hp2recomp PRIVATE -Wl,/debug -Wl,/opt:ref -Wl,/opt:icf)
+else()
+    set_source_files_properties(runtime/hot_math.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+endif()     # no fused multiply-add: its rounding is not the game's
 set_source_files_properties(runtime/native_movie.cpp PROPERTIES COMPILE_OPTIONS "-fwrapv")   # the game's arithmetic wraps
+# Built by what the game really runs (profile-guided): the compiler lays the code out and inlines by counts taken from a run, which is
+# worth more to the 20 MB of generated code than anything it can guess. The arithmetic is not touched: the same operations, in another order
+# of blocks. HP2_PGO=GEN: the counting build (run it with LLVM_PROFILE_FILE and HP2_PGO_SECONDS, then llvm-profdata merge);
+# HP2_PGO=USE: built by recomp/pgo/speed.profdata, or HP2_PGO_DATA. tools/recomp/pgo.sh does all of it. Functions changed since the
+# counts were taken are compiled as without them.
+set(HP2_PGO "" CACHE STRING "GEN: the counting build; USE: built by the counts in recomp/pgo/speed.profdata")
+if(HP2_PGO)
+    # A function private to its file is named in the counts by the file, and by default with the whole path the compiler was given:
+    # the counts taken in one folder then fit no build made in another (the release repository, anybody's own). By the file's name alone.
+    target_compile_options(hp2recomp PRIVATE -mllvm -static-func-full-module-prefix=false)
+endif()
+if(HP2_PGO STREQUAL "GEN")
+    target_compile_options(hp2recomp PRIVATE -fprofile-generate -DHP2_PGO_GEN)
+    target_link_options(hp2recomp PRIVATE -fprofile-generate)
+elseif(HP2_PGO STREQUAL "USE")
+    if(NOT HP2_PGO_DATA)
+        set(HP2_PGO_DATA ${CMAKE_CURRENT_SOURCE_DIR}/pgo/speed.profdata)
+    endif()
+    target_compile_options(hp2recomp PRIVATE -fprofile-use=${HP2_PGO_DATA} -Wno-profile-instr-out-of-date -Wno-profile-instr-unprofiled -Wno-backend-plugin)
+endif()
 target_link_libraries(hp2recomp PRIVATE user32 gdi32 ole32 comctl32 comdlg32 shell32 uuid SDL3::SDL3-static)

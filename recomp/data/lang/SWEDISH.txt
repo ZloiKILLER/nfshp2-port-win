@@ -67,6 +67,9 @@ Draw Distance	Siktavstånd
 How far away scenery still shows. 100% is the PS2's.	Hur långt bort miljön syns. 100 % som på PS2.
 Level of Detail	Detaljnivå
 Maximum: scenery and cars always at their most detailed models. Original: as on the PS2.	Maximal: miljö och bilar alltid med sina mest detaljerade modeller. Original: som på PS2.
+Reflections	Reflektioner
+High	Hög
+The reflections on the cars. Advanced: new every frame. High: new every frame, at twice the resolution.	Reflektionerna på bilarna. Avancerat: nya i varje bild. Hög: nya i varje bild, i dubbel upplösning.
 Show FPS	Visa FPS
 Frames per second in the corner of the picture.	Bilder per sekund i bildens hörn.
 Advanced	Avancerat
@@ -218,3 +221,21 @@ R Stick	H spak
 #900005	Anslut en@handkontroll för@spelare %d.
 #900011	Anslut en handkontroll.
 #940001	Tryck på \x80 för att delta i detta evenemang.
+Select, then press the key for it. Esc cancels.	Välj och tryck på tangenten. Esc avbryter.
+Zone Freeze	Zon: frys
+Zone Zoom	Zon: zooma
+Select, then type its name. A gamepad gets the letter grid.	Välj och skriv namnet. Med handkontroll visas bokstavsrutnätet.
+Capitals	Versaler
+Delete the profile %s? Its save and its controls will be gone.	Ta bort profilen %s? Dess sparfil och kontroller försvinner.
+The profile is made. Select it to play as it.	Profilen är skapad. Välj den för att spela med den.
+Antialiasing	Kantutjämning
+Smoother edges: off, MSAA or SMAA.	Mjukare kanter: av, MSAA eller SMAA.
+Off, MSAA (the scene drawn in samples) or SMAA (the picture's edges smoothed).	Av, MSAA (scenen ritad i sampel) eller SMAA (bildens kanter utjämnade).
+Quality	Kvalitet
+MSAA: samples a pixel. SMAA: how far it looks along an edge.	MSAA: sampel per pixel. SMAA: hur långt den letar längs en kant.
+This graphics card has no more samples for the game.	Det här grafikkortet har inte fler sampel för spelet.
+The buttons for driving and the stick.	Knapparna för körning och spaken.
+The gamepad's layouts, A to D: what each button does in a race.	Handkontrollens layouter, A till D: vad varje knapp gör under lopp.
+Leave the game?	Avsluta spelet?
+Pick the letters. The last key of the grid makes it.	Välj bokstäverna. Rutnätets sista tangent bekräftar.
+Type the new name. Enter sets it, Esc leaves it.	Skriv det nya namnet. Enter sätter det, Esc lämnar det.

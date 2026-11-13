@@ -72,6 +72,16 @@ void profile_start()
         int second_phase = 0;
         ULONGLONG second_at = GetTickCount64() / 1000;
         HMODULE exe = GetModuleHandleA(nullptr);
+        const IMAGE_NT_HEADERS *nt = (const IMAGE_NT_HEADERS *)((const char *)exe + ((const IMAGE_DOS_HEADER *)exe)->e_lfanew);
+        const DWORD64 exe_size = nt->OptionalHeader.BaseOfCode + nt->OptionalHeader.SizeOfCode;       // the code's end
+        std::map<std::pair<DWORD64, DWORD64>, unsigned> callers;
+        // <file>.callers: "<hits> <rva of the place> <rva of its caller's return address>" (tools/recomp/profcallers.py)
+        const auto write_callers = [&] {
+            if (FILE *f = fopen((path + ".callers").c_str(), "w")) {
+                for (auto &k : callers) fprintf(f, "%u %llx %llx\n", k.second, (unsigned long long)(k.first.first - (DWORD64)exe), (unsigned long long)(k.first.second - (DWORD64)exe));
+                fclose(f);
+            }
+        };
         LONGLONG next_write = 0;
         LARGE_INTEGER freq, now;
         QueryPerformanceFrequency(&freq);
@@ -86,7 +96,23 @@ void profile_start()
                 CONTEXT c = {};
                 c.ContextFlags = CONTEXT_CONTROL;
                 const bool got = GetThreadContext(game, &c) != 0;
+                // who called: the first word up the stack that is a return address into the program (a call just before it). Right for
+                // the small helpers (the EE's division, the vectors), whose own frames hold no other such word; a guess for the rest
+                DWORD64 stack[48] = {};
+                SIZE_T read = 0;
+                if (got) ReadProcessMemory(GetCurrentProcess(), (LPCVOID)c.Rsp, stack, sizeof stack, &read);
                 ResumeThread(game);
+                if (got && c.Rip - (DWORD64)exe < exe_size)
+                    for (SIZE_T i = 0; i < read / 8; i++) {
+                        const DWORD64 v = stack[i];
+                        if (v - (DWORD64)exe - 0x1000 >= exe_size - 0x1000) continue;
+                        const unsigned char *b = (const unsigned char *)v;
+                        const auto call_reg = [&](int back) { return b[-back] == 0xff && (b[-back + 1] >> 3 & 7) == 2; };
+                        if (b[-5] == 0xe8 || call_reg(2) || call_reg(3) || call_reg(6) || call_reg(7)) {
+                            callers[{c.Rip, v}]++;
+                            break;
+                        }
+                    }
                 if (got) {
                     const int phase = pc_replay_playing() ? (g_cfg.frame_rate == 60 ? 3 : 2) : pc_car_input() ? 1 : 4;
                     hits[0][c.Rip]++;
@@ -124,6 +150,7 @@ void profile_start()
         }
         for (int i = 0; i < 5; i++)
             if (counts[i]) write_hits(path + kPhase[i], hits[i], counts[i]);
+        write_callers();
     }).detach();
 }
 #else

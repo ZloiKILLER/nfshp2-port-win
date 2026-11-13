@@ -1,0 +1,81 @@
+# The instructions of the game whose loads and stores go outside the block (guest 0 to 0x0FFFFFFF) and the scratchpad: to a mirror of
+# the memory, to the VU's memory, to the hardware's registers. gen.py keeps the tested accessors (L and S, ps2.h) for every function
+# that holds one of these or lies in one of the ranges; all other generated code reaches memory with no test at all.
+# The single addresses are what a gen.py --sites build noted (work/nshots/t5/sites.sh: the five demos, a race, an own replay, the
+# menus; twelve runs, the same 68 instructions in each). The ranges are the code around them that deals with the hardware and that no
+# run may have walked through whole. A line is an address or a range first-last (last not included), in hex; # starts a comment.
+
+280550-296220    # the SDK's libraries: libgraph, libdma, libpad, the kernel's calls, SIF, the file system, CD, memory card (libc, after them, is not here)
+101ad8-1030e8    # class DMAC, eInitEngine, eCloseEngine
+103558-1036c8    # DownloadVUCode, PatchVUCode
+108048-108498    # eSwapScreenBuffers, ePutDisplayEnvironment, eForceBackgroundColour
+111830-112068    # the render stage queue, the waits for the screen and the renderer, the VBlank and VIF1 handlers
+
+102028
+102fc8
+102fe0
+102fe8
+102ff0
+102ff4
+102ffc
+103000
+103008
+10300c
+103014
+103018
+103600
+10363c
+1082b0
+1082e8
+108320
+10837c
+108394
+1083ac
+1083b4
+11192c
+111938
+11193c
+111944
+111f80
+111ff4
+112034
+2807ac
+2807b8
+2808d8
+2808e8
+28091c
+280924
+28092c
+280a4c
+280bd8
+280bf8
+280bfc
+280c00
+280c04
+280c08
+280c0c
+280c30
+280c3c
+280c48
+280c68
+280c70
+280ca0
+280ca8
+280cb8
+280cc8
+280cd0
+280df4
+280e04
+280e14
+280e24
+280e2c
+280ee4
+280ef0
+280ef4
+280efc
+280f10
+28a848
+28b090
+28b0a8
+28b6c8
+28b70c

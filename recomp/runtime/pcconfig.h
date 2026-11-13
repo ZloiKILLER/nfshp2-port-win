@@ -30,15 +30,21 @@ struct PcConfig {
     int show_fps = 0;
     char language[16] = "ENGLISH";  // a key of pc_languages() (pclang.h)
     bool ask_language = true;   // hp2.ini has no language yet: the very first start shows the game's own choice of language (pclang.cpp)
+    int log = 1;                // speed.log is written (1), or nothing is (0): hp2.ini has it as on / off
+    int reflections = 0;        // the cars' reflections in a race: 0 the PS2's (views of 64 pixels, a few of the six a frame), 1 advanced:
+                                // the PS2's resolution, all six views every frame; 2 high: twice the resolution, all six every frame
     int max_detail = 1;         // 1: scenery, cars and tyres at their best models whatever the size; 0: the game's choice by size
     int volume = 100;           // percent
     int key[PCB_COUNT][2] = {}; // virtual-key codes, 0 = none
     int key2[PCB_COUNT][2] = {};    // player 2's, when the keyboard is shared in two (window_pad)
+    // The keys are actions, named by what the button does in the game's layout A (pc_button_action); in another layout of the gamepad's
+    // the key keeps its action and presses the button that has it there (pc_layout_button). Two more, which on a pad are two buttons
+    // together: the zone cameras, 0 Zone Freeze (Triangle + L2), 1 Zone Zoom (Triangle + R2).
+    int key_zone[2][2] = {}, key2_zone[2][2] = {};
     int player2 = 0;            // 0: the second gamepad, else half of the keyboard. 1: the first gamepad, player 1 has the keyboard
     int pad[PCB_COUNT] = {};    // XInput button masks, 0 = none
     int pad_deadzone = 24;      // the left stick's dead zone, percent
     int pad_steering = 100;     // steering sensitivity, percent: above 100 more of it near the center
-    int pad_vibration = 1;
     int pad_icons = 0;          // 0 by the pad, 1 Xbox, 2 PlayStation: its menu layout goes with them
     int win_w = 960, win_h = 720;   // the window's picture, in pixels
     PcConfig();
@@ -48,6 +54,7 @@ struct PcConfig {
 };
 
 extern PcConfig g_cfg;
+extern int g_layout_playstation;    // the layouts' screen shows PlayStation's buttons: unless an Xbox pad is there or chosen
 extern int g_pad_playstation;   // the pad in use has PlayStation's buttons (window_pad keeps it)
 extern int g_pad_steering_now;  // the sensitivity now: pad_steering while driving, else 100
 // The race's aspect as it is drawn: the setting's, but no wider than the window (fullscreen: the screen), where a wider picture would only
@@ -56,6 +63,7 @@ int pc_aspect();
 int pc_aspect_limit();
 void pc_config_init();          // read hp2.ini (HP2_INI=<path> names another file); the main program only
 void pc_config_save();
+bool pc_config_log();           // hp2.ini's log key alone, before anything else is read: whether there is to be a log at all
 // the profile's file of controls: its values, or with none the defaults (fresh) or what is set now; each save writes it
 void pc_config_use_profile(const std::string &controls_path, bool fresh);
 const char *pc_button_name(int b);          // "Cross", the name in hp2.ini

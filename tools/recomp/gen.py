@@ -18,6 +18,7 @@ The retail program: work/release_us/SLUS_203.62, or --elf <path> (the first star
 """
 
 import bisect
+import re
 import json
 import os
 import struct
@@ -82,10 +83,31 @@ OUT = os.path.join(REPO, "work", "recomp", "gen")
 FUNCS_PER_FILE = 400
 
 
+# address: (the USA and Europe v1.00 word, the Europe v2.00 word): addiu sp, and the saves and loads of s0..s3 and ra 0x80 further up
+LARGER_REWARD_FRAMES = {
+    0x1de568: (0x27bdff30, 0x27bdfeb0), 0x1de56c: (0xffb10090, 0xffb10110), 0x1de570: (0xffb300b0, 0xffb30130),
+    0x1de574: (0xffb200a0, 0xffb20120), 0x1de578: (0xffb00080, 0xffb00100), 0x1de57c: (0xffbf00c0, 0xffbf0140),
+    0x1de688: (0xdfbf00c0, 0xdfbf0140), 0x1de68c: (0xdfb300b0, 0xdfb30130), 0x1de690: (0xdfb200a0, 0xdfb20120),
+    0x1de694: (0xdfb10090, 0xdfb10110), 0x1de698: (0xdfb00080, 0xdfb00100), 0x1de6a0: (0x27bd00d0, 0x27bd0150),
+    0x1de6a8: (0x27bdff40, 0x27bdfec0), 0x1de6ac: (0xffb200a0, 0xffb20120), 0x1de6b0: (0xffb10090, 0xffb10110),
+    0x1de6b4: (0xffb00080, 0xffb00100), 0x1de6b8: (0xffbf00b0, 0xffbf0130), 0x1de770: (0xdfbf00b0, 0xdfbf0130),
+    0x1de774: (0xdfb200a0, 0xdfb20120), 0x1de778: (0xdfb10090, 0xdfb10110), 0x1de77c: (0xdfb00080, 0xdfb00100),
+    0x1de784: (0x27bd00c0, 0x27bd0140),
+}
+
+
 def load():
     blob, secs = match_func.load_elf(RETAIL)
     t = secs[".text"]
     words = [struct.unpack_from("<I", blob, t["off"] + i)[0] for i in range(0, t["size"], 4)]
+    # The Europe v2.00 disc's program is the USA one but for these: the constructors of the two reward screens (PointsRewardScreen
+    # 0x1de568, TaskRewardScreen 0x1de6a8) keep 128 bytes more of stack under their saved registers, room for a longer text. The
+    # recompiled code has the larger frames whatever disc the program came from; a word that is neither of the two stops the build.
+    for addr, (was, now) in LARGER_REWARD_FRAMES.items():
+        i = (addr - t["addr"]) // 4
+        if words[i] not in (was, now):
+            sys.exit(f"gen: {addr:#x} is {words[i]:#010x}, neither the v1.00 word {was:#010x} nor the v2.00 one {now:#010x}")
+        words[i] = now
     data_words = []                 # (section, word)
     for name in (".rodata", ".data", ".sdata"):
         s = secs.get(name)
@@ -264,6 +286,50 @@ def cname(addr):
     return f"F_{addr:08x}"
 
 
+# Locals mode (the default; --ctx gives the old way, every register read and written in the Ctx).
+# A function keeps the registers it uses in local variables: the compiler cannot keep a Ctx field in a machine register across a store
+# to the game's memory (it has to take the store for one that may hit the Ctx), so in the old way every use is a load and every
+# definition a store. Locals have no address anyone else knows. They are brought to the Ctx (FL) before anything that sees it, a call,
+# a syscall, the interrupts, a return, and taken back from it (RL) after: at those points the Ctx is what it was in the old way.
+# RL loads every register the function uses (a load of one not used again costs nothing); a flush stores those written since the
+# Ctx last had them, which gen_l works out over the function's flow.
+LOCALS = "--ctx" not in sys.argv
+SYNC_OPS = {"syscall", "break", "eret", "ei", "mtc0"}       # these see the whole Ctx, or let an interrupt's handler see it
+RX_SPDEF = re.compile(r"c\.r\[29\]\.(?:q|[dwhb]\[\d+\]) = (?!=)")
+RX_GDEF = re.compile(r"c\.r\[(\d+)\]\.(?:q|[dwhb]\[\d+\]) = (?!=)")
+RX_FDEF = re.compile(r"c\.f\[(\d+)\]\.[uf] = (?!=)")
+RX_GWIDE = re.compile(r"c\.r\[(\d+)\]\.(?:q|d\[1\]|w\[[123]\]|h\[|b\[)")
+# A load or a store at a constant offset from the stack pointer: the frame is one piece of the host's memory wherever the stack is (the
+# 32 MB or the scratchpad), so its place is taken once (sph = host(sp), again whenever sp is written or may have been) and the access
+# is that pointer plus the offset. It was host() each time: two tests and, for a stack in the scratchpad, ten instructions.
+RX_SP = re.compile(r"\b([LS][BHWD])\(\(u32\)\(c\.r\[29\]\.w\[0\] \+ (-?\d+)\)")
+RX_G = re.compile(r"c\.r\[(\d+)\]")
+# A load or a store of the generated code (not the stack frame's, which RX_SP has taken): tested for where its address is (L and S,
+# ps2.h), which is the default. The game's addresses are offsets into 4 GB of the host's, so it can also be done with no test:
+#   --direct    no test, unless the function holds an instruction that a run has seen go outside the block and the scratchpad, or
+#               deals with the hardware: recomp/runtime/slow_sites.txt. An access to the hardware from a function not listed kills
+#               the game (mem_stray, ps2.cpp), and the gain measured in the build by counts was about 1 %: not the default
+#               (the build needs -DHP2_MEM4G=ON for it, recomp/CMakeLists.txt)
+#   --sites     the build that finds the instructions: every access notes its instruction when it goes outside (HP2_SITELOG)
+RX_MEM = re.compile(r"\b([LS][BHWDQ])\(")
+MEM_MODE = "sites" if "--sites" in sys.argv else "direct" if "--direct" in sys.argv and "--ctx" not in sys.argv else "checked"
+SLOW_SITES, SLOW_RANGES = set(), []
+_sites = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "recomp", "runtime", "slow_sites.txt")
+if os.path.exists(_sites):
+    for _l in open(_sites):
+        _l = _l.split("#")[0].strip()
+        if "-" in _l:
+            SLOW_RANGES.append(tuple(int(x, 16) for x in _l.split("-")))
+        elif _l:
+            SLOW_SITES.add(int(_l, 16))
+
+
+def io_constant(imm):
+    """lui's operand is the top of an address that is not plain memory: the hardware's registers, the VU's memory, a mirror"""
+    return 0x1000 <= imm <= 0x1200 or imm in (0x2000, 0x3000, 0x8000, 0xA000) or 0xB000 <= imm <= 0xB200
+RX_F = re.compile(r"c\.f\[(\d+)\]")
+
+
 # Loops that only wait for an interrupt to change a variable: they sleep instead of spinning (ps2_idle).
 # WaitUntilVSync, eWaitUntilRenderingDone twice: 75% of the game thread in a race at 30 fps.
 # MainLoop's wait for the next tick: 48% on a movie.
@@ -271,6 +337,8 @@ IDLE_LOOPS = {0x111d90, 0x111e00, 0x111f0c, 0x12f648}
 
 
 class FuncGen:
+    n_tested = 0
+
     def __init__(self, base, words, start, stop, funcs, jt_labels, names, hle=frozenset(), hooks=frozenset()):
         self.hle = hle
         self.hooks = hooks
@@ -393,6 +461,285 @@ class FuncGen:
         self.unimpl.add(n)
         return f"ps2_unimpl(c, 0x{a:x}, 0x{ins.word:08x});"
 
+    # ---- locals mode ---------------------------------------------------------
+    def stmt_l(self, a, ins):
+        """One non-control-flow instruction for the locals mode: (kind, text, registers).
+
+        The text is in the Ctx's terms still (c.r[4].d[0]); localize() turns it. kind: "pure" touches registers only as the text
+        says, "sync" sees the whole Ctx, "wide" is an MMI helper that reads and writes the given registers whole in the Ctx.
+        """
+        n, rs, rt, rd, sa = ins.name, ins.rs, ins.rt, ins.rd, ins.sa
+        S32, T32, T64 = f"c.r[{rs}].w[0]", f"c.r[{rt}].w[0]", f"c.r[{rt}].d[0]"
+        ea = f"(u32)({S32} + {ins.simm})"
+        p = 1 if n.endswith("1") else 0
+        base = n[:-1] if p else n
+        if base in ("mult", "multu", "madd", "maddu") and not n.startswith("p"):
+            call = f"opl_{base}(c, {S32}, {T32}, {p})"
+            return "pure", (f"c.r[{rd}].d[0] = {call};" if rd else f"{call};"), ()
+        if base in ("div", "divu") and not n.startswith("p"):
+            return "pure", f"opl_{base}(c, {S32}, {T32}, {p});", ()
+        if n in ("lwl", "lwr", "ldl", "ldr"):
+            return "pure", (f"opl_{n}(c.r[{rt}], {ea});" if rt else ""), ((rt,) if rt else ())
+        if n in ("swl", "swr"):
+            return "pure", f"opl_{n}({T32}, {ea});", ()
+        if n in ("sdl", "sdr"):
+            return "pure", f"opl_{n}({T64}, {ea});", ()
+        if n.endswith(".s") or n == "cvt.s.w":
+            return "pure", f"FPL_{n.replace('.', '_')}(c, c.f[{sa}], c.f[{rd}], c.f[{rt}]);", ()
+        text = self.stmt(a, ins)
+        if n in SYNC_OPS or text.startswith("ps2_unimpl"):
+            return "sync", text, ()
+        if text.startswith("MMI_"):
+            return "wide", text, tuple(sorted({rd, rs, rt} - {0}))
+        return "pure", text, ()
+
+    def gen_l(self):
+        labels = set(self.jt)
+        a = self.start
+        while a < self.stop:
+            ins = decode(self.w(a))
+            if ins.name in BRANCHES:
+                t = a + 4 + ins.simm * 4
+                if self.inside(t):
+                    labels.add(t)
+            elif ins.name == "j":
+                t = ((a + 4) & 0xF0000000) | ins.target
+                if self.inside(t):
+                    labels.add(t)
+            a += 4
+        name = self.names.get(self.start, "")
+        hooked = name in self.hooks
+        head = [f"// {name}" if name else f"// sub_{self.start:08x}"]
+        if name in self.hle:
+            return head + [f"void {cname(self.start)}(Ctx &c) {{ HLE_{name}(c); }}\n"]
+        used_g, used_f, def_g, def_f, wide = set(), set(), set(), set(), set()
+        # tested accesses for the whole function: it holds a listed instruction, lies in a listed range, or makes an address of the
+        # hardware's or of a mirror itself
+        tested = (any(lo < self.stop and self.start < hi for lo, hi in SLOW_RANGES) or any(self.start <= x < self.stop for x in SLOW_SITES)
+                  or any(i.name == "lui" and io_constant(i.imm) for i in (decode(self.w(x)) for x in range(self.start, self.stop, 4))))
+        FuncGen.n_tested += tested
+
+        sp_used = [False]
+
+        def loc(text):
+            """(the text with the function's locals for the Ctx's registers, the registers it writes); notes which are used, used whole"""
+            text, n = RX_SP.subn(lambda m: f"P{m.group(1)}(sph + ({m.group(2)})", text)
+            if n:
+                sp_used[0] = True
+                used_g.add(29)
+            if RX_SPDEF.search(text):
+                text += " SPH"
+            dg = {int(m) for m in RX_GDEF.findall(text)} - {0}
+            df = {int(m) for m in RX_FDEF.findall(text)}
+            def_g.update(dg)
+            def_f.update(df)
+            wide.update(int(m) for m in RX_GWIDE.findall(text))
+            used_g.update(int(m) for m in RX_G.findall(text))
+            used_f.update(int(m) for m in RX_F.findall(text))
+            text = RX_F.sub(lambda m: f"f_{m.group(1)}", RX_G.sub(lambda m: f"r_{m.group(1)}", text))
+            return text, {("g", r) for r in dg} | {("f", r) for r in df}
+
+        # The function as a flat list of steps, so that what each flush has to store can be worked out before the text is written:
+        #   ("pure", text, written)  a statement on the locals         ("raw", text)     text that touches no register
+        #   ("sync", text)           flush, text (a call), take back   ("tail", text)    flush, text, return
+        #   ("ret",)                 flush, return                     ("irq",)          if an interrupt waits: flush, take it, take back
+        #   ("goto", address)        ("label", address)                ("if", condition) ... ("endif",)
+        #   ("switch", addresses)    a jump table over the local t; any other address is flushed and called
+        def st(a, ins):
+            kind, text, regs = self.stmt_l(a, ins)
+            if kind == "pure":
+                text, d = loc(text)
+                if MEM_MODE == "sites":
+                    text = RX_MEM.sub(lambda m: f"X{m.group(1)}(0x{a:x}, ", text)
+                elif MEM_MODE == "direct" and not tested:
+                    text = RX_MEM.sub(lambda m: f"U{m.group(1)}(", text)
+                regs = set(regs) - {0}
+                def_g.update(regs)
+                d |= {("g", r) for r in regs}
+                if ins.name.endswith(".s") or ins.name == "cvt.s.w":
+                    def_f.add(ins.sa)
+                    d.add(("f", ins.sa))
+                return [("pure", text, d)] if text else []
+            if kind == "sync":
+                return [("sync", text)]
+            # an MMI helper: its registers go to the Ctx whole, it works there, its result comes back whole
+            wide.update(regs)
+            used_g.update(regs)
+            if ins.rd:
+                def_g.add(ins.rd)
+            out = " ".join(f"c.r[{r}].q = r_{r}.q;" for r in regs)
+            back = f" r_{ins.rd}.q = c.r[{ins.rd}].q;" if ins.rd else ""
+            return [("pure", f"{out} {text}{back}", {("g", ins.rd)} if ins.rd else set())]
+
+        def goto(target, src=None):
+            if self.inside(target):
+                if src is not None and target <= src:
+                    # loop back-edges also take interrupts: games spin on VBlank counters
+                    if target in IDLE_LOOPS:
+                        return [("sync", "ps2_idle(c);"), ("goto", target)]
+                    return [("irq",), ("goto", target)]
+                return [("goto", target)]
+            return [("tail", self.call(target))]
+
+        ops = []
+        a = self.start
+        while a < self.stop:
+            if a in labels:
+                ops.append(("label", a))
+            ins = decode(self.w(a))
+            n = ins.name
+            is_ctl = n in BRANCHES or n in ("j", "jal", "jr", "jalr")
+            if not is_ctl:
+                ops += st(a, ins)
+                a += 4
+                continue
+            ds_addr = a + 4
+            # the condition and the jump's register are read before the delay slot runs, as they are in the old way
+            ds = st(ds_addr, decode(self.w(ds_addr))) if ds_addr < self.stop else []
+            after = a + 8
+            if n in BRANCHES:
+                t = a + 4 + ins.simm * 4
+                link = n in ("bltzal", "bgezal")
+                cond = loc(self.cond(ins))[0]
+                if n in LIKELY:
+                    ops += [("if", cond)] + ds + goto(t, a) + [("endif",)]
+                elif link:
+                    ops += [("raw", f"{{ bool k = {cond};")] + ds + [("pure",) + loc(f"c.r[31].d[0] = 0x{after:x};"),
+                                                                  ("if", "k"), ("sync", self.call(t)), ("endif",), ("raw", "}")]
+                elif self.inside(t):
+                    ops += [("raw", f"{{ bool k = {cond};")] + ds + [("if", "k")] + goto(t, a) + [("endif",), ("raw", "}")]
+                else:
+                    # the old way's text, statement for statement: "if (k) F(c); return;"
+                    ops += [("raw", f"{{ bool k = {cond};")] + ds + [("if", "k"), ("sync", self.call(t)), ("endif",), ("ret",), ("raw", "}")]
+            elif n == "j":
+                t = ((a + 4) & 0xF0000000) | ins.target
+                ops += ds + goto(t, a)
+            elif n == "jal":
+                t = ((a + 4) & 0xF0000000) | ins.target
+                ops += ds + [("pure",) + loc(f"c.r[31].d[0] = 0x{after:x};"), ("sync", self.call(t))]
+            elif n == "jr":
+                if ins.rs == 31:
+                    ops += ds + [("ret",)]
+                else:
+                    ops += [("raw", "{ u32 t = " + loc(f"c.r[{ins.rs}].w[0]")[0] + ";")] + ds + [("switch", sorted(self.jt)), ("raw", "}")]
+            elif n == "jalr":
+                link = [("pure",) + loc(f"c.r[{ins.rd}].d[0] = 0x{after:x};")] if ins.rd else []
+                ops += [("raw", "{ u32 t = " + loc(f"c.r[{ins.rs}].w[0]")[0] + ";")] + ds + link + [("sync", "ps2_call(c, t);"), ("raw", "}")]
+            if ds_addr in labels:
+                ops.append(("goto", after) if after < self.stop else ("ret",))
+                ops += [("label", ds_addr)] + ds
+                labels.add(after)
+            a = after
+        ops.append(("tail", self.call(self.stop)))      # falls through
+        there = {op[1] for op in ops if op[0] == "label"}
+        for op in list(ops):
+            for lab in ((op[1],) if op[0] == "goto" else op[1] if op[0] == "switch" else ()):
+                if lab not in there:
+                    there.add(lab)
+                    ops += [("label", lab), ("ret",)]
+        used_g.discard(0)
+        def_g.discard(0)
+
+        # What a flush has to store: the registers written since the Ctx last had them, on any way to it. The rest are in the Ctx as
+        # the locals have them (RL takes every register the function uses), so the old "everything the function writes" was two stores
+        # in three for nothing. Forward over the steps till nothing changes; a label's set is the union of the ways into it.
+        every = {("g", r) for r in def_g} | {("f", r) for r in def_f}
+        at_label = {}
+        flush = [None] * len(ops)
+        changed = True
+        while changed:
+            changed = False
+            cur, live, stack = set(), True, []
+
+            def into(lab):
+                nonlocal changed
+                s = at_label.setdefault(lab, set())
+                if not cur <= s:
+                    s |= cur
+                    changed = True
+
+            for i, op in enumerate(ops):
+                k = op[0]
+                if k == "label":
+                    if live:
+                        into(op[1])
+                    cur, live = set(at_label.setdefault(op[1], set())), True
+                elif k == "endif":
+                    saved, was = stack.pop()
+                    cur, live = (cur | saved if live else saved), was
+                elif not live:
+                    flush[i] = every        # not reached: after a return and before the next label
+                    if k == "if":
+                        stack.append((set(every), False))
+                elif k == "pure":
+                    cur = cur | op[2]
+                elif k == "sync":
+                    flush[i], cur = frozenset(cur), set()
+                elif k == "irq":
+                    flush[i] = frozenset(cur)
+                elif k in ("ret", "tail"):
+                    flush[i], live = frozenset(cur), False
+                elif k == "goto":
+                    into(op[1])
+                    live = False
+                elif k == "switch":
+                    flush[i] = frozenset(cur)
+                    for lab in op[1]:
+                        into(lab)
+                    live = False
+                elif k == "if":
+                    stack.append((set(cur), True))
+
+        # a register is whole (128 bits) in its local where the function uses it so, else its low half is all the function touches
+        def part(r):
+            return "q" if r in wide else "d[0]"
+
+        def fl(d):
+            return " ".join([f"c.r[{r}].{part(r)} = r_{r}.{part(r)};" for r in sorted(r for t, r in d if t == "g" and r)]
+                            + [f"c.f[{r}].u = f_{r}.u;" for r in sorted(r for t, r in d if t == "f")])
+
+        o = []
+        for i, op in enumerate(ops):
+            k = op[0]
+            if k == "label":
+                o.append(f"L_{op[1]:x}:;")
+            elif k in ("pure", "raw"):
+                o.append("    " + op[1])
+            elif k == "sync":
+                o.append(f"    {fl(flush[i])} {op[1]} RL")
+            elif k == "tail":
+                o.append(f"    {fl(flush[i])} {op[1]} return;")
+            elif k == "ret":
+                o.append(f"    {fl(flush[i])} return;")
+            elif k == "irq":
+                o.append(f"    if (g_irq_pending) {{ {fl(flush[i])} ps2_take_interrupts(c); RL }}")
+            elif k == "goto":
+                o.append(f"    goto L_{op[1]:x};")
+            elif k == "if":
+                o.append(f"    if ({op[1]}) {{")
+            elif k == "endif":
+                o.append("    }")
+            elif k == "switch":
+                cases = " ".join(f"case 0x{x:x}: goto L_{x:x};" for x in op[1])
+                o.append(f"    switch (t) {{ {cases} default: {fl(flush[i])} ps2_call(c, t); return; }}")
+
+        rl = " ".join([f"r_{r}.{part(r)} = c.r[{r}].{part(r)};" for r in sorted(used_g)] + [f"f_{r}.u = c.f[{r}].u;" for r in sorted(used_f)])
+        sph = ("sph = g_ram + r_29.w[0];" if MEM_MODE == "direct" else "sph = host(r_29.w[0]);") if sp_used[0] else ""
+        if sp_used[0]:
+            rl += " SPH"
+        decl = "    GPR r_0 = {};" + (" u8 *sph;" if sp_used[0] else "")
+        if used_g:
+            decl += " GPR " + ", ".join(f"r_{r}" for r in sorted(used_g)) + ";"
+        if used_f:
+            decl += " FPR " + ", ".join(f"f_{r}" for r in sorted(used_f)) + ";"
+        out = head + [f"#define SPH {sph}", f"#define RL {rl}",
+                      f"void {cname(self.start)}{'_orig' if hooked else ''}(Ctx &__restrict c)\n{{",
+                      "    if (g_irq_pending) ps2_take_interrupts(c);", decl, "    (void)r_0; RL"] + o + ["}", "#undef RL", "#undef SPH", ""]
+        if hooked:
+            out.append(f"void HOOK_{name}(Ctx &c, void (*orig)(Ctx &));")
+            out.append(f"void {cname(self.start)}(Ctx &c) {{ HOOK_{name}(c, {cname(self.start)}_orig); }}\n")
+        return out
+
     def cond(self, ins):
         n, S, T = ins.name, f"c.r[{ins.rs}].d[0]", f"c.r[{ins.rt}].d[0]"
         return {
@@ -425,6 +772,8 @@ class FuncGen:
         return f"ps2_call(c, 0x{target:x});"
 
     def gen(self):
+        if LOCALS:
+            return self.gen_l()
         labels = set(self.jt)
         a = self.start
         while a < self.stop:
@@ -565,7 +914,7 @@ def main():
     tab += [f"    {{0x{s:x}, {cname(s)}}}," for s in entries]
     tab += ["};", f"const int g_functable_size = {len(entries)};", ""]
     write_if_changed(os.path.join(OUT, "functable.cpp"), "\n".join(tab))
-    print(f"functions {len(starts)} (+{len(extra)} leaf entries)  files {files}  jump-table funcs {len(jt)}  "
+    print(f"functions {len(starts)} (+{len(extra)} leaf entries)  files {files}  jump-table funcs {len(jt)}  memory {MEM_MODE}, tested in {FuncGen.n_tested}  "
           f"named {sum(1 for s in starts if s in names)}")
     if unimpl:
         print("unimplemented:", " ".join(sorted(unimpl)))

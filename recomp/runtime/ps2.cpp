@@ -7,6 +7,7 @@
 #include "setup_iso.h"
 #include "setup.h"
 #include "host.h"
+#include "layouts_patch.h"
 
 #include <chrono>
 #include <cstdio>
@@ -31,10 +32,68 @@
 #include <sys/mman.h>
 #endif
 
-alignas(64) u8 g_ram[0x02000000 + 64];
+#ifdef HP2_MEM4G
+// An access of the game's code to an address that is not memory, from code that reaches memory with no test: an instruction that
+// recomp/runtime/slow_sites.txt should list. Said before the program dies of it.
+static LONG CALLBACK mem_stray(EXCEPTION_POINTERS *e)
+{
+    const EXCEPTION_RECORD *r = e->ExceptionRecord;
+    if (r->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || r->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
+    const uintptr_t at = (uintptr_t)r->ExceptionInformation[1], base = (uintptr_t)g_ram;
+    if (at < base || at - base >= 0x100010000ull) return EXCEPTION_CONTINUE_SEARCH;
+    static bool told;
+    if (!told) {
+        told = true;
+        char text[256];
+        snprintf(text, sizeof text, "memory: the game's code %s %08x, which is not memory, at image + %llx: an instruction for slow_sites.txt",
+                 r->ExceptionInformation[0] == 1 ? "wrote to" : "read", (unsigned)(at - base),
+                 (unsigned long long)((uintptr_t)r->ExceptionAddress - (uintptr_t)GetModuleHandleA(nullptr)));
+        fprintf(stderr, "%s\n", text);
+        fflush(stderr);
+        host_fatal(text);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// The 4 GB of the game's addresses (ps2.h). The array is in the image up to guest 0x1200FFFF; of it the hardware's registers lose
+// their access (the VU's memory among them keeps it). What follows the image is reserved up to the end, the scratchpad given memory.
+void mem_reserve()
+{
+    DWORD old;
+    bool ok = ((uintptr_t)g_ram & 4095) == 0;
+    ok = ok && VirtualProtect(g_ram + 0x10000000u, 0x01000000, PAGE_NOACCESS, &old);
+    ok = ok && VirtualProtect(g_ram + 0x11010000u, 0x01000000, PAGE_NOACCESS, &old);
+    const u8 *image = (const u8 *)GetModuleHandleA(nullptr);
+    const IMAGE_NT_HEADERS *nt = (const IMAGE_NT_HEADERS *)(image + ((const IMAGE_DOS_HEADER *)image)->e_lfanew);
+    const uintptr_t from = ((uintptr_t)image + nt->OptionalHeader.SizeOfImage + 0xFFFF) & ~(uintptr_t)0xFFFF;
+    const uintptr_t end = (uintptr_t)g_ram + 0x100010000ull;    // and a little past the end, for an access that begins at the last address
+    ok = ok && from <= (uintptr_t)g_ram + 0x20000000u;          // nothing of the image where the mirrors and the scratchpad are
+    ok = ok && VirtualAlloc((void *)from, end - from, MEM_RESERVE, PAGE_NOACCESS) != nullptr;
+    ok = ok && VirtualAlloc(g_spr, 0x10000, MEM_COMMIT, PAGE_READWRITE) != nullptr;
+    if (!ok) {
+        MessageBoxA(nullptr, "The game could not reserve its memory (4 GB of address space after the program).", "NFS Hot Pursuit 2", MB_ICONERROR);
+        ExitProcess(1);
+    }
+    AddVectoredExceptionHandler(0, mem_stray);
+}
+
+#else
+alignas(4096) u8 g_ram[0x10000000 + 64];    // on a page of its own from the start: memwatch.cpp protects its pages
 alignas(64) u8 g_spr[0x4000 + 64];
 alignas(64) u8 g_vumem[0x10000 + 64];
-u8 *g_ext;
+#endif
+
+// gen.py --sites: an instruction of the game's whose access was not in the block or the scratchpad, each once to HP2_SITELOG
+void mem_site(u32 pc)
+{
+    static u8 seen[0x200000 / 4];                       // the program is 0x100000 to 0x2D...: one byte an instruction
+    const u32 i = (pc - 0x100000) >> 2;
+    if (i >= sizeof seen || seen[i]) return;
+    seen[i] = 1;
+    static FILE *f = getenv("HP2_SITELOG") ? fopen(getenv("HP2_SITELOG"), "a") : nullptr;
+    if (f) fprintf(f, "%x\n", pc), fflush(f);
+}
+u8 *g_ext = g_ram + EXT_BASE;
 uint8_t g_ee_booth16[8192];     // eefloat.h
 EeDivEntry g_ee_div_cache[4096];
 EeSqrtEntry g_ee_sqrt_cache[4096];
@@ -42,25 +101,53 @@ uint8_t g_ee_recip_up[1 << 20], g_ee_sqrt_up[1 << 21];
 std::atomic<bool> g_ee_tables;
 u32 g_ext_size;
 
-// the memory past 32 MB (ps2.h): the whole range reserved at the first call, then [off, off + bytes) committed (64 KB steps), never given
-// back. g_ext_size is where the range ends that host() takes as this memory.
+// the memory past 32 MB (ps2.h): part of g_ram's block, so there is nothing to reserve; g_ext_size is where the part in use ends (what
+// the DMA and the native memory helpers take as this memory)
 bool ext_commit(u32 off, u32 bytes)
 {
     u32 from = off & ~0xFFFFu, to = (off + bytes + 0xFFFF) & ~0xFFFFu;
     if (to > EXT_MAX || to <= from) return false;
-#ifdef _WIN32
-    if (!g_ext) g_ext = (u8 *)VirtualAlloc(nullptr, EXT_MAX, MEM_RESERVE, PAGE_NOACCESS);
-    if (!g_ext || !VirtualAlloc(g_ext + from, to - from, MEM_COMMIT, PAGE_READWRITE)) return false;
-#else
-    if (!g_ext) {
-        void *m = mmap(nullptr, EXT_MAX, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-        if (m == MAP_FAILED) return false;
-        g_ext = (u8 *)m;
-    }
-    if (mprotect(g_ext + from, to - from, PROT_READ | PROT_WRITE)) return false;
-#endif
     if (to > g_ext_size) g_ext_size = to;
     return true;
+}
+
+// host()'s rare cases: the mirrors of the block and the VU's memory
+u8 *host_slow(u32 a)
+{
+    const u32 top = a >> 28;
+    if (top == 7) return nullptr;
+    const u32 p = (top == 2 || top == 3) ? (a & 0x01FFFFFF) : (a & 0x1FFFFFFF);
+    if (p < 0x02000000) {
+        // uncached views of the PC's memory, else the 32 MB's mirror
+        if (top == 2 || top == 3) {
+            const u32 e = (a & 0x0FFFFFFF) - EXT_BASE;
+            if (e < g_ext_size) return g_ext + e;
+        }
+        return g_ram + p;
+    }
+    if (p - EXT_BASE < g_ext_size) return g_ext + (p - EXT_BASE);
+    if (p - 0x11000000u < 0x10000u) return g_vumem + (p - 0x11000000u);
+    return nullptr;
+}
+
+// what host() leaves: a mirror or the VU's memory by host_slow, else I/O
+u64 mem_read_slow(u32 a, int size)
+{
+    if (const u8 *p = host_slow(a)) {
+        u64 v = 0;
+        memcpy(&v, p, (size_t)size);
+        return v;
+    }
+    return io_read(a, size);
+}
+
+void mem_write_slow(u32 a, u64 v, int size)
+{
+    if (u8 *p = host_slow(a)) {
+        memcpy(p, &v, (size_t)size);
+        return;
+    }
+    io_write(a, v, size);
 }
 
 static FILE *g_log = stderr;
@@ -207,8 +294,10 @@ static void start_vblank_timer()
 {
     std::thread([] {
         auto next = std::chrono::steady_clock::now();
+        // HP2_VBLANKUS=<microseconds>: a shorter field for checking runs, a replay's steps are the same at any speed
+        static const int field = getenv("HP2_VBLANKUS") ? atoi(getenv("HP2_VBLANKUS")) : 16683;
         for (;;) {
-            next += std::chrono::microseconds(16683);       // NTSC field rate
+            next += std::chrono::microseconds(field);       // NTSC field rate
             std::this_thread::sleep_until(next);
             peek();
             gs_vblank();
@@ -460,11 +549,31 @@ static void ee_float_mode()
 
 void ee_float_mode_here() { ee_float_mode(); }
 
+#ifdef EE_CHECK
+int g_ee_chk = getenv("HP2_EECHK") ? atoi(getenv("HP2_EECHK")) : 7;
+// TEMP (-DEE_CHECK, eefloat.h): what the fast arithmetic gives other than the model, by kind and by what kind of difference
+void ee_check_report(int kind, uint32_t a, uint32_t b, uint32_t fast, uint32_t model)
+{
+    static const char *const kKind[6] = {"add", "mul", "div", "sqrt", "add4", "mul4"};
+    static std::atomic<unsigned> zero_sign[6], overflow[6], other[6];
+    const bool zs = !((fast | model) & 0x7fffffffu);
+    const bool ov = (a & 0x7f800000u) == 0x7f800000u || (b & 0x7f800000u) == 0x7f800000u || (model & 0x7f800000u) == 0x7f800000u;
+    std::atomic<unsigned> &n = ov ? overflow[kind] : zs ? zero_sign[kind] : other[kind];
+    const unsigned seen = n++;
+    if (seen < 6 || (seen & (seen + 1)) == 0)
+        fprintf(stderr, "eecheck: %s %08x %08x: fast %08x, model %08x (%s, %u of its kind)\n", kKind[kind], a, b, fast, model,
+                ov ? "past the host's range" : zs ? "the sign of zero" : "a value", seen + 1);
+}
+#endif
+
+void hot_math_selftest();
+
 int main()
 {
+    mem_reserve();
     // the first start, or the game installed beside this exe: the game runs from its own folder
     if (setup_start() != SETUP_PLAY) return 0;
-    host_log_start();
+    host_log_start(pc_config_log());
     if (!disc_open()) {
         host_fatal("The game's data was not found: the data folder (with data\\IRX253\\STREAM.IRX) must be next to the game.");
         return 1;
@@ -475,6 +584,10 @@ int main()
         host_fatal("The game's program, data\\SLUS_203.62, is missing or is not one the port knows. Install the game again from the disc image.");
         return 1;
     }
+    // The gamepad's layouts: Silent's "Trigger control mappings" (layouts_patch.h), words of the program's tables of controller setups.
+    // With it the DualShock 2 has eight setups, four with the throttle and the brake on the triggers. HP2_NOLAYOUTS: the game's four.
+    if (!getenv("HP2_NOLAYOUTS"))
+        for (const auto &w : kLayoutsPatch) SW(w[0], w[1]);
     fprintf(g_log, "entry %08x\n", entry);
     profile_start();
     start_vblank_timer();
@@ -490,6 +603,7 @@ int main()
     c.vf[0].f[3] = 1.0f;
     ee_float_mode();
     ee_float_init();
+    hot_math_selftest();                    // HP2_AABBTEST
     std::thread([] {
         ee_float_mode();
         const auto t0 = std::chrono::steady_clock::now();

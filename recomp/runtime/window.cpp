@@ -1,6 +1,7 @@
 // The Win32 window, the keyboard and the gamepads. The renderer draws to the window itself (native_vk.cpp).
 #include "hw.h"
 #include "pcconfig.h"
+#include "host.h"
 #include "pcmenu.h"
 #include "pad.h"
 #include "native.h"
@@ -94,8 +95,12 @@ void window_relaunch(const std::string &profile)
     char path[MAX_PATH];
     GetModuleFileNameA(nullptr, path, MAX_PATH);
     SetEnvironmentVariableA("HP2_PROFILE", profile.c_str());
+    // The new one starts as from the desktop: no standard handles (this one's are the log's pipe, whose numbers mean nothing there), and
+    // speed.log free for it to open.
+    host_log_close();
     STARTUPINFOA si = {};
     si.cb = sizeof si;
+    si.dwFlags = STARTF_USESTDHANDLES;
     PROCESS_INFORMATION pi = {};
     if (CreateProcessA(path, nullptr, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
         CloseHandle(pi.hThread);
@@ -173,6 +178,11 @@ static int text_char(int vk, bool shift)
     if (vk == VK_SPACE) return ' ';
     if (vk == VK_OEM_PERIOD || vk == VK_DECIMAL) return shift ? 0 : '.';
     if (vk == VK_BACK) return 8;
+    if (vk == VK_DELETE) return 127;
+    if (vk == VK_LEFT) return 1;                    // the cursor in the name
+    if (vk == VK_RIGHT) return 2;
+    if (vk == VK_HOME) return 3;
+    if (vk == VK_END) return 4;
     if (vk == VK_RETURN) return 13;
     if (vk == VK_ESCAPE) return 27;
     return 0;
@@ -187,12 +197,23 @@ int window_text_next()
     return ch;
 }
 
-void window_text_begin()
+// While a name is picked on the letter grid the keyboard's letters are kept: the first one says the player is back at the keyboard, and
+// is the first typed (window_text_begin(true)). Enter, Esc and the keys that move are not: they only bring the keyboard back.
+static std::atomic<bool> g_text_armed;
+
+void window_text_arm(bool on)
 {
-    g_text_out = g_text_in.load();
+    if (on && !g_text_armed) g_text_out = g_text_in.load();
+    g_text_armed = on;
+}
+
+void window_text_begin(bool keep)
+{
+    if (!keep) g_text_out = g_text_in.load();
     g_text_script_fresh = true;
-    g_text_enter_free = false;
-    g_text_esc_free = false;
+    // only a key that is down now is the one that opened the typing: any other counts at its first press
+    g_text_enter_free = !(GetAsyncKeyState(VK_RETURN) & 0x8000);
+    g_text_esc_free = !(GetAsyncKeyState(VK_ESCAPE) & 0x8000);
     g_text_on = true;
 }
 
@@ -217,6 +238,7 @@ int window_wheel()
 
 static std::atomic<int> g_input_kind;       // 0 the keyboard and mouse, 1 a gamepad
 int window_input_kind() { return g_input_kind; }
+
 // When the mouse last moved or clicked, by GetTickCount64; 0: not yet, or a key or a pad button since. The pointer shows for 3 seconds after
 // it (window_pad), so it is there for whoever uses the mouse and gone for whoever does not.
 static std::atomic<unsigned long long> g_mouse_at;
@@ -231,6 +253,9 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         if (g_text_on)
             if (const int ch = text_char((int)wp, (GetKeyState(VK_SHIFT) & 0x8000) != 0))
                 if ((ch != 13 || g_text_enter_free) && (ch != 27 || g_text_esc_free)) text_push(ch);
+        if (!g_text_on && g_text_armed && !(lp & 1 << 30))
+            if (const int ch = text_char((int)wp, (GetKeyState(VK_SHIFT) & 0x8000) != 0))
+                if (ch >= 32 && ch < 127) text_push(ch);
         break;
     case WM_KEYUP:
         if (wp == VK_RETURN) g_text_enter_free = true;
@@ -279,6 +304,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp)
         return 0;
     case WM_ACTIVATE:
         apply_cursor(h);
+        pad_rumble_quiet(LOWORD(wp) == WA_INACTIVE);    // a pad does not shake for a game behind another window
         break;
     case WM_SETCURSOR:
         if (LOWORD(lp) == HTCLIENT) {
@@ -289,6 +315,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp)
     case WM_DESTROY:
         window_rumble(0, 0);            // a pad's motors outlive the program
         pad_settle(150);                // the pads' thread tells them
+        host_log_flush();
         ExitProcess(0);
     }
     return DefWindowProcA(h, m, wp, lp);
@@ -390,6 +417,21 @@ static const struct { int bit, pressure; } kPadBit[PCB_COUNT] = {
 
 // which gamepad a player has
 static int pad_slot(int port) { return g_cfg.player2 ? 1 - port : port; }
+
+// Delete on the keyboard, Square (X on an Xbox pad) on the first gamepad: true once for each press, while the game's window has the input.
+// Asked once a frame by the screen that deletes with it (the profiles).
+bool window_delete_pressed()
+{
+    static bool was;
+    bool now = false;
+    if (g_hwnd && (g_key_script_on || GetForegroundWindow() == g_hwnd)) {
+        const PadState a = pad_read(0), b = pad_read(1);      // either gamepad, as the menus take them
+        now = key(VK_DELETE) || (a.ok && (a.mask & 0x4000)) || (b.ok && (b.mask & 0x4000));
+    }
+    const bool pressed = now && !was;
+    was = now;
+    return pressed;
+}
 
 void window_rumble_port(int port, int small, int large) { pad_rumble(pad_slot(port), small, large); }
 void window_rumble(int small, int large)
@@ -499,11 +541,29 @@ void window_cursor_frame()
     const unsigned long long mouse_at = g_mouse_at;
     const bool cursor = pc_cursor_wanted() && mouse_at && (long long)(GetTickCount64() - mouse_at) < 3000;
     static const bool log = getenv("HP2_NATIVELOG") != nullptr;
+    if (log) {                              // the wish itself, whether or not a mouse is there
+        static int was = -1, flips;
+        const int now = pc_cursor_wanted() ? 1 : 0;
+        if (now != was && ++flips < 200) fprintf(stderr, "pointer: the screen %s one, replay %d, car input %d\n", now ? "takes" : "takes no", (int)pc_replay_playing(), (int)pc_car_input());
+        was = now;
+    }
     if (g_cursor_on != cursor) {
         g_cursor_on = cursor;
         PostMessageA(g_hwnd, WM_CURSORSTATE, 0, 0);
         if (log) fprintf(stderr, "pointer: %s at %.1f s\n", cursor ? "wanted" : "not wanted", GetTickCount64() % 1000000 / 1000.0);
     }
+}
+
+// A zone camera's key: on a pad it is Triangle held and L2 (Zone Freeze) or R2 (Zone Zoom) pressed with it, the same in every layout.
+// The key holds Triangle and, two reads later, the second button with it, as fingers would.
+template <class Press> static void zone_keys(bool down, int which, int &held, Press &press)
+{
+    if (!down) {
+        held = 0;
+        return;
+    }
+    press(PCB_TRIANGLE, 0xFF);
+    if (++held > 2) press(which ? PCB_R2 : PCB_L2, 0xFF);
 }
 
 u16 window_pad(u8 sticks[4], u8 pressure[12])
@@ -520,6 +580,10 @@ u16 window_pad(u8 sticks[4], u8 pressure[12])
     }
     sticks[0] = sticks[1] = sticks[2] = sticks[3] = 0x80;
     memset(pressure, 0, 12);
+    // A pad shakes for the player who holds it: with one player, while the gamepad is the device used last (driving on the keyboard
+    // leaves a pad on the desk still); with two, each has their own.
+    pad_rumble_gate(pad_slot(0), pc_two_player_race() || g_input_kind == 1);
+    pad_rumble_gate(pad_slot(1), true);
     // HP2_AUTOPRESS=<start s>,<interval s>: tap cross (and start) on a timer, for
     // walking through the menus with defaults without anyone at the keyboard
     static const char *autop = getenv("HP2_AUTOPRESS");
@@ -559,6 +623,11 @@ u16 window_pad(u8 sticks[4], u8 pressure[12])
     }
     if (g_text_on) {
         esc_held = true;
+        // a gamepad's button says the player has moved to it: whoever types offers it its own way (the letter grid)
+        {
+            const PadState a = pad_read(0), b = pad_read(1);
+            if ((a.ok && a.mask) || (b.ok && b.mask) || (g_key_script_on && g_script_key[0xFF])) g_input_kind = 1;
+        }
         static const bool by_window = getenv("HP2_TYPEBYWINDOW") != nullptr;     // a test that posts the window's own messages
         if (g_key_script_on && !by_window) {    // the same keys from a test's script, by their edges
             static bool was[256];
@@ -578,7 +647,7 @@ u16 window_pad(u8 sticks[4], u8 pressure[12])
     }
     if (g_cap_release) {
         bool held = false;
-        for (int vk = 8; vk < 256 && !held; vk++) held = key(vk);
+        for (int vk = 8; vk < 0xFE && !held; vk++) held = key(vk);     // not the test script's two "as if a gamepad" marks
         PadState a = pad_read(0), b = pad_read(1);
         if (held || (a.ok && a.mask) || (b.ok && b.mask)) return 0xFFFF;
         g_cap_release = false;
@@ -627,16 +696,23 @@ u16 window_pad(u8 sticks[4], u8 pressure[12])
         return true;
     };
     g_keys_shared = keys_shared(driving);
+    pc_keyboard_layout(0, driving && g_input_kind != 1);
     const bool shared_driving = g_keys_shared == KEYS_SHARED_DRIVING, shared_menu = g_keys_shared == KEYS_SHARED_MENU;
     auto drive_on = [&](int vk) { return !(shared_driving && is_key2(vk)) && key_on(vk); };
     auto menu_key = [&](int b) { return shared_menu ? pc_menu_key_split(0, b) : pc_menu_key(b); };
     bool enter = !shared_menu && key_on(VK_RETURN);
     if (driving) {
+        // a key is an action, pressed as the button that has it in the keyboard's own layout (pc_keyboard_layout)
         for (int b = 0; b < PCB_COUNT; b++)
             if (drive_on(g_cfg.key[b][0]) || drive_on(g_cfg.key[b][1])) press(b, 0xFF);
-        if (drive_on(g_cfg.key[PCB_LEFT][0]) || drive_on(g_cfg.key[PCB_LEFT][1])) sticks[2] = 0x00;
-        if (drive_on(g_cfg.key[PCB_RIGHT][0]) || drive_on(g_cfg.key[PCB_RIGHT][1])) sticks[2] = 0xFF;
-        if (enter) press(PCB_CROSS, 0xFF);  // what the screens inside a race (the briefing) wait for
+        static int zone_held[2];
+        for (int z = 0; z < 2; z++) zone_keys(drive_on(g_cfg.key_zone[z][0]) || drive_on(g_cfg.key_zone[z][1]), z, zone_held[z], press);
+        // Steering is the two keys' buttons alone (the D-pad's Left and Right, JOY_EVENT_STEER): the game's own digital steering, which
+        // turns the wheel at its own rate. The stick is left in the middle: pushed to its end with the key, as it used to be, it was the
+        // analog steering at full lock at once.
+        // Enter is no key of the car's: in the race it does nothing (it was Cross, the throttle or the brake by the gamepad's layout).
+        // Where the game waits to go on, before the start and after the finish, it is the button waited for.
+        if (enter && pc_skip_wanted()) press(PCB_CROSS, 0xFF);
     } else {
         for (int b = 0; b < PCB_COUNT; b++)
             if (b != PCB_TRIANGLE && b != PCB_START && key_on(menu_key(b))) press(b, 0xFF);
@@ -645,7 +721,7 @@ u16 window_pad(u8 sticks[4], u8 pressure[12])
         if (key_on(menu_key(PCB_UP))) sticks[3] = 0x00;
         if (key_on(menu_key(PCB_DOWN))) sticks[3] = 0xFF;
     }
-    if (!driving) {
+    if (!driving || pc_replay_playing()) {      // a replay has the car's controls and a bar of buttons for the pointer
         int mouse = pc_mouse_buttons();
         for (int b = 0; b < PCB_COUNT; b++)
             if (mouse >> b & 1) {
@@ -671,6 +747,7 @@ u16 window_pad(u8 sticks[4], u8 pressure[12])
     }
     PadState ps = pad_read(pad_slot(0));
     g_pad_playstation = g_cfg.pad_icons ? g_cfg.pad_icons == 2 : pad_is_playstation(pad_slot(0));
+    g_layout_playstation = g_cfg.pad_icons ? g_cfg.pad_icons == 2 : !ps.ok || pad_is_playstation(pad_slot(0));
     if (ps.ok) {
         // a pad that is there when the game starts is the device, until a key says otherwise
         static bool first = true;
@@ -723,12 +800,13 @@ u16 window_pad2(u8 sticks[4], u8 pressure[12])
         if (p >= 0 && amount > pressure[p]) pressure[p] = (u8)amount;
     };
     const bool driving = pc_car_input();
+    pc_keyboard_layout(1, driving && g_keys_shared == KEYS_SHARED_DRIVING);
     if (g_keys_shared == KEYS_SHARED_DRIVING) {
         for (int b = 0; b < PCB_COUNT; b++)
             if (key(g_cfg.key2[b][0]) || key(g_cfg.key2[b][1])) press(b, 0xFF);
-        if (key(g_cfg.key2[PCB_LEFT][0]) || key(g_cfg.key2[PCB_LEFT][1])) sticks[2] = 0x00;
-        if (key(g_cfg.key2[PCB_RIGHT][0]) || key(g_cfg.key2[PCB_RIGHT][1])) sticks[2] = 0xFF;
-        if (key(VK_RETURN) && !key(VK_MENU)) press(PCB_CROSS, 0xFF);     // as player 1 has it: the briefing
+        static int zone_held[2];
+        for (int z = 0; z < 2; z++) zone_keys(key(g_cfg.key2_zone[z][0]) || key(g_cfg.key2_zone[z][1]), z, zone_held[z], press);
+        if (key(VK_RETURN) && !key(VK_MENU) && pc_skip_wanted()) press(PCB_CROSS, 0xFF);    // as player 1 has it
     } else if (g_keys_shared == KEYS_SHARED_MENU) {
         for (int b = 0; b < PCB_COUNT; b++)
             if (key(pc_menu_key_split(1, b))) press(b, 0xFF);

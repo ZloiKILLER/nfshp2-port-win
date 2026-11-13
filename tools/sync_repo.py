@@ -22,16 +22,21 @@ LIST = [
     ("recomp/data", None),
     ("recomp/docs", None),
     ("recomp/symbols", None),
+    ("recomp/pgo/speed.profdata", None),        # the counts the release exe is built by (-DHP2_PGO=USE)
     ("tools/recomp/gen.py", None),
+    ("tools/recomp/gen_iop.py", None),
     ("tools/recomp/r5900.py", None),
     ("tools/recomp/make_lang.py", None),
+    ("tools/recomp/check_lang.py", None),
     ("tools/recomp/make_cursor.py", None),
+    ("tools/recomp/make_disc_patch.py", None),
+    ("tools/recomp/make_layouts.py", None),
     ("tools/match_func.py", None),
     ("tools/sync_repo.py", None),
     ("work/ref/sdl3/SDL3-3.4.18.tar.gz", "third_party/SDL3-3.4.18.tar.gz"),
 ]
 SKIP = {"recomp/runtime/elf_image.cpp"}         # no longer built: the program comes from the disc
-OWN = {"README.md", ".gitignore", ".gitattributes", ".git"}
+OWN = {"README.md", "TECHNICAL.md", ".gitignore", ".gitattributes", ".git"}
 
 
 def wanted():

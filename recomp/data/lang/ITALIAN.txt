@@ -67,6 +67,9 @@ Draw Distance	Distanza visiva
 How far away scenery still shows. 100% is the PS2's.	Fin dove resta visibile lo scenario. 100% come su PS2.
 Level of Detail	Livello di dettaglio
 Maximum: scenery and cars always at their most detailed models. Original: as on the PS2.	Massimo: scenario e auto sempre con i modelli più dettagliati. Originale: come su PS2.
+Reflections	Riflessi
+High	Alto
+The reflections on the cars. Advanced: new every frame. High: new every frame, at twice the resolution.	I riflessi sulle auto. Avanzate: aggiornati a ogni fotogramma. Alto: a ogni fotogramma, a risoluzione doppia.
 Show FPS	Mostra FPS
 Frames per second in the corner of the picture.	Fotogrammi al secondo nell'angolo dell'immagine.
 Advanced	Avanzate
@@ -218,3 +221,21 @@ R Stick	Levetta des
 #900005	Collega un@controller per il@giocatore %d.
 #900011	Collega un controller.
 #940001	Premi \x80 per partecipare a questo evento.
+Select, then press the key for it. Esc cancels.	Seleziona, poi premi il tasto. Esc annulla.
+Zone Freeze	Zona: fermo immagine
+Zone Zoom	Zona: zoom
+Select, then type its name. A gamepad gets the letter grid.	Seleziona, poi scrivi il nome. Con un controller appare la griglia di lettere.
+Capitals	Maiuscole
+Delete the profile %s? Its save and its controls will be gone.	Eliminare il profilo %s? Il salvataggio e i comandi andranno persi.
+The profile is made. Select it to play as it.	Il profilo è stato creato. Selezionalo per giocare con esso.
+Antialiasing	Antialiasing
+Smoother edges: off, MSAA or SMAA.	Bordi più morbidi: no, MSAA o SMAA.
+Off, MSAA (the scene drawn in samples) or SMAA (the picture's edges smoothed).	No, MSAA (la scena disegnata a campioni) o SMAA (i bordi dell'immagine smussati).
+Quality	Qualità
+MSAA: samples a pixel. SMAA: how far it looks along an edge.	MSAA: campioni per pixel. SMAA: quanto lontano guarda lungo un bordo.
+This graphics card has no more samples for the game.	Questa scheda grafica non ha più campioni per il gioco.
+The buttons for driving and the stick.	I pulsanti per guidare e la levetta.
+The gamepad's layouts, A to D: what each button does in a race.	Le configurazioni del controller, da A a D: cosa fa ogni pulsante in gara.
+Leave the game?	Uscire dal gioco?
+Pick the letters. The last key of the grid makes it.	Scegli le lettere. L'ultimo tasto della griglia conferma.
+Type the new name. Enter sets it, Esc leaves it.	Scrivi il nuovo nome. Invio conferma, Esc annulla.

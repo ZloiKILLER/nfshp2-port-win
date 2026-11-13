@@ -24,25 +24,25 @@ static std::string key_text(int (*keys)[2], int b)
     return s;
 }
 
-// the key goes to the button; a button that had it gets the key the button had (no key twice), the other player's too: in a race on one keyboard a key is one player's
-static void bind_key(int (*keys)[2], int (*other)[2], int b, int vk)
+// A row of the keyboard's page: an action's key (the first of the pair the file has room for; the second is not used). The rows are the PS2 buttons of layout A, by what each does, and after them the
+// two zone cameras.
+static const int kKeyRows = PCB_COUNT + 2;
+static int *key_row(bool p2, int row)
 {
-    int old = keys[b][0];
-    for (int o = 0; o < PCB_COUNT; o++)
-        for (int s = 0; s < 2; s++) {
-            if (o != b && keys[o][s] == vk) keys[o][s] = old;
-            if (other[o][s] == vk) other[o][s] = old;
-        }
-    if (keys[b][1] == vk) keys[b][1] = 0;
-    keys[b][0] = vk;
+    if (row < PCB_COUNT) return (p2 ? g_cfg.key2 : g_cfg.key)[row];
+    return (p2 ? g_cfg.key2_zone : g_cfg.key_zone)[row - PCB_COUNT];
 }
 
-static void bind_pad(int b, int mask)
+// An action has one key, and a key one action and one player: it leaves whatever had it.
+static void bind_key(bool p2, int row, int vk)
 {
-    int old = g_cfg.pad[b];
-    for (int o = 0; o < PCB_COUNT; o++)
-        if (o != b && (g_cfg.pad[o] & mask)) g_cfg.pad[o] = (g_cfg.pad[o] & ~mask) | old;
-    g_cfg.pad[b] = mask;
+    for (int who = 0; who < 2; who++)
+        for (int r = 0; r < kKeyRows; r++)
+            for (int k = 0; k < 2; k++)
+                if (key_row(who != 0, r)[k] == vk) key_row(who != 0, r)[k] = 0;
+    int *mine = key_row(p2, row);
+    mine[0] = vk;
+    mine[1] = 0;
 }
 
 static void poll_capture()
@@ -50,8 +50,7 @@ static void poll_capture()
     if (g_binding < 0) return;
     int code = 0, what = window_capture_poll(code);
     if (!what) return;
-    if (what == 1) bind_key(g_binding_p2 ? g_cfg.key2 : g_cfg.key, g_binding_p2 ? g_cfg.key : g_cfg.key2, g_binding, code);
-    else if (what == 2) bind_pad(g_binding, code);
+    if (what == 1) bind_key(g_binding_p2, g_binding, code);
     g_binding = -1;
     if (what != 3) pc_config_save();
     pc_set_blurb(what == 3 ? "Cancelled." : "Done. Select a row to bind it again.");
@@ -77,35 +76,34 @@ static int gpu_limit(int what)
     return what ? aniso : aa;
 }
 
-static void binding_page(const char *name, const char *title, bool pad, bool p2 = false)
+static std::string keys_text(const int *k) { return pc_key_name(k[0]); }
+
+// The keyboard's keys, by action. Esc pauses, always.
+static void binding_page(const char *name, const char *title, bool p2 = false)
 {
     PcPage &p = pc_add_page(name, title);
-    for (int b : kDriving) {
-        if (!pad && b == PCB_START) continue;       // the keyboard pauses with Esc, always
-        PcRow row{pc_button_action(b),
-                  pad ? "Select, then press the gamepad button. Esc cancels." : "Select, then press the key. Esc cancels.",
-                  [b, pad, p2] {
-                      if (g_binding == b && g_binding_p2 == p2) return std::string("Press...");
-                      return pad ? pc_pad_names(g_cfg.pad[b]) : key_text(p2 ? g_cfg.key2 : g_cfg.key, b);
-                  },
-                  [b, pad, p2](int) {
-                      g_binding = b;
-                      g_binding_p2 = p2;
-                      window_capture_begin(pad ? 2 : 1);
-                      pc_set_blurb(pad ? "Press a gamepad button. Esc cancels." : "Press a key. Esc cancels.");
-                  }};
-        row.select_only = true;
-        p.rows.push_back(row);
-    }
-    p.rows.push_back({"Reset to Default", pad ? "Put the gamepad's buttons back as they were." : "Put these keys back as they were.", nullptr, [pad, p2](int) {
-                          if (pad) {
-                              PcConfig fresh;
-                              memcpy(g_cfg.pad, fresh.pad, sizeof g_cfg.pad);
-                          } else if (p2) {
-                              g_cfg.default_keys2();
-                          } else {
-                              g_cfg.default_keys();
-                          }
+    auto add = [&p, p2](int row, const char *action) {
+        PcRow r{action, "Select, then press the key for it. Esc cancels.",
+                [row, p2] {
+                    if (g_binding == row && g_binding_p2 == p2) return std::string("Press...");
+                    return keys_text(key_row(p2, row));
+                },
+                [row, p2](int) {
+                    g_binding = row;
+                    g_binding_p2 = p2;
+                    window_capture_begin(1);
+                    pc_set_blurb("Press a key. Esc cancels.");
+                }};
+        r.select_only = true;
+        p.rows.push_back(r);
+    };
+    for (int b : kDriving)
+        if (b != PCB_START) add(b, pc_button_action(b));
+    add(PCB_COUNT + 0, "Zone Freeze");
+    add(PCB_COUNT + 1, "Zone Zoom");
+    p.rows.push_back({"Reset to Default", "Put these keys back as they were.", nullptr, [p2](int) {
+                          if (p2) g_cfg.default_keys2();
+                          else g_cfg.default_keys();
                           pc_config_save();
                           pc_set_blurb("Back to the defaults.");
                           pc_refresh_page();
@@ -123,9 +121,10 @@ bool mc_profile_delete(const std::string &name);
 
 static const u32 kMoveBackScreen = 0x170320, kFred = 0x2fc050, kFredName1 = kFred + 0x10d90;
 static const char *const kProfilesPage = "PC Profiles";
+static const char *const kNewProfileBlurb = "Select, then type its name. A gamepad gets the letter grid.";
 static std::string g_profile;           // the one in use; empty until one is chosen
-static bool g_profiles_off, g_open_profiles, g_back_to_load, g_rebuild, g_typing, g_deleting;
-static std::string g_typed, g_armed;
+static bool g_profiles_off, g_open_profiles, g_back_to_load, g_rebuild;
+static bool g_made;                     // a profile was made: the rebuilt list says so
 
 static void use_profile(const std::string &name)
 {
@@ -144,24 +143,37 @@ static void use_profile(const std::string &name)
     }
 }
 
-// "Profile 2": for someone who has only a gamepad to name it with
-static std::string free_name()
-{
-    const auto names = mc_profiles();
-    for (int i = (int)names.size() + 1;; i++) {
-        std::string n = "Profile " + std::to_string(i);
-        if (std::find(names.begin(), names.end(), n) == names.end()) return n;
-    }
-}
-
 static void choose_profile(const std::string &name)
 {
     if (g_profile.empty()) {
         use_profile(name);
         g_back_to_load = true;
     } else if (name != g_profile) {
+        // Another profile while the game runs, as the game's own Load does it. Its state is Fred (FrontendDatabase, 0x2fc050), which a
+        // save is an image of. A profile with a save: the loader of the start (the screen BootMemcardLoader) comes over this one, reads
+        // it, checks it, puts it in Fred (MemcardTester::OverwriteFred, 0x245d30) and goes. A profile with none: Fred as the game starts
+        // with it (FrontendDatabase::InitWithDefaults, 0x183830), put in place by the same OverwriteFred, which also hands the sound
+        // and the players what the image says.
         pc_config_save();
-        window_relaunch(name);
+        std::error_code ec;
+        const bool has_save = std::filesystem::exists(mc_profile_dir(name) + "/save.dat", ec);
+        if (!has_save) pc_call(0x183830, kFred);
+        use_profile(name);
+        if (has_save) {
+            pc_call(0x14cc78, 0x2bef10, 1);         // ChangeToScreen("BootMemcardLoader", over this one)
+            return;
+        }
+        const u32 kSaveSize = 0x114e0;
+        const u32 image = pc_alloc(kSaveSize), tester = pc_alloc(32);
+        if (image && tester) {
+            memcpy(host(image), host(kFred), kSaveSize);
+            SW(tester + 0x10, tester + 0x18);       // MemcardTester's SavegameData, whose first word is the image
+            SW(tester + 0x18, image);
+            pc_call(0x245d30, tester);
+        }
+        if (image) pc_call(0x257850, image);        // bFree
+        if (tester) pc_call(0x257850, tester);
+        g_rebuild = true;
     }
 }
 
@@ -182,74 +194,77 @@ static void make_profile(std::string name)
         pc_set_blurb("That name cannot be a folder.");
         return;
     }
-    choose_profile(name);
+    // made, not loaded: it is one more row, to be selected like the others
+    g_rebuild = true;
+    g_made = true;
 }
 
 static void profile_rows(PcPage &pg)
 {
     pg.rows.clear();
+    if (!g_profile.empty()) fprintf(stderr, "profiles: %s in use, player 1 is %s\n", g_profile.c_str(), pc_str(kFredName1).c_str());
     std::vector<std::string> names = mc_profiles();
     // the one played last comes first
     auto last = std::find(names.begin(), names.end(), std::string(g_cfg.last_profile));
     if (last != names.end()) std::rotate(names.begin(), last, last + 1);
-    pg.hide_back = g_profile.empty();
+    // the first screen, before a profile is chosen: there is nowhere to go back to, Back offers to leave the game
+    pg.hide_back = false;
+    pg.back_text = g_profile.empty() ? "Exit" : "Back";
+    if (g_profile.empty()) pg.on_back = [] { pc_ask_exit(); };
+    else pg.on_back = nullptr;
     for (const std::string &n : names) {
-        PcRow r{n, g_deleting ? "Select it twice to delete this profile, its save and its controls." : "Play as this profile.",
-                [n] {
-                    if (g_armed == n) return std::string("Delete?");
-                    return n == g_profile ? std::string("Current") : std::string();
-                },
+        PcRow r{n, "Play as this profile.", [n] { return n == g_profile ? std::string("Current") : std::string(); },
                 [n](int) {
-                    if (!g_deleting) {
-                        if (n == g_profile) pc_set_blurb("This is the profile in use.");
-                        else choose_profile(n);
-                        return;
-                    }
-                    if (n == g_profile) {
-                        pc_set_blurb("The profile in use cannot be deleted.");
-                    } else if (g_armed != n) {
-                        g_armed = n;
-                        pc_set_blurb("Select it again to delete it for good.");
-                        pc_refresh_page();
-                    } else {
-                        g_armed.clear();
-                        mc_profile_delete(n);
-                        g_deleting = false;
-                        g_rebuild = true;
-                    }
+                    if (n == g_profile) pc_set_blurb("This is the profile in use.");
+                    else choose_profile(n);
                 }};
         r.select_only = true;
         pg.rows.push_back(r);
     }
-    if (g_deleting) {
-        pg.rows.push_back({"Cancel", "Delete nothing.", nullptr, [](int) {
-                               g_deleting = false;
-                               g_armed.clear();
-                               g_rebuild = true;
-                           }});
-        return;
-    }
-    PcRow add{"New Profile", "Select, then type its name. With a gamepad it gets a number.",
-              [] { return g_typing ? g_typed + pc_text_cursor(0xa9bfda04) : std::string(); },      // the font of the pages' values
+    PcRow add{"New Profile", kNewProfileBlurb,
+              nullptr,
               [](int) {
-                  if (window_input_kind() == 1) {
-                      make_profile(free_name());
-                      return;
+                  // a gamepad: the game's letter grid; the keyboard types into the same seven places
+                  const bool pad = window_input_kind() == 1;
+                  if (pc_name_grid([](const std::string &name) {
+                          if (name.empty()) pc_set_blurb(kNewProfileBlurb);
+                          else make_profile(name);
+                      }, pad)) {
                   }
-                  g_typing = true;
-                  g_typed.clear();
-                  window_text_begin();
-                  pc_set_blurb("Type the name. Enter makes it, Esc leaves it.");
-                  pc_refresh_page();
               }};
     add.select_only = true;
     pg.rows.push_back(add);
-    if (!names.empty() && !g_profile.empty())
-        pg.rows.push_back({"Delete Profile", "Choose one to delete.", nullptr, [](int) {
-                               g_deleting = true;
-                               g_armed.clear();
-                               g_rebuild = true;
-                           }});
+}
+
+// Delete, or Square (X) on the gamepad, on a profile's row: the game's question, and on Yes the profile goes, its save and its controls.
+// On the first screen as in Options. The profile in use stays: the game is running on its save.
+static void delete_frame()
+{
+    const int row = pc_page_row(kProfilesPage);
+    if (row >= 0 && !pc_asking()) {      // (a question hides the page under it, the hint too)
+        // the hint only where the button does something: not on the profile in use, not on New Profile, not while a name is typed
+        PcPage *page = pc_find_page(kProfilesPage);
+        const bool can = page && row < (int)page->rows.size() - 1 && page->rows[(size_t)row].label != g_profile && !pc_name_grid_up();
+        // with the grid up the same button (Square, X) changes its letters to capitals and back, as on the PS2
+        if (pc_name_grid_mode() == 2) pc_delete_hint(kProfilesPage, true, true, "Capitals");
+        else pc_delete_hint(kProfilesPage, window_input_kind() == 1, can);
+    }
+    const bool pressed = window_delete_pressed();       // asked every frame: a press is one press
+    if (!pressed || row < 0 || pc_asking() || pc_name_grid_up()) return;
+    PcPage *pg = pc_find_page(kProfilesPage);
+    if (!pg || row >= (int)pg->rows.size() - 1) return;        // the last row is New Profile
+    const std::string name = pg->rows[(size_t)row].label;
+    if (name == g_profile) {
+        pc_set_blurb("The profile in use cannot be deleted.");
+        return;
+    }
+    std::string sure = tr("Delete the profile %s? Its save and its controls will be gone.");
+    if (size_t at = sure.find("%s"); at != std::string::npos) sure.replace(at, 2, name);
+    pc_ask("Delete Profile", sure, [name](bool yes) {
+        if (!yes) return;
+        mc_profile_delete(name);
+        g_rebuild = true;
+    });
 }
 
 static void profiles_frame()
@@ -263,25 +278,7 @@ static void profiles_frame()
         g_back_to_load = false;
         pc_call(kMoveBackScreen, 1);
     }
-    if (g_typing) {
-        bool changed = false;
-        while (const int ch = window_text_next()) {
-            changed = true;
-            if (ch == 13 || ch == 27) {
-                g_typing = false;
-                window_text_end();
-                if (ch == 13) make_profile(g_typed);
-                else pc_set_blurb("Select, then type its name. With a gamepad it gets a number.");
-                break;
-            }
-            if (ch == 8) {
-                if (!g_typed.empty()) g_typed.pop_back();
-            } else if (g_typed.size() < 15 && (ch != ' ' || !g_typed.empty())) {
-                g_typed += (char)ch;
-            }
-        }
-        if (changed || pc_text_cursor_changed()) pc_refresh_page();
-    }
+    delete_frame();
     if (g_rebuild) {
         g_rebuild = false;
         for (PcPage *pg : {pc_find_page(kProfilesPage)})
@@ -290,6 +287,8 @@ static void profiles_frame()
                 pg->top = 0;
             }
         pc_reshape_page();
+        if (g_made) pc_set_blurb("The profile is made. Select it to play as it.");
+        g_made = false;
     }
 }
 
@@ -361,6 +360,12 @@ void pc_settings_register()
                       [] { return std::string(g_cfg.max_detail ? "Maximum" : "Original"); },
                       [](int) {
                           g_cfg.max_detail ^= 1;
+                          pc_config_save();
+                      }});
+    v.rows.push_back({"Reflections", "The reflections on the cars. Advanced: new every frame. High: new every frame, at twice the resolution.",
+                      [] { return std::string(g_cfg.reflections == 2 ? "High" : g_cfg.reflections ? "Advanced" : "PS2"); },
+                      [](int d) {
+                          g_cfg.reflections = (g_cfg.reflections + (d < 0 ? 2 : 1)) % 3;
                           pc_config_save();
                       }});
     v.rows.push_back({"Show FPS", "Frames per second in the corner of the picture.",
@@ -496,13 +501,13 @@ void pc_settings_register()
     PcPage &p = pc_add_page("PC Controls", "Controls");
     p.rows.push_back({"Keyboard", "The keys for driving. In menus: arrows, Enter, Esc.", nullptr,
                       [](int) { pc_open_page("PC Keyboard"); }});
-    p.rows.push_back({"Gamepad", "The buttons for driving, the stick and vibration.", nullptr,
+    p.rows.push_back({"Gamepad", "The buttons for driving and the stick.", nullptr,
                       [](int) { pc_open_page("PC Gamepad"); }});
 
     p.rows.push_back({"Player 2", "What the second player drives with in a two-player race.", nullptr,
                       [](int) { pc_open_page("PC Player 2"); }});
 
-    binding_page("PC Keyboard", "Keyboard", false);
+    binding_page("PC Keyboard", "Keyboard");
 
     PcPage &two = pc_add_page("PC Player 2", "Player 2");
     two.rows.push_back({"Gamepad", "Second: the second gamepad or half the keyboard. First: the first one.",
@@ -513,13 +518,11 @@ void pc_settings_register()
                         }});
     two.rows.push_back({"Keyboard", "Player 2's keys, when the keyboard is shared.", nullptr,
                         [](int) { pc_open_page("PC Keyboard P2"); }});
-    binding_page("PC Keyboard P2", "Player 2 Keyboard", false, true);
+    binding_page("PC Keyboard P2", "Player 2 Keyboard", true);
 
     PcPage &g = pc_add_page("PC Gamepad", "Gamepad");
-    g.rows.push_back({"Layouts", "The game's own layouts: what each of the PS2's buttons does in a race.", nullptr,
+    g.rows.push_back({"Layouts", "The gamepad's layouts, A to D: what each button does in a race.", nullptr,
                       [](int) { pc_open_page("Joystick PreConfig"); }});
-    g.rows.push_back({"Buttons", "Which of the pad's buttons is which of the PS2's. In menus: A, B back, Y help.", nullptr,
-                      [](int) { pc_open_page("PC Gamepad Buttons"); }});
     g.rows.push_back({"Stick Dead Zone", "How far the left stick moves before the car steers.",
                       [] { return std::to_string(g_cfg.pad_deadzone) + "%"; },
                       [](int d) {
@@ -534,13 +537,6 @@ void pc_settings_register()
                           g_cfg.pad_steering = x < 50 ? 50 : x > 200 ? 200 : x;
                           pc_config_save();
                       }});
-    g.rows.push_back({"Vibration", "Vibration of the gamepad.",
-                      [] { return onoff(g_cfg.pad_vibration); },
-                      [](int) {
-                          g_cfg.pad_vibration ^= 1;
-                          if (!g_cfg.pad_vibration) window_rumble(0, 0);
-                          pc_config_save();
-                      }});
     g.rows.push_back({"Button Icons", "Which buttons the game shows, and the menus' layout that goes with them.",
                       [] { return std::string(g_cfg.pad_icons == 1 ? "Xbox" : g_cfg.pad_icons == 2 ? "PlayStation" : "Auto"); },
                       [](int d) {
@@ -553,5 +549,4 @@ void pc_settings_register()
                           pc_set_blurb("The gamepad is back to the defaults.");
                           pc_refresh_page();
                       }});
-    binding_page("PC Gamepad Buttons", "Gamepad Buttons", true);
 }

@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -64,14 +65,26 @@ inline std::string sha1_hex(const void *p, size_t n)
 
 // The discs the port knows, by the program SYSTEM.CNF boots and its SHA-1. The European v1.00 disc has the very program of the USA one (and
 // the same archive, but for the empty PAL.TAG that turns on the PAL video mode, left out by install.cpp): the code recompiled from the one
-// runs the other. Whatever the disc, the program goes to data\SLUS_203.62. Europe v2.00 (e8983ff7..., two reward screens with larger
-// stacks, 147 files changed) and Asia, Korea (SLPM, another build) are not among them yet.
+// runs the other. The European v2.00 disc's program differs in 22 instructions, the stack frames of the two reward screens' constructors
+// (128 bytes more for a text); the recompiled code has those larger frames for every disc (tools/recomp/gen.py), and nothing else of the
+// program is other, its data included, so the one recompiled code runs all three. Its archive is the same files built again (147 differ
+// by a few bytes), less two of the demo's recordings, plus HOTCHUNK.TAG, which the program never asks for. Whatever the disc, the program
+// goes to data\SLUS_203.62.
+// The Asia and Korea discs (one disc under two numbers: the programs differ in 5 bytes, the archives in none) have the program linked
+// again with 24 bytes less of data, one disc number and one memory card code where the USA program has two each, and so with every
+// address after them 8 or 16 lower: the recompiled code cannot run on it. The installer turns it into the USA program by a patch the exe
+// carries (tools/recomp/make_disc_patch.py, the resource named here) and checks the result by the USA program's SHA-1. Their archive is
+// the USA one less two of the demo's recordings, 46 files differing by a few bytes.
 struct KnownDisc {
     const char *elf_sha1, *boot, *name;
+    const wchar_t *patch;       // the resource that makes the USA program of this one, null where it runs as it is
 };
 static const KnownDisc kKnownDiscs[] = {
-    {"6397d4425d55056678ed5a405cc81542f7d4d2ee", "SLUS_203.62", "Need for Speed: Hot Pursuit 2 (USA), SLUS-20362"},
-    {"6397d4425d55056678ed5a405cc81542f7d4d2ee", "SLES_507.31", "Need for Speed: Hot Pursuit 2 (Europe) v1.00, SLES-50731"},
+    {"6397d4425d55056678ed5a405cc81542f7d4d2ee", "SLUS_203.62", "Need for Speed: Hot Pursuit 2 (USA), SLUS-20362", nullptr},
+    {"6397d4425d55056678ed5a405cc81542f7d4d2ee", "SLES_507.31", "Need for Speed: Hot Pursuit 2 (Europe) v1.00, SLES-50731", nullptr},
+    {"e8983ff7e3517fd6fce5c1ca3673b71619c777f5", "SLES_507.31", "Need for Speed: Hot Pursuit 2 (Europe) v2.00, SLES-50731", nullptr},
+    {"ffcfeedaba5deeec3b80c9f700739c2e080343f5", "SLPM_651.81", "Need for Speed: Hot Pursuit 2 (Asia), SLPM-65181", L"PATCH_SLPM_65181"},
+    {"548fbe75a6096231a72254aea539fd0bea4406dc", "SLPM_675.27", "Need for Speed: Hot Pursuit 2 (Korea), SLPM-67527", L"PATCH_SLPM_67527"},
 };
 
 inline uint32_t crc32_update(uint32_t crc, const void *p, size_t n)
@@ -100,10 +113,46 @@ struct Iso {
     };
     FILE *f = nullptr;
     std::vector<File> files;
-    ~Iso() { if (f) fclose(f); }
+    // The other source, the disc itself in a drive (or its image mounted as one): root is the drive, "E:", and the files are read as the
+    // files Windows shows there, one open at a time.
+    std::wstring root;
+    FILE *cur = nullptr;
+    const File *cur_of = nullptr;
+    ~Iso()
+    {
+        if (f) fclose(f);
+        if (cur) fclose(cur);
+    }
 
     bool read(uint64_t at, void *dst, size_t n) { return _fseeki64(f, (int64_t)at, SEEK_SET) == 0 && fread(dst, 1, n, f) == n; }
-    bool read_file(const File &x, uint64_t at, void *dst, size_t n) { return read((uint64_t)x.lba * SECTOR + at, dst, n); }
+    bool read_file(const File &x, uint64_t at, void *dst, size_t n)
+    {
+        if (root.empty()) return read((uint64_t)x.lba * SECTOR + at, dst, n);
+        if (cur_of != &x) {
+            if (cur) fclose(cur);
+            cur = _wfopen((root + std::wstring(x.path.begin(), x.path.end())).c_str(), L"rb");
+            cur_of = &x;
+        }
+        return cur && _fseeki64(cur, (int64_t)at, SEEK_SET) == 0 && fread(dst, 1, n, cur) == n;
+    }
+
+    // the files of the disc's root and of the game's two folders, with their sizes
+    bool open_drive(const std::wstring &drive, std::string &why)
+    {
+        root = drive;
+        while (!root.empty() && (root.back() == L'\\' || root.back() == L'/')) root.pop_back();
+        for (const wchar_t *dir : {L"", L"/NFSHP2", L"/NFSHP2/IRX253"}) {
+            std::error_code ec;
+            for (std::filesystem::directory_iterator it(root + dir + L"/", ec), end; !ec && it != end; it.increment(ec)) {
+                if (!it->is_regular_file(ec)) continue;
+                std::string path;
+                for (wchar_t ch : std::wstring(dir) + L"/" + it->path().filename().wstring()) path += (char)ch;
+                files.push_back({path, 0, (uint64_t)it->file_size(ec)});
+            }
+        }
+        if (files.empty()) return why = "The disc in the drive cannot be read.", false;
+        return true;
+    }
 
     void walk(uint32_t lba, uint32_t size, const std::string &dir, int depth)
     {

@@ -1,5 +1,5 @@
-// IOP side of the sound path: the game's own STREAM.IRX (MultiStream 5.2) runs on
-// an R3000 interpreter over a small HLE IOP kernel; libsd sits on a software SPU2.
+// IOP side of the sound path: the game's own STREAM.IRX (MultiStream 5.2), translated to C++ ahead of time
+// (tools/recomp/gen_iop.py), over a small HLE IOP kernel; libsd sits on a software SPU2.
 //
 // Only modules loaded through iop_start_module run here (STREAM.IRX); everything
 // else on the IOP stays at the EE SDK boundary in hle_iop.cpp.
@@ -61,6 +61,7 @@ const char *iop_hle_name(u32 index);
 
 // runs until max instructions have executed or iop_stop() is called from an HLE function
 void iop_execute(IopRegs &c, int max);
+bool iop_gen_matches(u32 base, u32 text_size);     // the module in memory is the one the code was made from
 void iop_stop();
 
 // kernel (iop_kernel.cpp)

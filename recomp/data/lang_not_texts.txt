@@ -1,0 +1,46 @@
+; The string literals of the port's menus (recomp/runtime/pcsettings.cpp, pcmenu.cpp) that are not texts for the player: names of the
+; game's objects and of the port's pages, pieces of file names, names that are the same in every language. tools/recomp/check_lang.py
+; takes every other literal of those files for a text and wants its line in each language file (tools/recomp/make_lang.py).
+; One literal a line, as it is in the code.
+PC Profiles
+PC Controls
+PC Graphics
+PC Languages
+PC Resolution
+PC Advanced
+PC Antialiasing
+PC Keyboard
+PC Gamepad
+PC Player 2
+PC Keyboard P2
+Joystick PreConfig
+BootAutoload
+/save.dat
+/controls.ini
+ FPS
+VSync
+PS2
+MSAA
+SMAA
+Xbox
+PlayStation
+text
+bitmap
+other
+MENUITEM_
+MI_
+_MASK
+PC_VALUE_
+PC_BACK_ICON
+PC_BACK_TEXT
+PC_NAME_
+PC_MASTER_BAR
+PC_MASTER_BAR_V
+MI_3_MASK
+MENUITEM_4_GROUP
+MI_4_MASK
+PC_DEL_TEXT
+PC_DEL_ICON
+CONTROLLER30
+LEFT_ARROW
+RIGHT_ARROW

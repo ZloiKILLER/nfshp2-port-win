@@ -39,9 +39,11 @@ void window_quit();                     // from any thread; closes the window an
 void window_relaunch(const std::string &profile);
 // typing a name: the game sees no input; window_text_next gives a character, 8 Backspace, 13 Enter, 27 Esc, or 0 for nothing yet.
 // By the key, not the keyboard's layout: names are in Latin letters whatever the layout is.
-void window_text_begin();
+void window_text_begin(bool keep = false);    // keep: with the letters typed while armed
+void window_text_arm(bool on);
 void window_text_end();
 int window_text_next();
+bool window_delete_pressed();           // Delete, or Square / X on the gamepad: once a press
 int window_input_kind();                // the device last used: 0 the keyboard, 1 a gamepad (g_pad_playstation: which)
 // binding a key or a pad button from the menu: the game sees no input until the next press
 void window_capture_begin(int what);    // 1 a key, 2 a pad button

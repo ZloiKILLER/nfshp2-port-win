@@ -14,17 +14,16 @@ python tools/recomp/export_text.py       data/text/
 |---|---:|---:|---|
 | `SOUND/` | 70 | 1.8 GB | sound banks `.MSB`/`.MSH`, music `.JBC`, speech `.PCK`, `.EVT`, engine tables `.CTB`/`.LTB`, `.sndbank` |
 | `MOVIES/` | 21 | 650 MB | `.AVI`, MV30; four names unknown in `unnamed/`, one of them MVDV, which the game rejects |
-| `TRACKS/` | 120 | 306 MB | `TRACKB*.LZC` the track, `TEX*TRACK.tex`, `TEX*LOCATION.tex`, empty `TRACKA*.BUN`, marker notes `.txt` |
-| `unused/` | 58 | 111 MB | twins of `.LZC` files; none read in a run through menus and a race |
-| `FRONTEND/` | 3 | 26 MB | `FRONTB.LZC` the menus, `TSELECT.tex` |
-| `CARS/` | 48 | 25 MB | `<car>/GEOMETRY.LZC`, `TEXTURES.tex` |
+| `TRACKS/` | 120 | 584 MB | `TRACKB*.BUN` the track, `TEX*TRACK.tex`, `TEX*LOCATION.tex`, empty `TRACKA*.BUN`, marker notes `.txt` |
+| `FRONTEND/` | 3 | 40 MB | `FRONTB.BUN` the menus, `TSELECT.tex` |
+| `CARS/` | 48 | 41 MB | `<car>/GEOMETRY.geo`, `TEXTURES.tex` |
 | `GLOBAL/` | 9 | 6 MB | `GLOBALB`, `INGAMEB`, `PRERACEANIM`, `HUDTEX.tex`, `DYNTEX.tex`, `DRIVTEX.tex` |
 | `REPLAY/` | 36 | 4 MB | demo-mode replays `.replay`; those with no known name in `DEMO/`, by the author written in them |
 | `NIS/`, `MARKERS/`, `LANGUAGES/` | | 2 MB | cutscenes `.nis` + `.CAM`, `.markers`, string tables `.lang` |
 
 Ours, which the game does not read: `textures/`, `text/`, `replace/`. Not read by the game, as far as is known: `KEY.TXT`, a line of hex digits between two x; `NFS.TAG` holds "Hello." and the name fits its hash, as does `NG2.TAG`. Names are not read from anywhere: `index.txt` is what matters.
 
-Extensions of ours, all the game's `.BIN`: `.tex` a texture pack, `.geo` geometry, `.lang` strings, `.replay`, `.nis`, `.markers`, `.sndbank`. `.LZC` is a COMP file of chunks, `.BUN` the same not compressed.
+Extensions of ours, all the game's `.BIN`: `.tex` a texture pack, `.geo` geometry, `.lang` strings, `.replay`, `.nis`, `.markers`, `.sndbank`. `.BUN` is a file of chunks. The disc keeps 81 of them compressed (`.LZC`, a COMP container: the tracks, the cars' geometry, `FRONTB`, `GLOBALB`, `INGAMEB`, `PRERACEANIM`); the installer writes them unpacked, as `.BUN` or `.geo`, under the compressed file's hash, and the game takes them as they are (2026-11-11; installs of 0.12 and before have the `.LZC` files and an `unused/` folder with the disc's own plain copies of 58 of them, and run as they are). The disc's plain copy and the unpacked file are the same bytes, so the copy's line of `index.txt` names the same file: 405 lines, 344 files.
 
 Some names stand twice in ZDIR with one hash (`CARS/TEXTURES`, `GLOBAL/HUDTEX`, `SOUND/SPEECH/EVENTS.EVT`) and share one file here: the check below shows the two copies are the same bytes.
 
@@ -53,6 +52,6 @@ A PNG in `data/replace/` (any subfolder) takes a texture's place:
 ## Not known yet
 
 - Whether a file may change size. The decompiled loading code (`src/bFileE.cpp`, `src/ResourceLoader.cpp`) has no reference by sector, it takes each file's place from ZDIR, which `disc.cpp` builds from the sizes now. That is the EE's code only: the contents of the game's files and the IRX were not searched for sector numbers, and no file of another size has been tried in the game. A texture table has to fit in a file's first 0x20000 bytes.
-- A file not starting with `COMP` is taken as it is under a `.LZC` name: from the code, not tried.
+- A file not starting with `COMP` is taken as it is under a `.LZC` name: `ResourceFile::LoadResourceIfFileTransferFinished` (`0x1994f0`) unpacks only on that mark. Tried on all five discs, 2026-11-11: this is how every install is laid out now.
 - The formats of `SOUND/`, of geometry and of tracks are not exported.
 - 32 files keep their hash for a name: 25 replays, 4 movies, one sound bank (2 files), one table of the speech's events.

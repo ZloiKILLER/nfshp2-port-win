@@ -14,8 +14,12 @@ std::string pc_str(u32 addr);   // a guest C string
 u32 pc_hash(const char *s);     // bStringHash of the game
 u32 pc_alloc(u32 size);         // zeroed guest memory that stays; early, as the game's own lasting blocks
 bool pc_racing();               // the game flow is in a race (else the frontend or loading)
+bool pc_skip_wanted();          // a race waits to be started or left: Enter is the button it waits for
 bool pc_two_player_race();      // a race of two players
 bool pc_two_player_screen();    // a screen where two players choose at once
+bool pc_replay_playing();       // a replay is on screen, with its bar of buttons
+// keys: this port's player drives with the keyboard now, which has its own layout whatever the gamepad's is; else the chosen one is back
+void pc_keyboard_layout(int port, bool keys);
 bool pc_car_input();            // the player has the car or a race's own controls (not a menu, the pause menu included)
 bool pc_race_menu();
 u32 pc_screen_hash();           // the screen whose menu is up, 0 with none
@@ -46,6 +50,8 @@ struct PcPage {
     int top = 0;                            // the row in the first slot
     std::function<void(PcPage &)> on_open;  // the rows are made as the page opens: registered with at least 8 so that its screen has all it may need
     bool hide_back = false;                 // no Back at the bottom: there is nowhere to go
+    std::function<void()> on_back;          // Back is the page's own (the first screen: Exit)
+    std::string back_text;                  // and its word at the bottom, when not Back
 };
 
 // register a page; before the frontend is built (the page's screen is made as FRONTB loads)
@@ -53,6 +59,8 @@ PcPage &pc_add_page(const char *name, const char *title);
 // the pages behind the Options screen's Controls and Graphics rows
 void pc_options_pages(const char *controls, const char *graphics);
 void pc_profiles_page(const char *name);    // Options' Profiles
+// the hint of the button that deletes, on that page: Square's icon or the Delete key's, shown or not
+void pc_delete_hint(const char *page, bool pad, bool show, const char *text = "Delete");
 void pc_retranslate();                      // the language changed: the port's texts on the frontend's screens again
 PcPage *pc_find_page(const char *name);
 // go to a page now (from a row that opens another page)
@@ -63,6 +71,20 @@ void pc_refresh_page();
 void pc_reshape_page();
 // called once per frame while a frontend screen runs (key capture, values changed elsewhere)
 void pc_on_frame(std::function<void()> fn);
+// the row of this page the highlight is on, from 0; -1 when the page is not the screen that is up
+int pc_page_row(const char *name);
+// The game's own question over the screen, with Yes and No (a tPopupMenu, as "quit the race?"): answer is called with the choice, No if
+// it was left. One at a time; pc_asking while it is up.
+void pc_ask(const std::string &title, const std::string &question, std::function<void(bool yes)> answer, const char *yes = nullptr,
+            const char *no = nullptr);       // the two buttons' words, when not Yes and No
+void pc_ask_exit();             // "Leave the game?", Exit and Cancel
+bool pc_asking();
+// The game's letter grid (the Player Names screen's) on the page that is up, for a name of up to 7 characters from a gamepad: the name is
+// typed in the highlighted row; done gets it, empty if nothing was typed. False: no grid here. Without grid the keyboard types
+// it (Enter takes it, Esc leaves it), shown the same way: the seven places, the bar under the one being typed.
+bool pc_name_grid(std::function<void(const std::string &name)> done, bool grid = true);
+bool pc_name_grid_up();
+int pc_name_grid_mode();        // 0 no name is typed, 1 the keyboard types it, 2 the grid is up
 // a row's blurb on screen now (e.g. "Press a key")
 void pc_set_blurb(const std::string &text);
 // registered by pcsettings.cpp

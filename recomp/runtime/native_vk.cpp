@@ -115,7 +115,9 @@ static int W43 = 1024;              // the 4:3 middle of it
 // a frame's vertices, 32 bytes each: 4 million. The draw distance takes a race at 200% to half a million and more, the mirror and 16:9 with it
 static const VkDeviceSize kMaxBytes = 128 * 1024 * 1024, kStaging = 64 * 1024 * 1024, kFoldBytes = 1024 * 1024, kLightBytes = 4 * 1024 * 1024;
 static const VkDeviceSize kFpsBytes = 256 * 1024, kDepthBytes = 8 * 1024 * 1024;
-static const int ENV_SIZE = 64, SPHERE_SIZE = 256;
+// The cars' reflections: the six views round the car and the sphere map they are folded into. The PS2's sizes, or twice them with
+// Graphics, Reflections at High (set where the renderer is made: that is part of settings_key).
+static int ENV_SIZE = 64, SPHERE_SIZE = 256;
 
 struct VkTex {
     VkImage image;
@@ -368,7 +370,10 @@ static bool make_buffer(VkBuffer &b, void **map, VkDeviceSize size, VkBufferUsag
 // Without the GPU's buffer (HP2_HOSTBUFFERS, or no memory) the host's copy is drawn from, and there is no cache.
 static const VkDeviceSize kSide = 16 * 1024 * 1024;  // a frame's own vertices, and its indices, in the GPU's buffer
 
-uint32_t native_vk_cache_vertices() { return g.vb_in_vram ? g.cache_verts : 0; }
+static uint32_t cache_verts_now() { return g.vb_in_vram ? g.cache_verts : 0; }
+// what the game's thread reads of it: as it stood when the last frame was done
+static std::atomic<uint32_t> g_cache_cap_pub{0};
+uint32_t native_vk_cache_vertices() { return g_cache_cap_pub.load(); }
 
 static void device_vertices()
 {
@@ -458,13 +463,21 @@ static void depth_barrier(VkImageLayout from, VkImageLayout to)
     vkCmdPipelineBarrier(g.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
 }
 
+// Replaced textures, destroyed once the frame that could still name them is done: an upload records copies into its image, and a second
+// upload of the same texture in that frame would otherwise destroy an image the frame's commands are about to write.
+static std::vector<VkTex *> g_dead_textures;
+
 static void free_texture(VkTex *t)
 {
     vkFreeDescriptorSets(g.dev, g.pool, 1, &t->set);
     vkDestroyImageView(g.dev, t->view, nullptr);
     vkDestroyImage(g.dev, t->image, nullptr);
     vkFreeMemory(g.dev, t->mem, nullptr);
-    if (t->owner) t->owner->vk = nullptr;
+    if (t->owner) {                         // let go: the game's thread decodes it again when it is next asked for
+        std::lock_guard<std::mutex> hold(g_native_tex_mutex);
+        t->owner->vk = nullptr;
+        t->owner->loaded = false;
+    }
     delete t;
 }
 
@@ -474,7 +487,7 @@ static void free_texture(VkTex *t)
 // A cut-out (a fence, leaves: alpha either side of the alpha test's 0x30, little in between) keeps the share of its texels that pass the
 // test, as the base has it, or its thin parts would average away with distance; its colours are averaged by alpha, so that what is cut out
 // does not darken the edges.
-static void more_levels(NativeTexture &tex)
+static void more_levels(NativeTexUpload &tex)
 {
     const int have = tex.levels;
     int full = 1;
@@ -545,18 +558,22 @@ static void more_levels(NativeTexture &tex)
 }
 
 // a decoded texture into the GPU, with the game's own levels; with the setting's anisotropic filter, the rest of them made here (more_levels)
-static void upload_texture(NativeTexture &tex, VkDeviceSize &at)
+// False: no room in this frame's staging, the next frame's then.
+static bool upload_texture(NativeTexUpload &tex, VkDeviceSize &at)
 {
     // not for a texture that changes every few frames (a movie's, a screen's): it is 2D, and its levels would be made each time
-    const bool often = tex.vk && g.frame - ((VkTex *)tex.vk)->born < 120;
+    VkTex *const was = (VkTex *)tex.tex->vk;
+    const bool often = was && g.frame - was->born < 120;
     tex.gpu_levels = tex.levels;
     if (g.aniso && !often) more_levels(tex);
     VkDeviceSize bytes = (VkDeviceSize)tex.px.size() * 4;
-    if (at + bytes > kStaging) return;      // the next frame
-    if (tex.vk) {
-        VkTex *old = (VkTex *)tex.vk;
-        g.textures.erase(std::find(g.textures.begin(), g.textures.end(), old));
-        free_texture(old);
+    if (bytes > kStaging) return true;      // never fits: it stays as it is
+    if (at + bytes > kStaging) return false;
+    if (was) {
+        g.textures.erase(std::find(g.textures.begin(), g.textures.end(), was));
+        was->owner = nullptr;               // replaced, not let go: the game's thread goes on counting it as loaded
+        g_dead_textures.push_back(was);     // destroyed when the last frame's and this frame's commands are done (free_dead_textures)
+        tex.tex->vk = nullptr;
     }
     uint32_t levels = (uint32_t)tex.gpu_levels;
     VkTex *t = new VkTex();
@@ -610,12 +627,18 @@ static void upload_texture(NativeTexture &tex, VkDeviceSize &at)
     at += bytes;
     image_barrier(t->image, 0, levels, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
                   VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
-    t->owner = &tex;
+    t->owner = tex.tex;
     t->used = g.frame;
-    tex.vk = t;
-    tex.dirty = false;
-    std::vector<uint32_t>().swap(tex.px);
+    tex.tex->vk = t;
     g.textures.push_back(t);
+    return true;
+}
+
+// with no frame of the GPU's in flight: after the wait for the last one, before this one's uploads
+static void free_dead_textures()
+{
+    for (VkTex *t : g_dead_textures) free_texture(t);
+    g_dead_textures.clear();
 }
 
 static bool make_image(VkImage &img, VkImageView &view, VkFormat fmt, VkImageUsageFlags usage, VkImageAspectFlags aspect, int iw = 0, int ih = 0, uint32_t levels = 1,
@@ -776,7 +799,7 @@ static bool setup()
 }
 
 // the picture's size, the multisampling, the filter: what the settings say
-static int settings_key() { return g_cfg.scale | native_aspect() << 4 | g_cfg.msaa() << 8 | g_cfg.aniso << 16 | (g_cfg.aa_mode == 2) << 24; }
+static int settings_key() { return g_cfg.scale | native_aspect() << 4 | g_cfg.msaa() << 8 | g_cfg.aniso << 16 | (g_cfg.aa_mode == 2) << 24 | (g_cfg.reflections == 2) << 25; }
 
 // what the menu may offer: the most samples the picture can have, the most anisotropy
 bool native_vk_limits(int &aa, int &aniso)
@@ -809,6 +832,8 @@ static bool setup_resources()
             if (can & (VkSampleCountFlags)s) g.samples = (VkSampleCountFlagBits)s;
     }
 
+    ENV_SIZE = !exact && g_cfg.reflections == 2 ? 128 : 64;
+    SPHERE_SIZE = ENV_SIZE * 4;
     W43 = 512 * g_cfg.scale;
     H = 448 * g_cfg.scale;
     if (const char *e = getenv("HP2_NATIVESIZE")) sscanf(e, "%dx%d", &W43, &H);
@@ -1452,6 +1477,7 @@ static bool setup_resources()
 static bool rebuild()
 {
     vkDeviceWaitIdle(g.dev);
+    free_dead_textures();
     for (VkTex *t : g.textures) free_texture(t);
     g.textures.clear();
     for (auto it = g_undo.rbegin(); it != g_undo.rend(); ++it) (*it)();
@@ -1674,14 +1700,14 @@ static void draw_target(const NativeFrame &frame, int target, int vw, int vh, si
         p.snap[0] = d.snap_x;
         p.snap[1] = d.snap_y;
         // the pictures of this renderer: clamped and linear, as TEX1's 0xe0 has it at level 0
-        p.tex_mode = which == 2 && env_tex ? tex_mode(*frame.env_override) | 64
-                   : which == 2 || d.rt >= 0 || !d.tex ? 4 | 8 : which == 1 ? tex_mode(*frame.road_specular) : tex_mode(*d.tex);
+        p.tex_mode = which == 2 && env_tex ? frame.env_mode | 64
+                   : which == 2 || d.rt >= 0 || !d.tex ? 4 | 8 : which == 1 ? frame.road_mode : d.tex_mode;
         // what VU1 transforms, the world, whatever filter the game gave the texture; the setting's filter leaves the 2D and the envmap views
         // to the GS's sampling. HP2_AFOLD: only the textures the game filters linear, as it was; HP2_AFFLIP: that and this by turns of
         // 120 frames, for two pictures of one place
         static const bool af_old = getenv("HP2_AFOLD") != nullptr, af_flip = getenv("HP2_AFFLIP") != nullptr;
         const bool af_every = af_flip ? (g.frame / 120 & 1) != 0 : !af_old;
-        if (which == 0 && d.tex && d.rt < 0 && (d.tex->upscaled || (g.aniso && (af_every || d.tex->min_linear) && d.snap_x != 0 && target < 8))) p.tex_mode |= 32;
+        if (which == 0 && d.tex && d.rt < 0 && (d.tex_upscaled || (g.aniso && (af_every || d.tex_min_linear) && d.snap_x != 0 && target < 8))) p.tex_mode |= 32;
         if (pipeline != bound_pipeline) vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
         if (set != bound_set) vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.layout, 0, 1, &set, 0, nullptr);
         bound_pipeline = pipeline;
@@ -1810,7 +1836,7 @@ static void draw_env_views(const NativeFrame &frame, VkDeviceSize &)
     static const int env_log_every = getenv("HP2_ENVLOG") ? std::max(atoi(getenv("HP2_ENVLOG")), 30) : 0;
     bool env_log_now = false;
     if (env_log_every && g.frame % env_log_every == 0) {
-        if (!g_env_log_rb) make_buffer(g_env_log_rb, &g_env_log_map, 6 * ENV_SIZE * ENV_SIZE * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        if (!g_env_log_rb) make_buffer(g_env_log_rb, &g_env_log_map, 6 * 128 * 128 * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT);    // room for either size
         if (g_env_log_rb && g_env_log_have) {
             fprintf(g_hle_log, "envlog: frame %llu, pixels with the alpha bit clear (drawn / the clear's grey kept), of 4096:", (unsigned long long)g.frame - env_log_every);
             for (int i = 0; i < 6; i++) {
@@ -1890,8 +1916,9 @@ static void fold_sphere_map(const NativeFrame &frame)
         auto at = [&](int r, int c) {
             float q[7];
             memcpy(q, base + (r * 7 + c) * 28, sizeof q);
-            // XYZ2 is the whole pixel, trunc(s * 256 - 128 + 2048) on a target at 1920
-            out[n++] = {std::floor(q[3] * SPHERE_SIZE) / SPHERE_SIZE, std::floor(q[4] * SPHERE_SIZE) / SPHERE_SIZE, q[5], q[6]};
+            // XYZ2 is the whole pixel, trunc(s * 256 - 128 + 2048) on a target at 1920: the PS2's pixel whatever the map's size here, so
+            // a larger map is the same picture, finer
+            out[n++] = {std::floor(q[3] * 256.0f) / 256.0f, std::floor(q[4] * 256.0f) / 256.0f, q[5], q[6]};
         };
         for (int r = 0; r < 5; r++)
             for (int c = 0; c < 5; c++) {
@@ -2025,12 +2052,13 @@ static void compare_pictures()
     }
 }
 
+static bool g_frame_dumping;                // this frame's NativeFrame::dumping
 static void shot_this_frame()
 {
     static const char *shot = getenv("HP2_NATIVESHOT");
     static const int every = getenv("HP2_NATIVESHOTN") ? atoi(getenv("HP2_NATIVESHOTN")) : 150;
     static int frames;
-    const bool forced = native_dumping_now();
+    const bool forced = g_frame_dumping;
     if (!shot || (++frames % every && !forced)) return;
     vkWaitForFences(g.dev, 1, &g.fence, VK_TRUE, UINT64_MAX);
     char path[512];
@@ -2532,7 +2560,27 @@ static double cpu_lap()
     return ms;
 }
 
-bool native_vk_draw(const NativeFrame &frame)
+static bool draw_frame(const NativeFrame &frame, bool &uploaded);
+std::atomic<uint32_t> g_native_epoch{0};
+static std::vector<NativeTexUpload> g_tex_pending;      // decoded and not yet on the GPU, in order
+
+bool native_vk_draw(NativeFrame &frame)
+{
+    // the textures first, whatever comes of the frame: the game's thread counts them as loaded
+    for (NativeTexUpload &u : frame.uploads) g_tex_pending.push_back(std::move(u));
+    frame.uploads.clear();
+    g_frame_dumping = frame.dumping;
+    bool uploaded = false, ok = false;
+    // a frame made before the game's thread heard of the cache's loss draws from places that hold something else
+    if (frame.epoch == g_native_epoch.load()) {
+        ok = draw_frame(frame, uploaded);
+        if (!uploaded) g_native_epoch++;
+    }
+    g_cache_cap_pub.store(cache_verts_now());
+    return ok;
+}
+
+static bool draw_frame(const NativeFrame &frame, bool &uploaded)
 {
     if (g.failed) return false;
     const double game_ms = cpu_lap();
@@ -2563,7 +2611,7 @@ bool native_vk_draw(const NativeFrame &frame)
                  index_bytes = frame.indices.size() * sizeof(uint32_t);
     {
         // not drawn: the window keeps the last picture while the game goes on (and native.cpp empties its cache)
-        const char *why = frame.dyn_base != native_vk_cache_vertices() ? nullptr
+        const char *why = frame.dyn_base != cache_verts_now() ? nullptr
                           : g.vb_in_vram ? (bytes > kSide || index_bytes > kSide ? "more than the GPU's buffer takes" : "")
                           : bytes + index_bytes > kMaxBytes ? "more than a frame can take" : "";
         if (!why) return false;             // made for a cache of another size: the first frame
@@ -2575,6 +2623,7 @@ bool native_vk_draw(const NativeFrame &frame)
     }
     cpu_lap();
     vkWaitForFences(g.dev, 1, &g.fence, VK_TRUE, UINT64_MAX);
+    free_dead_textures();
     const double wait_ms = cpu_lap();
     vkResetFences(g.dev, 1, &g.fence);
     gpu_times_read();
@@ -2596,7 +2645,7 @@ bool native_vk_draw(const NativeFrame &frame)
     QueryPerformanceFrequency(&cf);
     g_copy_cpu[0] += (double)(c1.QuadPart - c0.QuadPart) * 1000.0 / (double)cf.QuadPart;
     g_fresh_bytes += fresh_bytes;
-    frame.uploaded = true;
+    uploaded = true;
     g.vb = g.vb_in_vram ? g.vb_dev : g.vb_stage;
     g.draw_idx_off = g.vb_in_vram ? g.idx_off : bytes + fresh_bytes;
     g.draw_dyn_first = g.vb_in_vram ? g.cache_verts : 0;
@@ -2671,11 +2720,19 @@ bool native_vk_draw(const NativeFrame &frame)
         }
     }
     VkDeviceSize staged = 0;
-    for (const NativeDraw &d : frame.draws)
-        if (d.tex && d.count) {
-            if (d.tex->dirty) upload_texture(*d.tex, staged);
-            if (d.tex->vk) ((VkTex *)d.tex->vk)->used = g.frame;
+    {   // the textures decoded for this frame, and what an earlier one had no room for, in the order they were decoded
+        // Frames that were not drawn (a change of settings, the cache emptied) leave their uploads here, and a texture that changes every
+        // frame (a menu's animation, a movie) is then here several times: only its newest is the texture now
+        size_t done = 0;
+        for (; done < g_tex_pending.size(); done++) {
+            bool newer = false;
+            for (size_t later = done + 1; later < g_tex_pending.size() && !newer; later++) newer = g_tex_pending[later].tex == g_tex_pending[done].tex;
+            if (!newer && !upload_texture(g_tex_pending[done], staged)) break;
         }
+        g_tex_pending.erase(g_tex_pending.begin(), g_tex_pending.begin() + (ptrdiff_t)done);
+    }
+    for (const NativeDraw &d : frame.draws)
+        if (d.tex && d.count && d.tex->vk) ((VkTex *)d.tex->vk)->used = g.frame;
     // what has not been drawn for a quarter of a minute goes, and is decoded again if it comes back. A few a frame: freed all at once every
     // 300 frames, they cost that frame 5 to 16 ms (a vkFreeMemory each), a stutter
     {
@@ -2683,8 +2740,20 @@ bool native_vk_draw(const NativeFrame &frame)
         int freed = 0;
         for (int looked = 0; looked < 64 && !g.textures.empty() && freed < 2; looked++) {
             if (cursor >= g.textures.size()) cursor = 0;
-            if (g.frame - g.textures[cursor]->used > 900) {
-                free_texture(g.textures[cursor]);
+            VkTex *const old = g.textures[cursor];
+            bool go = g.frame - old->used > 900;
+            if (go && old->owner) {
+                // and not one the game's thread has asked for since: its frames run ahead of these, and what it asked for it counts on
+                std::lock_guard<std::mutex> hold(g_native_tex_mutex);
+                go = frame.number >= old->owner->frame && frame.number - old->owner->frame > 900;
+                if (go) {
+                    old->owner->vk = nullptr;
+                    old->owner->loaded = false;
+                    old->owner = nullptr;
+                }
+            }
+            if (go) {
+                free_texture(old);
                 g.textures[cursor] = g.textures.back();
                 g.textures.pop_back();
                 freed++;
@@ -2693,9 +2762,7 @@ bool native_vk_draw(const NativeFrame &frame)
             }
         }
     }
-    if (frame.road_specular && frame.road_specular->dirty) upload_texture(*frame.road_specular, staged);
     if (frame.road_specular && frame.road_specular->vk) ((VkTex *)frame.road_specular->vk)->used = g.frame;
-    if (frame.env_override && frame.env_override->dirty) upload_texture(*frame.env_override, staged);
     if (frame.env_override && frame.env_override->vk) ((VkTex *)frame.env_override->vk)->used = g.frame;
     upload_palettes(frame, staged);
     VkDeviceSize zero_vb = 0;
@@ -2870,7 +2937,15 @@ bool native_vk_draw(const NativeFrame &frame)
         si.signalSemaphoreCount = 1;
         si.pSignalSemaphores = &present_wait;
     }
-    vkQueueSubmit(g.queue, 1, &si, g.fence);
+    {   // a device that is lost draws nothing more: said once, where it was a silent still picture
+        const VkResult submitted = vkQueueSubmit(g.queue, 1, &si, g.fence);
+        static bool told;
+        if (submitted != VK_SUCCESS && !told) {
+            told = true;
+            fprintf(g_hle_log, "native: the frame was not taken by the graphics device (%d%s) at frame %u\n", (int)submitted,
+                    submitted == VK_ERROR_DEVICE_LOST ? ", the device is lost" : "", g.frame);
+        }
+    }
     if (on_screen) {
         VkPresentInfoKHR pi = {VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
         pi.waitSemaphoreCount = 1;

@@ -1,4 +1,4 @@
-// Minimal IOP kernel for modules run by the R3000 interpreter (iop_cpu.cpp).
+// Minimal IOP kernel for the module whose code is in iop_stream_*.cpp (iop_cpu.cpp): the sound driver.
 //
 // Everything on the IOP runs on one host thread ("IOP thread"). Threads are register
 // sets switched by priority like the IOP kernel does: a thread runs until it blocks
@@ -641,6 +641,12 @@ static bool load_irx(ModuleJob &job, u32 &entry)
             default: KLOG("IOP: relocation type %u at %06x\n", type, at);
             }
         }
+    }
+    // The module's code is not run from these words: it was translated ahead of time (iop_cpu.cpp). They must be the words it was
+    // translated from, at the address it was translated for.
+    if (!iop_gen_matches(base, rd32(f, iopmod + 12))) {
+        KLOG("IOP: %s at %06x is not the module this build has the code of: no sound\n", job.name.c_str(), base);
+        return false;
     }
     // names of the import stubs from the symbol table
     std::map<u32, std::string> syms;

@@ -15,5 +15,7 @@ PadState pad_read(int slot = 0);
 int pad_count();                                    // how many are connected
 bool pad_is_playstation(int slot = 0);              // that pad has PlayStation's buttons
 void pad_rumble(int slot, int small_on, int large); // large 0..255
+void pad_rumble_quiet(bool quiet);                  // the window is not in front: the motors rest until it is
+void pad_rumble_gate(int slot, bool on);            // off: this pad's player is not using it (the keyboard is)
 void pad_virtual(int slot, bool south, bool right_trigger);     // HP2_VPADS: presses on a test pad
 void pad_settle(int ms);                            // waits, that long at most, until the pads' motors are as last asked: before the program ends

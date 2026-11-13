@@ -67,6 +67,9 @@ Draw Distance	Sichtweite
 How far away scenery still shows. 100% is the PS2's.	Wie weit die Umgebung sichtbar bleibt. 100 % wie auf der PS2.
 Level of Detail	Detailstufe
 Maximum: scenery and cars always at their most detailed models. Original: as on the PS2.	Maximal: Umgebung und Autos immer mit ihren detailliertesten Modellen. Original: wie auf der PS2.
+Reflections	Spiegelungen
+High	Hoch
+The reflections on the cars. Advanced: new every frame. High: new every frame, at twice the resolution.	Die Spiegelungen auf den Autos. Erweitert: in jedem Bild neu. Hoch: in jedem Bild neu, in doppelter Auflösung.
 Show FPS	FPS anzeigen
 Frames per second in the corner of the picture.	Bilder pro Sekunde in der Bildecke.
 Advanced	Erweitert
@@ -218,3 +221,21 @@ R Stick	Stick R
 #900005	Bitte ein Gamepad@für Spieler %d@anschließen.
 #900011	Bitte ein Gamepad anschließen.
 #940001	\x80 drücken, um an diesem Event teilzunehmen.
+Select, then press the key for it. Esc cancels.	Wählen, dann die Taste drücken. Esc bricht ab.
+Zone Freeze	Zone einfrieren
+Zone Zoom	Zone zoomen
+Select, then type its name. A gamepad gets the letter grid.	Wählen, dann den Namen eingeben. Mit Gamepad erscheint das Buchstabenfeld.
+Capitals	Großbuchstaben
+Delete the profile %s? Its save and its controls will be gone.	Profil %s löschen? Spielstand und Steuerung gehen verloren.
+The profile is made. Select it to play as it.	Das Profil ist angelegt. Wählen Sie es, um damit zu spielen.
+Antialiasing	Kantenglättung
+Smoother edges: off, MSAA or SMAA.	Glattere Kanten: aus, MSAA oder SMAA.
+Off, MSAA (the scene drawn in samples) or SMAA (the picture's edges smoothed).	Aus, MSAA (die Szene in Samples gezeichnet) oder SMAA (die Kanten des Bildes geglättet).
+Quality	Qualität
+MSAA: samples a pixel. SMAA: how far it looks along an edge.	MSAA: Samples pro Pixel. SMAA: wie weit es an einer Kante entlang sucht.
+This graphics card has no more samples for the game.	Diese Grafikkarte hat nicht mehr Samples für das Spiel.
+The buttons for driving and the stick.	Die Knöpfe zum Fahren und der Stick.
+The gamepad's layouts, A to D: what each button does in a race.	Die Belegungen des Gamepads, A bis D: was jeder Knopf im Rennen tut.
+Leave the game?	Spiel beenden?
+Pick the letters. The last key of the grid makes it.	Buchstaben wählen. Die letzte Taste des Feldes übernimmt.
+Type the new name. Enter sets it, Esc leaves it.	Neuen Namen eingeben. Enter übernimmt, Esc bricht ab.

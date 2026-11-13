@@ -3,8 +3,8 @@
 
 // The file's properties (Explorer, Details)
 1 VERSIONINFO
-FILEVERSION 0,12,0,0
-PRODUCTVERSION 0,12,0,0
+FILEVERSION 0,13,0,0
+PRODUCTVERSION 0,13,0,0
 FILEFLAGSMASK 0x3f
 FILEFLAGS 0
 FILEOS 0x40004
@@ -15,10 +15,10 @@ BEGIN
     BEGIN
         BLOCK "040904b0"
         BEGIN
-            VALUE "FileDescription", "Ported by ZloiKILLER"
-            VALUE "FileVersion", "0.12"
-            VALUE "ProductName", "Need for Speed: Hot Pursuit 2"
-            VALUE "ProductVersion", "0.12"
+            VALUE "FileDescription", "Need for Speed: Hot Pursuit 2"
+            VALUE "FileVersion", "0.13"
+            VALUE "ProductName", "Ported by ZloiKILLER"
+            VALUE "ProductVersion", "0.13"
             VALUE "OriginalFilename", "speed.exe"
         END
     END
@@ -38,3 +38,6 @@ LANG_SPANISH RCDATA "../data/lang/SPANISH.txt"
 LANG_SWEDISH RCDATA "../data/lang/SWEDISH.txt"
 UI_CURSOR RCDATA "../data/ui/cursor.cur"
 README RCDATA "../data/README.txt"
+// The Asia and Korea discs' program into the USA one (install.cpp, tools/recomp/make_disc_patch.py)
+PATCH_SLPM_65181 RCDATA "../data/patch/SLPM_651.81.hp2p"
+PATCH_SLPM_67527 RCDATA "../data/patch/SLPM_675.27.hp2p"

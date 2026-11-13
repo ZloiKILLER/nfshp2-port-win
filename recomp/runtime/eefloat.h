@@ -78,7 +78,7 @@ static inline float fclamp(float v)
     return v;
 }
 
-static inline float ee_add(float a, float b)
+static inline float ee_add_fast(float a, float b)
 {
     EE_N(0);
 #ifndef EE_HOST_ADD
@@ -92,6 +92,69 @@ static inline float ee_add(float a, float b)
     return fclamp(a + b);
 #endif
 }
+
+// TEMP (-DEE_CHECK): each operation's result against the integer model's (PCSX2's DoAdd as work/eefloat/test.cpp has it; the
+// multiplier and the recurrences below), what differs counted and the first written down (ee_check_report, ps2.cpp), and the model's
+// result returned. A replay that stays in step so, and does not without, says the difference is in one of these. Kinds: 0 add, 1 mul,
+// 2 div, 3 sqrt, 4 a lane of add4, 5 a lane of mul4.
+#ifdef EE_CHECK
+void ee_check_report(int kind, uint32_t a, uint32_t b, uint32_t fast, uint32_t model);
+// HP2_EECHK (default 7): 1 the model's values past the host's range are kept (exponent 255: the EE has no infinity, they are numbers),
+// 2 compares, max and min as the EE's (by sign and magnitude, whatever the exponent), 4 the model's sign of a zero
+extern int g_ee_chk;
+// PCSX2's PS2Float::Add: an operand of exponent 0 is nothing (the other comes back; two give a zero, signed as the larger), else the
+// smaller loses its low bits and DoAdd sums the mantissas
+static inline uint32_t ee_ref_add(uint32_t a, uint32_t b)
+{
+    int ea = a >> 23 & 255, eb = b >> 23 & 255;
+    if (!ea || !eb) {
+        if (ea) return a;
+        if (eb) return b;
+        const uint32_t ma = a & 0x7fffffff, mb = b & 0x7fffffff;
+        if (!ma && !mb) return a & b & 0x80000000u;
+        return (ma >= mb ? a : b) & 0x80000000u;
+    }
+    int d = ea - eb;
+    if (d > 0 && d < 25) b &= 0xffffffffu << (d - 1);
+    else if (d < 0 && d > -25) a &= 0xffffffffu << (-d - 1);
+    if (d < 0) { uint32_t t = a; a = b; b = t; ea = a >> 23 & 255; eb = b >> 23 & 255; d = -d; }
+    if (d >= 25) return a;
+    const int rm = 6;
+    const uint32_t s1 = (uint32_t)((int32_t)a >> 31), s2 = (uint32_t)((int32_t)b >> 31);
+    const int32_t m1 = (int32_t)((((a & 0x7fffff) | 0x800000) ^ s1) - s1), m2 = (int32_t)((((b & 0x7fffff) | 0x800000) ^ s2) - s2);
+    const int32_t man = (int32_t)((uint32_t)m1 << rm) + ((int32_t)((uint32_t)m2 << rm) >> d);
+    const int32_t am = man < 0 ? -man : man;
+    if (!am) return 0;
+    int e = ea - rm, msb = 31;
+    while (!((uint32_t)am >> msb & 1)) msb--;
+    e += msb - 23;
+    const uint32_t mant = msb >= 23 ? ((uint32_t)am >> (msb - 23)) : ((uint32_t)am << (23 - msb));
+    if (e > 255) return man < 0 ? 0xffffffff : 0x7fffffff;
+    if (e < 1) return (uint32_t)(man < 0) << 31;
+    return ((uint32_t)man & 0x80000000u) | (uint32_t)e << 23 | (mant & 0x7fffff);
+}
+// what the wrappers give back: the fast one's where the model agrees or the kind of difference is switched off, else the model's
+static inline float ee_checked(int kind, uint32_t a, uint32_t b, float fast, uint32_t model)
+{
+    if (ee_bits(fast) == model) return fast;
+    const bool big = (a & 0x7f800000u) == 0x7f800000u || (b & 0x7f800000u) == 0x7f800000u || (model & 0x7f800000u) == 0x7f800000u;
+    const bool zero = !((ee_bits(fast) | model) & 0x7fffffffu);
+    ee_check_report(kind, a, b, ee_bits(fast), model);
+    if (big) return g_ee_chk & 1 ? ee_float(model) : fast;
+    if (zero) return g_ee_chk & 4 ? ee_float(model) : fast;
+    return ee_float(model);
+}
+// the EE's compare: sign and magnitude as integers
+static inline int ee_cmp(float a, float b)
+{
+    const uint32_t x = ee_bits(a), y = ee_bits(b);
+    const int32_t p = x >> 31 ? -(int32_t)(x & 0x7fffffff) : (int32_t)(x & 0x7fffffff), q = y >> 31 ? -(int32_t)(y & 0x7fffffff) : (int32_t)(y & 0x7fffffff);
+    return p < q ? -1 : p > q;
+}
+static inline float ee_add(float a, float b) { return ee_checked(0, ee_bits(a), ee_bits(b), ee_add_fast(a, b), ee_ref_add(ee_bits(a), ee_bits(b))); }
+#else
+static inline float ee_add(float a, float b) { return ee_add_fast(a, b); }
+#endif
 
 static inline float ee_sub(float a, float b) { return ee_add(a, ee_float(ee_bits(b) ^ 0x80000000u)); }
 
@@ -170,7 +233,7 @@ static inline float ee_mul_slow(uint32_t x, uint32_t y, float r)
     return ee_float(((x ^ y) & 0x80000000u) | (uint32_t)e << 23 | (m & 0x7fffff));
 }
 
-static inline float ee_mul(float a, float b)
+static inline float ee_mul_fast(float a, float b)
 {
     EE_N(1);
 #ifdef EE_COUNT
@@ -184,6 +247,24 @@ static inline float ee_mul(float a, float b)
 #endif
     return r;
 }
+
+#ifdef EE_CHECK
+static inline uint32_t ee_ref_mul(uint32_t a, uint32_t b)
+{
+    const uint32_t ea = a >> 23 & 255, eb = b >> 23 & 255;
+    if (!ea || !eb) return (a ^ b) & 0x80000000u;
+    const uint32_t ma = (a & 0x7fffff) | 0x800000, mb = (b & 0x7fffff) | 0x800000;
+    int32_t e = (int32_t)ea + (int32_t)eb - 127;
+    uint32_t m = (uint32_t)(ee_mul_mantissa(ma, mb) >> 23);
+    if (m > 0xffffff) m >>= 1, e++;
+    if (e > 255) return ((a ^ b) & 0x80000000u) | 0x7fffffff;
+    if (e < 1) return (a ^ b) & 0x80000000u;
+    return ((a ^ b) & 0x80000000u) | (uint32_t)e << 23 | (m & 0x7fffff);
+}
+static inline float ee_mul(float a, float b) { return ee_checked(1, ee_bits(a), ee_bits(b), ee_mul_fast(a, b), ee_ref_mul(ee_bits(a), ee_bits(b))); }
+#else
+static inline float ee_mul(float a, float b) { return ee_mul_fast(a, b); }
+#endif
 
 // The divider and the square root: 25 steps of a radix-2 SRT recurrence on a carry-save remainder (PCSX2's, after DOI
 // 10.1109/ARITH.1995.465363), the quotient then cut to 24 bits. Its last digit may leave the quotient above the true one.
@@ -262,7 +343,7 @@ static inline uint32_t ee_past_ulp(double v)
     return (uint32_t)(b & 0x1fffffff);
 }
 
-static inline float ee_div(float a, float b)
+static inline float ee_div_fast(float a, float b)
 {
     EE_N(2);
 #ifdef EE_COUNT
@@ -302,7 +383,7 @@ static inline float ee_div(float a, float b)
 #endif
 }
 
-static inline float ee_sqrt(float a)
+static inline float ee_sqrt_fast(float a)
 {
     EE_N(3);
 #ifndef EE_HOST_SQRT
@@ -320,6 +401,26 @@ static inline float ee_sqrt(float a)
     return std::sqrt(std::fabs(a));
 #endif
 }
+
+#ifdef EE_CHECK
+// PCSX2's PS2Float::Div: nothing over anything is a zero, anything over nothing the largest value; the quotient's exponent may be 255
+static inline uint32_t ee_ref_div(uint32_t x, uint32_t y)
+{
+    const uint32_t sign = (x ^ y) & 0x80000000u, ex = x >> 23 & 255, ey = y >> 23 & 255;
+    if (!ey) return sign | 0x7fffffffu;
+    if (!ex) return sign;
+    const uint32_t r = ee_bits(ee_div_srt(ee_float(0x3f800000u | (x & 0x7fffff)), ee_float(0x3f800000u | (y & 0x7fffff))));
+    const int e = (int)(r >> 23 & 255) + (int)ex - (int)ey;
+    if (e > 255) return sign | 0x7fffffffu;
+    if (e < 1) return sign;
+    return sign | (uint32_t)e << 23 | (r & 0x7fffff);
+}
+static inline float ee_div(float a, float b) { return ee_checked(2, ee_bits(a), ee_bits(b), ee_div_fast(a, b), ee_ref_div(ee_bits(a), ee_bits(b))); }
+static inline float ee_sqrt(float a) { return ee_checked(3, ee_bits(a), 0, ee_sqrt_fast(a), ee_bits(ee_sqrt_srt(a))); }
+#else
+static inline float ee_div(float a, float b) { return ee_div_fast(a, b); }
+static inline float ee_sqrt(float a) { return ee_sqrt_fast(a); }
+#endif
 
 // a / sqrt(|b|), each rounded as the EE has it
 static inline float ee_rsqrt(float a, float b) { return ee_div(a, ee_sqrt(b)); }
@@ -343,7 +444,7 @@ static inline ee_v4f ee_clamp4(ee_v4f v)
     return v;
 }
 
-static inline ee_v4f ee_add4(ee_v4f a, ee_v4f b)
+static inline ee_v4f ee_add4_fast(ee_v4f a, ee_v4f b)
 {
     EE_N(4);
 #ifndef EE_HOST_ADD
@@ -371,9 +472,20 @@ static inline ee_v4f ee_add4(ee_v4f a, ee_v4f b)
 #endif
 }
 
+#ifdef EE_CHECK
+static inline ee_v4f ee_add4(ee_v4f a, ee_v4f b)
+{
+    ee_v4f r = ee_add4_fast(a, b);
+    for (int i = 0; i < 4; i++) r[i] = ee_checked(4, ee_bits(a[i]), ee_bits(b[i]), r[i], ee_ref_add(ee_bits(a[i]), ee_bits(b[i])));
+    return r;
+}
+#else
+static inline ee_v4f ee_add4(ee_v4f a, ee_v4f b) { return ee_add4_fast(a, b); }
+#endif
+
 static inline ee_v4f ee_sub4(ee_v4f a, ee_v4f b) { return ee_add4(a, (ee_v4f)((ee_v4u)b ^ 0x80000000u)); }
 
-static inline ee_v4f ee_mul4(ee_v4f a, ee_v4f b)
+static inline ee_v4f ee_mul4_fast(ee_v4f a, ee_v4f b)
 {
     EE_N(5);
     ee_v4f r = ee_clamp4(a * b);
@@ -383,14 +495,31 @@ static inline ee_v4f ee_mul4(ee_v4f a, ee_v4f b)
     const ee_v4i maybe = (ee_v4i)(((x * y) & 0x7f8000u) == 0u);
     uint64_t w[2];
     memcpy(w, &maybe, 16);
-    if (__builtin_expect((w[0] | w[1]) != 0, 0))
-        for (int i = 0; i < 4; i++) {
-            const uint32_t xi = x[i], yi = y[i];
-            if (ee_mul_differs(xi, yi)) r[i] = ee_mul_slow(xi, yi, r[i]);
-        }
+    if (__builtin_expect((w[0] | w[1]) != 0, 0)) {
+        // the rest of ee_mul_differs for all four before any lane is taken apart: a zero or a round second operand has those bits
+        // zero every time (a matrix of the identity's kind against anything), and has nothing to correct
+        const ee_v4i real = maybe & (ee_v4i)((y & 0xffffu) != 0u) & (ee_v4i)((x & 0x7f800000u) != 0u) & (ee_v4i)((y & 0x7f800000u) != 0u);
+        memcpy(w, &real, 16);
+        if (w[0] | w[1])
+            for (int i = 0; i < 4; i++) {
+                const uint32_t xi = x[i], yi = y[i];
+                if (real[i]) r[i] = ee_mul_slow(xi, yi, r[i]);
+            }
+    }
 #endif
     return r;
 }
+
+#ifdef EE_CHECK
+static inline ee_v4f ee_mul4(ee_v4f a, ee_v4f b)
+{
+    ee_v4f r = ee_mul4_fast(a, b);
+    for (int i = 0; i < 4; i++) r[i] = ee_checked(5, ee_bits(a[i]), ee_bits(b[i]), r[i], ee_ref_mul(ee_bits(a[i]), ee_bits(b[i])));
+    return r;
+}
+#else
+static inline ee_v4f ee_mul4(ee_v4f a, ee_v4f b) { return ee_mul4_fast(a, b); }
+#endif
 
 // the multiplier's table, from the model: once, before any of the game's maths
 static inline void ee_float_init()
