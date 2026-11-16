@@ -2186,6 +2186,42 @@ void HOOK_DoSteering__10RealDriverf12JoystickPort(Ctx &c, void (*orig)(Ctx &))
     SW(at, was);
 }
 
+// tCopManager::IsCopNearby(car, the bust's distance): what tPursuit's check of the player asks of a slow car (the manager at gp-15620,
+// the distance the float at gp-15592)
+static bool cop_near(Ctx &c, u32 car)
+{
+    const u32 gp = c.r[28].w[0], cops = LW(gp - 15620);
+    if (!cops) return false;
+    Ctx saved = c;
+    c.r[4].d[0] = (u64)(s64)(s32)cops;
+    c.r[5].d[0] = (u64)(s64)(s32)car;
+    c.f[12].u = LW(gp - 15592);
+    c.r[29].d[0] -= 0x200;
+    ps2_call(c, 0x225d30);
+    const bool near = c.r[2].w[0] != 0;
+    c = saved;
+    return near;
+}
+
+// A reset during a chase. RealDriver::JoyHandler_ResetCar puts the car back on the road (0x132f20) and marks it as just reset,
+// car+2140 = 2, which Car::Drive counts down a frame at a time. tPursuit's check of the player (0x22bea0) takes a blinking car with that
+// mark for busted at once, with no cop near or speed asked, so on the PS2 a reset is an arrest for as long as the chase lasts, with the
+// cops long out of sight. Here it is an arrest only with a cop within the bust's distance of the car when the reset is asked; else the
+// mark is put back as it was, the car still goes back and blinks and the chase goes on. Nothing else reads the mark but the replay's
+// snapshot. HP2_PS2RESET: the PS2's way. Never for the attract demo (a PS2 recording).
+void HOOK_JoyHandler_ResetCar__10RealDriver12JoystickPort8JoyEventUcPv(Ctx &c, void (*orig)(Ctx &))
+{
+    const u32 gp = c.r[28].w[0], rc = LW(gp - 22216), car = LW(c.r[7].w[0] + 560);
+    static const bool ps2 = getenv("HP2_PS2RESET") != nullptr;
+    if (ps2 || !car || (rc && LW(rc) == 9) || cop_near(c, car)) {
+        orig(c);
+        return;
+    }
+    const u32 was = LW(car + 2140);
+    orig(c);
+    SW(car + 2140, was);
+}
+
 void HOOK_Think__15AICarControllerf(Ctx &c, void (*orig)(Ctx &))
 {
     const u32 gp = c.r[28].w[0], rc = LW(gp - 22216);
