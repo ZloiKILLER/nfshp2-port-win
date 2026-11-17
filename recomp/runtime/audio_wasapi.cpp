@@ -1,6 +1,8 @@
 // audio_out.h on WASAPI: shared mode, event driven, 48 kHz stereo 16-bit (Windows
 // converts to the mix format).
 #include "audio_out.h"
+#include "phase.h"
+#include "cores.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -58,6 +60,8 @@ bool audio_out_start(AudioPull pull)
     bool ok = false;
     HANDLE ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     std::thread([pull, ready, &ok] {
+        phase_thread("audio out");
+        cores_thread(CORE_SOUND);
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         bool opened = open_device();
         ok = opened;

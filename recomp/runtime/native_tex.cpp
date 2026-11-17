@@ -4,6 +4,7 @@
 
 #include "host.h"
 #include "ps2.h"
+#include "phase.h"
 #include "memwatch.h"
 
 #include <chrono>
@@ -155,7 +156,9 @@ static void decode(u32 *out, int tw, int th, int w, int h, const u8 *px, const u
     pad();
 }
 
-// ---- replacements: data/replace/<name>.png or <name>@<crc>.png takes a texture's place (tools/recomp/export_textures.py) -----------
+// ---- replacements: <name>.png or <name>@<crc>.png takes a texture's place (tools/recomp/export_textures.py) -----------------------
+// Since 2026-11-13 the game looks for none by itself (no data\replace: the user, "a tool for the assets comes later"). What is left
+// is for that tool and for the check of the decoder: HP2_REPLACE=<folder> names where the PNGs are.
 
 struct ReplacementImage {
     std::vector<u32> px;    // the GS's bytes: alpha 0x80 is 1.0
@@ -172,8 +175,9 @@ static const std::unordered_map<std::string, std::string> &replacement_files()
     if (scanned) return files;
     scanned = true;
     namespace fs = std::filesystem;
-    const char *env = getenv("HP2_DATA");
-    const fs::path dir = (env ? fs::path(env) : fs::path(host_exe_dir())) / "data" / "replace";
+    const char *env = getenv("HP2_REPLACE");
+    if (!env || !*env) return files;
+    const fs::path dir = env;
     std::error_code ec;
     for (fs::recursive_directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
         if (!it->is_regular_file(ec) || it->path().extension() != ".png") continue;
@@ -409,8 +413,16 @@ static NativeTexture *native_texture_now(uint32_t info, uint32_t frame)
     u32 mmin = LB(info + 0x70);
     t.mag_linear = LB(info + 0x6f) != 0;
     t.min_linear = mmin == 1 || mmin == 4 || mmin == 5;
+    {
+        // The track's map in a race, TRACKnn_MAP: 256 x 256 of the whole track, of which the HUD shows a part several times larger,
+        // and the game asks for the nearest texel, squares at any size above the PS2's. Filtered here (HP2_MAPSHARP=1: as the game asks).
+        static const bool sharp = getenv("HP2_MAPSHARP") != nullptr;
+        const char *name = (const char *)host(info + 8);
+        if (!sharp && !strncmp(name, "TRACK", 5) && !strcmp(name + 7, "_MAP")) t.mag_linear = t.min_linear = true;
+    }
     t.mip_linear = mmin == 3 || mmin == 5;
     if (t.image_w == w && t.image_h == h && t.sum == sum && on_gpu) return &t;
+    Phase timed(PH_TEXTURES);
     t.image_w = w;
     t.image_h = h;
     t.w = 1 << LB(info + 0x48);

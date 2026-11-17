@@ -1,0 +1,29 @@
+// savestransfer.exe: a memory card (savestransfer.ico, drawn by make_icon.py), for the file and for the window
+1 ICON "savestransfer.ico"
+
+// The file's properties (Explorer, Details); the version is this program's own, not the game's
+1 VERSIONINFO
+FILEVERSION 0,1,0,0
+PRODUCTVERSION 0,1,0,0
+FILEFLAGSMASK 0x3f
+FILEFLAGS 0
+FILEOS 0x40004
+FILETYPE 1
+FILESUBTYPE 0
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "FileDescription", "PS2 Memcard Saves manager"
+            VALUE "FileVersion", "0.1"
+            VALUE "ProductName", "Ported by ZloiKILLER"
+            VALUE "ProductVersion", "0.1"
+            VALUE "OriginalFilename", "savestransfer.exe"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

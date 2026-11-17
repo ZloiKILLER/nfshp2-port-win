@@ -14,6 +14,24 @@ Player Names	Spielernamen
 Set your player names.	Spielernamen festlegen.
 Languages	Sprachen
 Choose the language of the game.	Sprache des Spiels wählen.
+Extras	Extras
+Bonus features of the game.	Bonusfunktionen des Spiels.
+The developers' debug menu, in the pause menu.	Das Debug-Menü der Entwickler, im Pausenmenü.
+Cheat Menu	Cheat-Menü
+F8 in the menus opens the game's cheats.	F8 in den Menüs öffnet die Cheats des Spiels.
+Cheats	Cheats
+Effects	Effekte
+The game's easter eggs.	Die Easter Eggs des Spiels.
+Cars	Autos
+Cars a code opens.	Autos, die ein Code freischaltet.
+Cop Cars	Polizeiautos
+Cop cars for You're The Cop.	Polizeiautos für den Polizei-Modus.
+Tracks	Strecken
+Tracks a code opens.	Strecken, die ein Code freischaltet.
+All	Alle
+Every one in this list, on or off.	Alle in dieser Liste, an oder aus.
+Some	Einige
+As if its code had been entered.	Als wäre sein Code eingegeben worden.
 Credits	Mitwirkende
 See who made this game.	Sehen Sie, wer dieses Spiel gemacht hat.
 Master Volume	Gesamtlautstärke
@@ -32,11 +50,10 @@ Off	Aus
 Selected	Gewählt
 Current	Aktuell
 Maximum	Maximal
+Ultra	Ultra
 Original	Original
 Fullscreen	Vollbild
 Windowed	Fenster
-Smooth	Weich
-Sharp	Scharf
 First	Erstes
 Second	Zweites
 Auto	Auto
@@ -62,12 +79,16 @@ Choose one to delete.	Eines zum Löschen wählen.
 Resolution	Auflösung
 The window, the screen's resolution and the render scale.	Fenster, Bildschirmauflösung und Renderskalierung.
 Frame Rate	Bildrate
-The race's frame rate. The PS2's was 30.	Bildrate im Rennen. Auf der PS2 waren es 30.
+The PS2's was 30. Above 60 the game still runs at 60, with pictures drawn in between.	Die PS2 hatte 30. Über 60 läuft das Spiel weiter mit 60, dazwischen werden Bilder gezeichnet.
 Draw Distance	Sichtweite
-How far away scenery still shows. 100% is the PS2's.	Wie weit die Umgebung sichtbar bleibt. 100 % wie auf der PS2.
+How far away scenery still shows. Original: as on the PS2. Advanced: twice as far. High: four times. Maximum: six times.	Wie weit die Umgebung sichtbar bleibt. Original: wie auf der PS2. Erweitert: doppelt so weit. Hoch: viermal. Maximal: sechsmal.
 Level of Detail	Detailstufe
 Maximum: scenery and cars always at their most detailed models. Original: as on the PS2.	Maximal: Umgebung und Autos immer mit ihren detailliertesten Modellen. Original: wie auf der PS2.
 Reflections	Spiegelungen
+Shadows	Schatten
+The cars' shadows. High: the body's own outline, lying on whatever is under it. Maximum: finer still.	Die Schatten der Autos. Hoch: der Umriss der Karosserie selbst, auf allem, was darunter liegt. Maximum: noch feiner.
+Particles	Partikel
+Smoke, sparks and dust. Advanced: the same, with soft edges.	Rauch, Funken und Staub. Erweitert: dieselben, mit weichen Rändern.
 High	Hoch
 The reflections on the cars. Advanced: new every frame. High: new every frame, at twice the resolution.	Die Spiegelungen auf den Autos. Erweitert: in jedem Bild neu. Hoch: in jedem Bild neu, in doppelter Auflösung.
 Show FPS	FPS anzeigen
@@ -76,16 +97,13 @@ Advanced	Erweitert
 Anti-aliasing, texture filtering, brightness, contrast and gamma.	Kantenglättung, Texturfilter, Helligkeit, Kontrast und Gamma.
 Window	Fenster
 Window or borderless fullscreen. Alt+Enter switches too.	Fenster oder randloses Vollbild. Auch Alt+Enter schaltet um.
-The size of the window. Fullscreen fills the monitor.	Größe des Fensters. Vollbild füllt den Monitor.
-Aspect Ratio	Seitenverhältnis
-The race's picture, no wider than the window. The menus stay 4:3.	Das Bild im Rennen, nicht breiter als das Fenster. Die Menüs bleiben 4:3.
-A 4:3 window shows the race in 4:3. A wider one has the wider pictures.	Ein 4:3-Fenster zeigt das Rennen in 4:3. Ein breiteres hat die breiteren Bilder.
-Fullscreen is the monitor's own resolution. Windowed has the sizes.	Vollbild hat die Auflösung des Monitors. Im Fenster gibt es die Größen.
-On: each frame waits for the screen, no tearing. Off: shown at once.	An: Jedes Bild wartet auf den Bildschirm, kein Zerreißen. Aus: sofort gezeigt.
+The picture's size. Fullscreen stretches it to the monitor.	Größe des Bildes. Vollbild streckt es auf den Monitor.
+The race's picture: as wide as the resolution, or 4:3. The menus stay 4:3.	Das Rennbild: so breit wie die Auflösung oder 4:3. Die Menüs bleiben 4:3.
+A 4:3 resolution shows the race in 4:3. A wider one has the wider picture.	Eine 4:3-Auflösung zeigt das Rennen in 4:3. Eine breitere hat das breite Bild.
 Render Scale	Renderskalierung
-The picture's detail, times the PS2's 512 x 448.	Bilddetails als Vielfaches der 512 x 448 der PS2.
-Scaling	Skalierung
-How the picture is scaled to the window.	Wie das Bild an das Fenster angepasst wird.
+How finely the picture is drawn: 100% is the resolution itself.	Wie fein das Bild berechnet wird: 100% ist die Auflösung selbst.
+Aspect Ratio	Seitenverhältnis
+On: each frame waits for the screen, no tearing. Off: shown at once.	An: Jedes Bild wartet auf den Bildschirm, kein Zerreißen. Aus: sofort gezeigt.
 Anti-Aliasing	Kantenglättung
 Smoother edges.	Glattere Kanten.
 Anisotropic Filtering	Anisotrope Filterung
@@ -98,6 +116,22 @@ Contrast	Kontrast
 The difference between light and dark.	Der Unterschied zwischen hell und dunkel.
 Gamma	Gamma
 Above 1.00 the dark parts get lighter.	Über 1.00 werden dunkle Bereiche heller.
+Ambient Occlusion	Umgebungsverdeckung
+Soft shading where surfaces meet: under cars, by walls and kerbs.	Weiche Schattierung, wo Flächen aufeinandertreffen: unter Autos, an Mauern und Bordsteinen.
+Unlimited	Unbegrenzt
+Monitor	Monitor
+The screen the game is shown on.	Der Bildschirm, auf dem das Spiel gezeigt wird.
+Automatic	Automatisch
+Select GPU	Grafikkarte wählen
+Which graphics card draws the game. Changing it restarts the game.	Welche Grafikkarte das Spiel zeichnet. Ein Wechsel startet das Spiel neu.
+The game chooses: a separate graphics card before a built-in one.	Das Spiel wählt: eine eigene Grafikkarte vor einer eingebauten.
+Draw the game with this graphics card.	Das Spiel mit dieser Grafikkarte zeichnen.
+The game will restart to draw with another graphics card. Continue?	Das Spiel startet neu, um eine andere Grafikkarte zu verwenden. Fortfahren?
+This is the choice in use.	Das ist die aktuelle Wahl.
+In Use	In Gebrauch
+Dithering	Dithering
+Smooth gradients without colour steps.	Weiche Verläufe ohne Farbstufen.
+Low	Niedrig
 Defaults	Standard
 Brightness, contrast and gamma as they were.	Helligkeit, Kontrast und Gamma wie zuvor.
 The picture is back to the defaults.	Das Bild ist wieder auf Standard.
@@ -222,8 +256,12 @@ R Stick	Stick R
 #900011	Bitte ein Gamepad anschließen.
 #940001	\x80 drücken, um an diesem Event teilzunehmen.
 Select, then press the key for it. Esc cancels.	Wählen, dann die Taste drücken. Esc bricht ab.
-Zone Freeze	Zone einfrieren
-Zone Zoom	Zone zoomen
+Zone Freeze / Helicopter	Zone einfrieren / Helikopter
+Zone Zoom / Road Block	Zone zoomen / Straßensperre
+Racer: Zone Freeze. Cop: call the helicopter.	Fahrer: Zone einfrieren. Polizist: Helikopter.
+Racer: Zone Zoom. Cop: ask for a road block.	Fahrer: Zone zoomen. Polizist: Straßensperre.
+Horn. Police car: siren. Cop: next suspect.	Hupe. Polizei: Sirene, nächster Verdächtiger.
+The cop's turbo: a few seconds faster.	Polizei-Turbo: ein paar Sekunden schneller.
 Select, then type its name. A gamepad gets the letter grid.	Wählen, dann den Namen eingeben. Mit Gamepad erscheint das Buchstabenfeld.
 Capitals	Großbuchstaben
 Delete the profile %s? Its save and its controls will be gone.	Profil %s löschen? Spielstand und Steuerung gehen verloren.

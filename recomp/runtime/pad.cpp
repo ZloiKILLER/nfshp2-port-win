@@ -9,6 +9,8 @@
 #include "pad.h"
 
 #include "pcconfig.h"
+#include "phase.h"
+#include "cores.h"
 
 #include <SDL3/SDL.h>
 #include <atomic>
@@ -123,6 +125,8 @@ bool is_playstation(SDL_Gamepad *p)
 
 void pad_thread()
 {
+    phase_thread("pads");
+    cores_thread(CORE_BACKGROUND);
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) {
         fprintf(stderr, "pad: SDL's gamepads did not start: %s\n", SDL_GetError());

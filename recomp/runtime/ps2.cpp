@@ -1,6 +1,9 @@
 // Host side of the recompiled EE: memory, ELF loading, BIOS syscalls,
 // hardware register access and the indirect-call dispatcher.
 #include "ps2.h"
+#include "stall.h"
+#include "phase.h"
+#include "cores.h"
 #include "hw.h"
 #include "pcconfig.h"
 #include "disc.h"
@@ -156,6 +159,7 @@ static Ctx *g_ctx;
 static std::map<u32, int> g_io_seen;
 
 void profile_start();                       // profile.cpp
+std::atomic<int> g_stall_cd_us, g_stall_rpc_us;         // stall.h
 
 [[noreturn]] static void die(const char *what, Ctx &c, u32 pc)
 {
@@ -221,6 +225,7 @@ void raise_intc(int cause)
 void ps2_idle(Ctx &c)
 {
     if (!g_irq_pending) {
+        Phase timed(PH_WAIT_VSYNC);
         std::unique_lock<std::mutex> lock(g_idle_lock);
         g_idling = true;
         // the time is only a guard: the loop looks at its variable again in any case
@@ -293,6 +298,8 @@ static void peek()
 static void start_vblank_timer()
 {
     std::thread([] {
+        phase_thread("vblank");
+        cores_thread(CORE_SOUND);           // the field's clock: short and on time, as the sound is
         auto next = std::chrono::steady_clock::now();
         // HP2_VBLANKUS=<microseconds>: a shorter field for checking runs, a replay's steps are the same at any speed
         static const int field = getenv("HP2_VBLANKUS") ? atoi(getenv("HP2_VBLANKUS")) : 16683;
@@ -399,6 +406,81 @@ void ps2_syscall(Ctx &c, u32 pc)
 }
 
 void ps2_break(Ctx &c, u32 pc) { die("break", c, pc); }
+
+// The game's own assert (bAssertFail, 0x250ac0: the expression, the file, the line; it prints them nowhere on a retail disc and then
+// breaks, which stops the game here as it would hang a PS2). The log gets what it said, so a tester's log names the check that failed.
+void HOOK_bAssertFail__FPCcT0i(Ctx &c, void (*orig)(Ctx &))
+{
+    const u32 expr = c.r[4].w[0], file = c.r[5].w[0];
+    auto text = [](u32 a) {
+        static char buf[2][96];
+        static int turn;
+        char *out = buf[turn ^= 1];
+        const char *in = a >= 0x100000 && a < 0x2000000 ? (const char *)host(a) : "?";
+        size_t n = 0;
+        for (; n < 95 && in[n] >= 32 && in[n] < 127; n++) out[n] = in[n];
+        out[n] = 0;
+        return out;
+    };
+    fprintf(stderr, "the game's assert failed: \"%s\", %s line %d (called from %08x)\n", text(expr), text(file), (int)c.r[6].w[0], c.r[31].w[0]);
+    fflush(stderr);
+    orig(c);
+}
+
+// The sound's 48 voices: a sample that keeps its voices (an engine, a siren, a stream) takes a run of them in the table at 0x322490
+// (bSnd_LockChannels, 0x2638a0; 0xfffc: no run that long is free) and gives them back (bSnd_UnlockChannels). A tester's log of 0.13
+// (two players, You're the Cop, Island Outskirts) ends in the assert on that 0xfffc as the race starts: the log now says who asked.
+static void voices_line(const char *what, u32 n, u32 at, u32 ra)
+{
+    static const bool all = getenv("HP2_VOICELOG") != nullptr;     // every keep and free, not only the ones that found no room
+    const bool failed = at == 0xfffc;
+    if (!failed && !all) return;
+    static int told;
+    if (failed && !all && told++ >= 40) return;     // the menus' sounds may ask in vain many times over: the first forty say enough
+    char table[49];
+    int kept = 0;
+    for (int i = 0; i < 48; i++) table[i] = host(0x322490)[i] ? (kept++, '#') : '.';
+    table[48] = 0;
+    fprintf(stderr, "sound voices: %s %u at %u (from %08x): %d of 48 kept [%s]%s\n", what, n, at, ra, kept, table, failed ? " NO ROOM" : "");
+}
+void HOOK_bSnd_LockChannels__FUs(Ctx &c, void (*orig)(Ctx &))
+{
+    const u32 n = c.r[4].w[0] & 0xffff, ra = c.r[31].w[0];
+    // TEMP HP2_VOICETEST=1: the eighth such question finds every voice kept, and three tries later they are as they were
+    static const bool test = getenv("HP2_VOICETEST") != nullptr;
+    static int asked;
+    u8 kept_were[48];
+    const bool faked = test && ra >= 0x273388 && ra < 0x273468 && ++asked == 8;
+    if (faked) memcpy(kept_were, host(0x322490), 48), memset(host(0x322490), 1, 48);
+    orig(c);
+    // No run of free voices, asked by bSample::LockVoice (0x2733c0), which asserts on that and stops the game. A voice counts as
+    // free when it is not kept and the sound driver's status says it has ended (SOUND_FindFreeSPUChannels reads the table that
+    // SOUND_CopyIOPBuffer fills once a frame, in bSnd_DriverUpdate). A race starts here seconds sooner than a PS2 loaded it, with
+    // the menu's sounds still dying away, and the engines, the sirens and the streams all ask at once. So the voices are given
+    // time: a few milliseconds, the driver's update, and the question again, for up to half a second. Still none: as the game has it.
+    if ((c.r[2].w[0] & 0xffff) == 0xfffc && ra >= 0x273388 && ra < 0x273468) {
+        voices_line("keep", n, 0xfffc, ra);
+        int waited = 0;
+        for (; waited < 125 && (c.r[2].w[0] & 0xffff) == 0xfffc; waited++) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(4));
+            if (faked && waited == 3) memcpy(host(0x322490), kept_were, 48);
+            Ctx saved = c;
+            c.r[29].d[0] -= 0x200;
+            ps2_call(c, 0x25f418);          // bSnd_DriverUpdate
+            c = saved;
+            c.r[4].d[0] = n;
+            orig(c);
+        }
+        fprintf(stderr, "sound voices: waited %d ms for voices that were ending: %s\n", waited * 4, (c.r[2].w[0] & 0xffff) == 0xfffc ? "none came free" : "room now");
+    }
+    voices_line("keep", n, c.r[2].w[0] & 0xffff, ra);
+}
+void HOOK_bSnd_UnlockChannels__FUsUs(Ctx &c, void (*orig)(Ctx &))
+{
+    const u32 at = c.r[4].w[0] & 0xffff, n = c.r[5].w[0] & 0xffff, ra = c.r[31].w[0];
+    orig(c);
+    voices_line("free", n, at, ra);
+}
 
 void ps2_unimpl(Ctx &c, u32 pc, u32 word)
 {
@@ -590,6 +672,9 @@ int main()
         for (const auto &w : kLayoutsPatch) SW(w[0], w[1]);
     fprintf(g_log, "entry %08x\n", entry);
     profile_start();
+    stall_watch_start();
+    cores_init();
+    cores_thread(CORE_GAME);
     start_vblank_timer();
     pc_config_init();
     if (!getenv("HP2_NOWINDOW")) {

@@ -34,7 +34,8 @@ What a build needs: this repository, your disc image, and
    cmake --build build --target hp2recomp
    ```
 
-   `speed.exe` appears in `recompwin/`. SDL3 is built from `third_party/SDL3-3.4.18.tar.gz`.
+   `speed.exe` appears in `recompwin/`. SDL3 is built from `third_party/SDL3-3.4.18.tar.gz`. The Saves Manager `savestransfer.exe`
+   (target `savestransfer`) is built first, beside it: `speed.exe` carries it and its setup puts it in the game's folder.
 
    `-DHP2_PGO=USE` builds by `recomp/pgo/speed.profdata`: counts of what the game really runs (five demos, the menus, a race), by which
    the compiler lays the code out. It changes no result, only the speed, about a seventh less processor time; the release is built
@@ -48,6 +49,7 @@ The same tools give the same `speed.exe` as in Releases, and with the same disc 
 |---|---|
 | `recomp/runtime/` | the runtime: the PS2's hardware where the game needs it, the renderer, sound, input, menus, the first start's setup |
 | `recomp/data/` | what the exe carries into the game's folder: the port's texts in six languages, the cursor, the README, the names of the disc's files; `recomp/data/patch/` has the patches the port applies |
+| `recomp/savestransfer/` | the Saves Manager: PS2 memory cards (images, PCSX2 folder cards) and `.psu`/`.max`/`.cbs` save files to and from the port's profiles, its icon's maker and its tests (`README.md` there) |
 | `recomp/symbols/` | the recompiler's table of the game's functions |
 | `recomp/pgo/` | the counts the release is built by (`-DHP2_PGO=USE`) |
 | `recomp/docs/` | notes on the data files, the menus and the languages |
@@ -60,6 +62,10 @@ The same tools give the same `speed.exe` as in Releases, and with the same disc 
   layouts with the throttle and the brake on the triggers (E to H in Options > Controls > Gamepad > Layouts). The patch is
   `recomp/data/patch/SLUS-20362_1D2818AF_triggers.pnach`, as its author made it; `recomp/runtime/layouts_patch.h` is the same
   as a table, and the port applies it when the game starts.
+- **Reset during a chase** — pull request 10 by **spartaque12**. On the PS2, resetting the car (Select, **R** on the keyboard)
+  at any point in a pursuit is an arrest, even with every cop out of sight; with this change it is an arrest only when a cop is
+  close to the car, and otherwise the chase goes on. The hook on `RealDriver::JoyHandler_ResetCar` is in
+  `recomp/runtime/native.cpp`; `HP2_PS2RESET` brings back the PS2's rule.
 - **SMAA** by Jorge Jimenez and others (MIT license, `LICENSE.txt` in `recomp/runtime/shaders/smaa/`): the antialiasing
   shader and its tables (`recomp/runtime/shaders/smaa/`, `recomp/runtime/smaa/`).
 - **SDL3** (zlib license), for gamepads: `third_party/`.

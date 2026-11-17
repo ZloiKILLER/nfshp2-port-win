@@ -18,6 +18,8 @@
 #include <thread>
 
 #include "pcconfig.h"
+#include "stall.h"
+#include <atomic>
 
 bool pc_racing();
 bool pc_car_input();
@@ -40,6 +42,130 @@ static void write_hits(const std::string &path, const std::map<DWORD64, unsigned
         fprintf(f, "%u %s %llx\n", h.second, base ? base + 1 : name, (unsigned long long)rva);
     }
     fclose(f);
+}
+
+// ---- the stall catcher (stall.h) ---------------------------------------------------------------------------------
+static std::atomic<unsigned> g_stall_frames;
+static HANDLE g_stall_game, g_stall_render;
+
+static long long stall_us()
+{
+    static LARGE_INTEGER freq;
+    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return now.QuadPart * 1000000 / freq.QuadPart;
+}
+
+StallTimer::StallTimer(std::atomic<int> &t) : to(t), from(stall_us()) {}
+StallTimer::~StallTimer() { to += (int)(stall_us() - from); }
+
+void stall_frame() { g_stall_frames++; }
+void stall_render_thread() { DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &g_stall_render, THREAD_ALL_ACCESS, FALSE, 0); }
+
+void stall_test()
+{
+    static const char *env = getenv("HP2_STALLTEST");
+    if (!env) return;
+    static int frames;
+    static bool done;
+    if (!pc_racing()) frames = 0;
+    else if (++frames == 600 && !done) done = true, Sleep((DWORD)atoi(env));
+}
+
+// one thread's place: "<module>+<offset>", and the return addresses into the program up its stack
+static void stall_sample(HANDLE thread, const char *who, unsigned long long stood)
+{
+    if (!thread || SuspendThread(thread) == (DWORD)-1) return;
+    CONTEXT c = {};
+    c.ContextFlags = CONTEXT_CONTROL;
+    const bool got = GetThreadContext(thread, &c) != 0;
+    DWORD64 stack[160] = {};
+    SIZE_T read = 0;
+    if (got) ReadProcessMemory(GetCurrentProcess(), (LPCVOID)c.Rsp, stack, sizeof stack, &read);
+    ResumeThread(thread);
+    if (!got) return;
+    HMODULE exe = GetModuleHandleA(nullptr);
+    const IMAGE_NT_HEADERS *nt = (const IMAGE_NT_HEADERS *)((const char *)exe + ((const IMAGE_DOS_HEADER *)exe)->e_lfanew);
+    const DWORD64 code = nt->OptionalHeader.BaseOfCode + nt->OptionalHeader.SizeOfCode;
+    HMODULE m = nullptr;
+    char name[MAX_PATH] = "?";
+    DWORD64 rva = c.Rip;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)c.Rip, &m) && m) {
+        GetModuleFileNameA(m, name, MAX_PATH);
+        rva = c.Rip - (DWORD64)m;
+    }
+    const char *base = strrchr(name, '\\');
+    char line[512];
+    int at = snprintf(line, sizeof line, "stall: %5llu ms, the %s thread at %s+%llx, called from", stood, who, base ? base + 1 : name, (unsigned long long)rva);
+    int found = 0;
+    for (SIZE_T i = 0; i < read / 8 && found < 8 && at < (int)sizeof line - 24; i++) {
+        const DWORD64 v = stack[i];
+        if (v - (DWORD64)exe - 0x1000 >= code - 0x1000) continue;
+        const unsigned char *b = (const unsigned char *)v;
+        const auto call_reg = [&](int back) { return b[-back] == 0xff && (b[-back + 1] >> 3 & 7) == 2; };
+        if (b[-5] != 0xe8 && !call_reg(2) && !call_reg(3) && !call_reg(6) && !call_reg(7)) continue;
+        at += snprintf(line + at, sizeof line - (size_t)at, " %llx", (unsigned long long)(v - (DWORD64)exe));
+        found++;
+    }
+    fprintf(stderr, "%s\n", line);
+}
+
+void stall_watch_start()
+{
+    static const bool off = getenv("HP2_NOSTALLWATCH") != nullptr;
+    if (off || g_stall_game) return;
+    DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &g_stall_game, THREAD_ALL_ACCESS, FALSE, 0);
+    HMODULE exe = GetModuleHandleA(nullptr);
+    const IMAGE_NT_HEADERS *nt = (const IMAGE_NT_HEADERS *)((const char *)exe + ((const IMAGE_DOS_HEADER *)exe)->e_lfanew);
+    fprintf(stderr, "stall: watching for a picture that stands still in a race (this exe's stamp is %08lx)\n", (unsigned long)nt->FileHeader.TimeDateStamp);
+    std::thread([] {
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+        unsigned last = g_stall_frames, flowing = 0, samples = 0, lines = 0;
+        ULONGLONG last_at = GetTickCount64();
+        bool standing = false;
+        // the world's clock: its bits when they last changed, when that was and which frame, and how the stand is going
+        unsigned world = 0, world_frame = 0, world_samples = 0;
+        ULONGLONG world_at = GetTickCount64();
+        bool world_stands = false;
+        for (;;) {
+            Sleep(25);
+            const unsigned frames = g_stall_frames;
+            const ULONGLONG now = GetTickCount64();
+            {
+                unsigned bits = 0, paused = 0, slow = 0;
+                const bool runs = stall_world(bits, paused, slow);
+                if (!runs || bits != world) {
+                    if (world_stands)
+                        fprintf(stderr, "stall: over, the world stood for %llu ms while %u frames were shown\n", (unsigned long long)(now - world_at), frames - world_frame), fflush(stderr);
+                    world = bits, world_at = now, world_frame = frames, world_samples = 0, world_stands = false;
+                } else {
+                    const ULONGLONG stood = now - world_at;
+                    if (stood >= 150 && frames - world_frame >= 4 && flowing >= 40 && lines < 800 && world_samples < 12 && stood >= 150 + world_samples * 60ull) {
+                        if (!world_stands) fprintf(stderr, "stall: the world stands though frames go on (paused %u, slow %u)\n", paused, slow);
+                        world_stands = true, world_samples++, lines += 2;
+                        stall_sample(g_stall_game, "game's", stood);
+                        stall_sample(g_stall_render, "renderer's", stood);
+                        fflush(stderr);
+                    }
+                }
+            }
+            if (frames != last) {
+                if (standing) fprintf(stderr, "stall: over, the picture stood for %llu ms (frame %u)\n", (unsigned long long)(now - last_at), frames), fflush(stderr);
+                // frames coming at a race's pace: the catcher is for a picture that stops among those, not for a screen that loads
+                flowing = now - last_at < 70 ? std::min(flowing + 1, 1000u) : 0;
+                last = frames, last_at = now, samples = 0, standing = false;
+                continue;
+            }
+            const ULONGLONG stood = now - last_at;
+            if (stood < 150 || (!standing && flowing < 40) || lines > 800 || samples >= 12 || stood < 150 + samples * 60ull) continue;
+            if (!standing && !pc_racing()) continue;
+            standing = true, samples++, lines += 2;
+            stall_sample(g_stall_game, "game's", stood);
+            stall_sample(g_stall_render, "renderer's", stood);
+            fflush(stderr);
+        }
+    }).detach();
 }
 
 void profile_start()
@@ -155,4 +281,10 @@ void profile_start()
 }
 #else
 void profile_start() {}
+void stall_watch_start() {}
+void stall_render_thread() {}
+void stall_frame() {}
+void stall_test() {}
+StallTimer::StallTimer(std::atomic<int> &t) : to(t), from(0) {}
+StallTimer::~StallTimer() {}
 #endif

@@ -22,6 +22,7 @@ LIST = [
     ("recomp/data", None),
     ("recomp/docs", None),
     ("recomp/symbols", None),
+    ("recomp/savestransfer", None),                # savestransfer.exe, the optional importer of PS2 saves, and its test
     ("recomp/pgo/speed.profdata", None),        # the counts the release exe is built by (-DHP2_PGO=USE)
     ("tools/recomp/gen.py", None),
     ("tools/recomp/gen_iop.py", None),
@@ -37,6 +38,8 @@ LIST = [
 ]
 SKIP = {"recomp/runtime/elf_image.cpp"}         # no longer built: the program comes from the disc
 OWN = {"README.md", "TECHNICAL.md", ".gitignore", ".gitattributes", ".git"}
+# what a build from the repository makes there (its .gitignore): not the repository's files, never touched
+BUILT = {"build", "work", "recompwin"}
 
 
 def wanted():
@@ -68,7 +71,7 @@ def main():
     for d, dirs, files in os.walk(a.repo):
         rel_d = os.path.relpath(d, a.repo).replace("\\", "/")
         if rel_d == ".":
-            dirs[:] = [x for x in dirs if x not in OWN]
+            dirs[:] = [x for x in dirs if x not in OWN and x not in BUILT]
             files = [f for f in files if f not in OWN]
         for f in files:
             rel = f if rel_d == "." else f"{rel_d}/{f}"

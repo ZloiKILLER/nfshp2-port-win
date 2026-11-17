@@ -23,6 +23,35 @@ layout(location = 1) in vec2 v_st;
 layout(location = 2) in float v_k;
 layout(location = 3) in float v_far;
 layout(location = 0) out vec4 o_col;
+#ifdef SOFT
+// Particles: High, the soft sprite (2026-11-17). A sprite is a flat sheet at the depth of its middle, and the road cut a large
+// puff of smoke along a hard line. Here the particle is a ball of its own radius about that middle: a pixel shows as much of it
+// as the share of the ball's thickness there that lies in front of what the picture already has behind it (a copy of the depth
+// made before the frame's first such sprite: native_vk.cpp, copy_depth_soft). So a puff sinks into the ground and goes round a
+// car, and thins out as the camera comes into it, where the game's goes out at once. Small ones (sparks, stones) stay as they are.
+layout(set = 2, binding = 0) uniform sampler2D scene_depth;
+layout(location = 4) in vec4 v_soft;        // native.vert: where in the sprite, how far its middle is, its radius
+layout(location = 5) flat in vec4 v_cam;
+layout(location = 6) flat in vec2 v_cam2;
+
+float soft_share()
+{
+    if (!(v_soft.w > 0.0)) return 1.0;
+    float zw = 2.0 + texelFetch(scene_depth, ivec2(gl_FragCoord.xy), 0).r * v_cam2.x;
+    float under = zw * v_cam.z - v_cam.x;
+    float behind = abs(under) > 1.0e-20 ? (v_cam.y - zw * v_cam.w) / under : 1.0e9;
+    if (!(behind > 0.0)) behind = 1.0e9;    // nothing there
+    float out2 = dot(v_soft.xy, v_soft.xy);
+    float half_thick = v_soft.w * sqrt(max(1.0 - out2, 0.0625));
+    float share = clamp((behind - (v_soft.z - half_thick)) / (2.0 * half_thick), 0.0, 1.0);
+    share *= clamp((v_soft.z - v_cam2.y) / v_soft.w, 0.0, 1.0);
+    // A ball has no corners: nothing of it past the circle within the sprite. A large puff near the camera showed the straight
+    // edge of its sprite (the user's picture, 2026-11-17: a dark cloud ending at an upright line): its cell of the sheet, 32
+    // texels stretched over hundreds of pixels, is not clear at its border, and the next cell's texels come into the filter there.
+    share *= 1.0 - smoothstep(0.7, 1.0, sqrt(out2));
+    return mix(1.0, share, smoothstep(0.15, 0.6, v_soft.w));
+}
+#endif
 
 // The GS's sampling, integers and all: the same bytes as the software GS's sample_level and sample_tex.
 ivec4 texel(int level, ivec2 at, ivec2 size)
@@ -117,6 +146,9 @@ void main()
         // the factor can go past 1 on the GS: the colour takes it whole, the blend's alpha what fits
         // ... >> 7 + Cd: the GS rounds down, the blender to the nearest
         float f = u.blend_alpha < 0.0 ? a8 / 128.0 : u.blend_alpha;
+#ifdef SOFT
+        f *= soft_share();
+#endif
         o_col = vec4(max(rgb * f - 0.49 / 255.0, vec3(0.0)), min(f, 1.0));
     }
 }

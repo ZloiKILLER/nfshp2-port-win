@@ -2,7 +2,7 @@
 // Need for Speed: Hot Pursuit 2 (a disc of kKnownDiscs), or takes the disc itself from a DVD drive, and where to install; reads the image
 // as ISO 9660 without mounting it (the disc in a drive: as the files Windows shows), checks the game's program by its SHA-1, makes the folder
 // with all the game needs (install.cpp), puts this exe in it, and starts the game from there. Update: it asks for a folder the game is
-// installed in and puts this exe and the port's own files there; the settings, the saves and data\replace are not touched. The folder is any the user names: typed, or browsed to (then with the game's own folder under it, as
+// installed in and puts this exe and the port's own files there; the settings and the saves are not touched. The folder is any the user names: typed, or browsed to (then with the game's own folder under it, as
 // installers do). It is remembered (HKCU\Software\NFSHP2Port, InstallDir), so this exe started again elsewhere starts the installed game.
 #include "setup.h"
 
@@ -33,7 +33,7 @@ namespace fs = std::filesystem;
 
 namespace {
 
-const uint64_t kNeeded = 3600ull * 1024 * 1024;   // the folder: 3.0 GB of the disc's files, the PNGs, room to spare
+const uint64_t kNeeded = 3200ull * 1024 * 1024;   // the folder: 2.9 GB of the disc's files, room to spare
 
 std::wstring widen(const std::string &s)
 {
@@ -164,8 +164,10 @@ std::vector<std::wstring> game_drives()
     return out;
 }
 
-// The update of a folder the game is installed in: this exe as its speed.exe and the port's own files (the languages, the cursor, README).
-// Nothing else there is written: not hp2.ini, not the saves and the replays, not data\replace, not the game's data.
+// The update of a folder the game is installed in: this exe as its speed.exe and the port's own files (the languages, the cursor, README,
+// the Saves Manager savestransfer.exe).
+// Nothing else there is written: not hp2.ini, not the saves and the replays, not the game's data (nor the folders an earlier version
+// made there for mods: data\textures, data\text, data\replace stay, unused).
 bool update_folder(const std::wstring &root, std::wstring &why)
 {
     std::error_code ec;
@@ -234,7 +236,7 @@ void check_folder()
     ULARGE_INTEGER free_bytes = {};
     const std::wstring drive = root.root_path().wstring();
     if (!GetDiskFreeSpaceExW(drive.c_str(), &free_bytes, nullptr, nullptr)) return set_status(g_ui.disc + L". There is no drive " + drive + L".");
-    if (free_bytes.QuadPart < kNeeded) return set_status(g_ui.disc + L". Not enough free space: 3.6 GB are needed on " + drive + L".");
+    if (free_bytes.QuadPart < kNeeded) return set_status(g_ui.disc + L". Not enough free space: 3.2 GB are needed on " + drive + L".");
     set_status(g_ui.disc + L". Ready to install.");
     EnableWindow(g_ui.install, TRUE);
 }
@@ -621,7 +623,7 @@ bool run_window(const fs::path &exe_dir, const fs::path &found)
     auto up = [](HWND c) { return g_ui.update_page.push_back(c), ShowWindow(c, SW_HIDE), c; };
     up(add(L"STATIC",
            L"Choose the folder where the game is installed. Its program (speed.exe) and the port's own files (the languages, the cursor, "
-           L"README) are replaced by this version's. Your settings, saves, replays and the files in data\\replace stay as they are, "
+           L"README, the Saves Manager) are replaced by this version's. Your settings, saves and replays stay as they are, "
            L"and no disc is needed.",
            WS_GROUP, 20, 118, W - 40, 78));
     up(add(L"STATIC", L"Game folder:", 0, 20, 228, 200, 20));

@@ -1,6 +1,7 @@
 // The Win32 window, the keyboard and the gamepads. The renderer draws to the window itself (native_vk.cpp).
 #include "hw.h"
 #include "pcconfig.h"
+#include "phase.h"
 #include "host.h"
 #include "pcmenu.h"
 #include "pad.h"
@@ -25,6 +26,7 @@ static std::atomic<bool> g_want_fullscreen;
 static const UINT WM_SETFULLSCREEN = WM_APP + 1;
 static const UINT WM_SETWINDOWSIZE = WM_APP + 2;
 static const UINT WM_CURSORSTATE = WM_APP + 3;
+static const UINT WM_SETMONITOR = WM_APP + 4;
 // set when a setting changed from the keyboard (Alt+Enter): the menu shows the new value
 std::atomic<bool> g_pc_ui_dirty;
 
@@ -46,6 +48,52 @@ static void set_fullscreen_now(bool fs)
                      SWP_FRAMECHANGED | SWP_SHOWWINDOW);
     }
     g_fullscreen = fs;
+}
+
+// ---- the screen the game is shown on (Options > Graphics > Resolution > Monitor; the user, 2026-11-17) ----
+// The screens as Windows lists them, 1 and up. 0 in hp2.ini is "where the window is": nothing is moved.
+static BOOL CALLBACK monitor_each(HMONITOR, HDC, LPRECT r, LPARAM to)
+{
+    ((std::vector<RECT> *)to)->push_back(*r);
+    return TRUE;
+}
+static std::vector<RECT> monitors()
+{
+    std::vector<RECT> all;
+    EnumDisplayMonitors(nullptr, nullptr, monitor_each, (LPARAM)&all);
+    return all;
+}
+int window_monitor_count() { return (int)monitors().size(); }
+void window_monitor_size(int index, int &w, int &h)
+{
+    const std::vector<RECT> all = monitors();
+    w = h = 0;
+    if (index >= 1 && index <= (int)all.size()) w = all[(size_t)index - 1].right - all[(size_t)index - 1].left, h = all[(size_t)index - 1].bottom - all[(size_t)index - 1].top;
+}
+// on the window's thread: the window to the screen the setting names, in its middle; a fullscreen window over all of it
+static void to_monitor_now()
+{
+    const std::vector<RECT> all = monitors();
+    if (!g_hwnd || g_cfg.monitor < 1 || g_cfg.monitor > (int)all.size()) return;
+    const RECT m = all[(size_t)g_cfg.monitor - 1];
+    RECT r = {0, 0, g_cfg.win_w, g_cfg.win_h};
+    AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+    const int w = r.right - r.left, h = r.bottom - r.top;
+    const int spare_x = ((int)(m.right - m.left) - w) / 2, spare_y = ((int)(m.bottom - m.top) - h) / 2;
+    const int x = m.left + (spare_x > 0 ? spare_x : 0), y = m.top + (spare_y > 0 ? spare_y : 0);
+    if (g_fullscreen) {
+        g_windowed_rect = {x, y, x + w, y + h};            // where it goes when it is a window again
+        SetWindowPos(g_hwnd, HWND_TOP, m.left, m.top, m.right - m.left, m.bottom - m.top, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    } else {
+        SetWindowPos(g_hwnd, nullptr, x, y, w, h, SWP_NOZORDER);
+    }
+}
+void window_set_monitor(int index)
+{
+    g_cfg.monitor = index;
+    pc_config_save();
+    g_pc_ui_dirty = true;
+    if (g_hwnd) PostMessageA(g_hwnd, WM_SETMONITOR, 0, 0);
 }
 
 // from any thread; the setting is saved, and the menu told
@@ -83,7 +131,9 @@ void window_screen_size(int &w, int &h)
 void window_view_size(int &w, int &h)
 {
     if (g_cfg.fullscreen) {
+        // the monitor's, or the size chosen for fullscreen where the monitor has room for it
         window_screen_size(w, h);
+        if (g_cfg.fs_w > 0 && g_cfg.fs_h > 0 && g_cfg.fs_w <= w && g_cfg.fs_h <= h) w = g_cfg.fs_w, h = g_cfg.fs_h;
     } else {
         w = g_cfg.win_w;
         h = g_cfg.win_h;
@@ -109,6 +159,8 @@ void window_relaunch(const std::string &profile)
     }
     SetEnvironmentVariableA("HP2_PROFILE", nullptr);
 }
+
+void pc_save_on_exit();
 
 void window_quit()
 {
@@ -299,6 +351,9 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp)
     case WM_SETFULLSCREEN:
         set_fullscreen_now(wp != 0);
         return 0;
+    case WM_SETMONITOR:
+        to_monitor_now();
+        return 0;
     case WM_CURSORSTATE:
         apply_cursor(h);
         return 0;
@@ -315,6 +370,7 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp)
     case WM_DESTROY:
         window_rumble(0, 0);            // a pad's motors outlive the program
         pad_settle(150);                // the pads' thread tells them
+        pc_save_on_exit();              // the profile's save, with what was chosen in the menus since the game's last one
         host_log_flush();
         ExitProcess(0);
     }
@@ -395,8 +451,12 @@ static void key_script_step()
     }();
     if (steps.empty()) return;
     g_key_script_on = true;
+    // HP2_KEYTIME=1: the script's count goes by sixtieths of a second, not by pad reads: in a race at 30 steps a second a read is
+    // worth two. Without it the same script presses its keys at other moments of a race at 30 than at 60 (the car starts later
+    // and is driven twice as long), and two runs that are meant to differ in the frame rate alone differ in the driving too.
+    static const bool by_time = getenv("HP2_KEYTIME") != nullptr;
     static long t = -1;
-    t++;
+    t += by_time && pc_racing() && pc_world_rate() == 30 ? 2 : 1;
     memset(g_script_key, 0, sizeof g_script_key);
     for (auto &s : steps)
         if (t >= s.t && t < s.t + s.hold) g_script_key[s.vk & 255] = true;
@@ -406,6 +466,12 @@ static bool key(int vk)
 {
     if (g_key_script_on) return vk && g_script_key[vk & 255];
     return vk && (GetAsyncKeyState(vk) & 0x8000) != 0;
+}
+
+bool window_key_down(int vk)
+{
+    if (!g_key_script_on && (!g_hwnd || GetForegroundWindow() != g_hwnd)) return false;
+    return key(vk);
 }
 
 // each PcButton: its bit in the button word, and its pressure byte (-1: none)
@@ -556,15 +622,22 @@ void window_cursor_frame()
 
 // A zone camera's key: on a pad it is Triangle held and L2 (Zone Freeze) or R2 (Zone Zoom) pressed with it, the same in every layout.
 // The key holds Triangle and, two reads later, the second button with it, as fingers would.
+// For a cop the same two buttons are the calls for the helicopter and for a road block (Player::RacingJoyHandler, events 129 and 128),
+// and there the key is a short press, whatever the finger does: the game changes the camera's view when Triangle is let go, and
+// keeps that from following a call for one second only (Player +152, the time of the call). A key held longer than that, as a
+// single key easily is, changed the view on its way up. Six reads and both buttons are up again, well inside the second.
 template <class Press> static void zone_keys(bool down, int which, int &held, Press &press)
 {
     if (!down) {
         held = 0;
         return;
     }
+    if (pc_cop_mode() && held >= 6) return;
     press(PCB_TRIANGLE, 0xFF);
     if (++held > 2) press(which ? PCB_R2 : PCB_L2, 0xFF);
 }
+
+int native_turntest_pad();     // native.cpp
 
 u16 window_pad(u8 sticks[4], u8 pressure[12])
 {
@@ -665,6 +738,7 @@ u16 window_pad(u8 sticks[4], u8 pressure[12])
         const bool f9 = key(VK_F9);
         if (f9 && !f9_held) {
             g_cfg.frame_rate = g_cfg.frame_rate == 60 ? 30 : 60;
+            g_cfg.pictures = 0;
             fprintf(stderr, "speedlog: F9, frame rate %d\n", g_cfg.frame_rate);
         }
         f9_held = f9;
@@ -674,7 +748,7 @@ u16 window_pad(u8 sticks[4], u8 pressure[12])
     if (frame_key) {
         const bool f10 = key(VK_F10);
         if (f10 && !f10_held) {
-            g_cfg.draw_distance = g_cfg.draw_distance >= 400 ? 100 : g_cfg.draw_distance * 2;
+            g_cfg.draw_distance = g_cfg.draw_distance >= 600 ? 100 : g_cfg.draw_distance >= 400 ? 600 : g_cfg.draw_distance * 2;
             fprintf(stderr, "speedlog: F10, draw distance %d\n", g_cfg.draw_distance);
         }
         f10_held = f10;
@@ -688,7 +762,7 @@ u16 window_pad(u8 sticks[4], u8 pressure[12])
         f11_held = f11;
     }
     bool alt = key(VK_MENU);                // Alt+Enter is the window's
-    bool driving = pc_car_input();
+    bool driving = pc_car_input_port(0);
     window_cursor_frame();
     auto key_on = [&](int vk) {
         if (!key(vk) || (alt && vk == VK_RETURN)) return false;
@@ -707,6 +781,10 @@ u16 window_pad(u8 sticks[4], u8 pressure[12])
             if (drive_on(g_cfg.key[b][0]) || drive_on(g_cfg.key[b][1])) press(b, 0xFF);
         static int zone_held[2];
         for (int z = 0; z < 2; z++) zone_keys(drive_on(g_cfg.key_zone[z][0]) || drive_on(g_cfg.key_zone[z][1]), z, zone_held[z], press);
+        if (const int hands = native_turntest_pad()) {      // TEMP HP2_TURNTEST: the port's own hands
+            if (hands & 1) press(PCB_CROSS, 0xFF);
+            if (hands & 2) press(PCB_LEFT, 0xFF);
+        }
         // Steering is the two keys' buttons alone (the D-pad's Left and Right, JOY_EVENT_STEER): the game's own digital steering, which
         // turns the wheel at its own rate. The stick is left in the middle: pushed to its end with the key, as it used to be, it was the
         // analog steering at full lock at once.
@@ -736,7 +814,8 @@ u16 window_pad(u8 sticks[4], u8 pressure[12])
     // says No to its questions
     if (!key(VK_ESCAPE)) esc_held = false;
     if (!esc_held && key_on(VK_ESCAPE)) {
-        if (pc_racing() && !pc_race_menu()) press(PCB_START, 0xFF);
+        // (the pause menu can be up with the mode of driving, opened while the zone camera was on: Start closes it there too)
+        if (pc_racing() && (!pc_race_menu() || pc_pause_menu())) press(PCB_START, 0xFF);
         if (!driving) press(PCB_TRIANGLE, 0xFF);
     }
     g_pad_steering_now = driving ? g_cfg.pad_steering : 100;
@@ -799,7 +878,7 @@ u16 window_pad2(u8 sticks[4], u8 pressure[12])
         int p = kPadBit[b].pressure;
         if (p >= 0 && amount > pressure[p]) pressure[p] = (u8)amount;
     };
-    const bool driving = pc_car_input();
+    const bool driving = pc_car_input_port(1);
     pc_keyboard_layout(1, driving && g_keys_shared == KEYS_SHARED_DRIVING);
     if (g_keys_shared == KEYS_SHARED_DRIVING) {
         for (int b = 0; b < PCB_COUNT; b++)
@@ -864,6 +943,7 @@ void window_dpi_thread()
 void window_start()
 {
     std::thread([] {
+        phase_thread("window");
         window_dpi_thread();
         if (getenv("HP2_CURSORSTART")) g_cursor_on = true, mouse_used();    // for tests: as if the mouse had just been used on a screen before
         WNDCLASSA wc = {};
@@ -879,6 +959,7 @@ void window_start()
         g_hwnd = CreateWindowA("hp2recomp", "Need for Speed: Hot Pursuit 2", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                                CW_USEDEFAULT, CW_USEDEFAULT, r.right - r.left, r.bottom - r.top, nullptr,
                                nullptr, wc.hInstance, nullptr);
+        to_monitor_now();                   // the screen the setting names, if it does
         if (g_cfg.fullscreen) set_fullscreen_now(true);
         MSG msg;
         while (GetMessageA(&msg, nullptr, 0, 0) > 0) {

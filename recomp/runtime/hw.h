@@ -30,8 +30,11 @@ void *window_handle();                  // the window to draw to (an HWND), null
 void window_set_fullscreen(bool fs);    // from any thread; saves hp2.ini
 void window_set_size(int w, int h);     // from any thread; saves hp2.ini; a fullscreen window keeps it for later
 void window_cursor_frame();             // the pointer shown or hidden as the screen and the mouse have it: once a frame
+int window_monitor_count();                // the screens there are
+void window_monitor_size(int index, int &w, int &h);     // of screen 1 and up, in pixels; 0, 0: no such screen
+void window_set_monitor(int index);         // from any thread; saves hp2.ini; 0: where the window is, 1 and up: moved to that screen
 void window_screen_size(int &w, int &h);    // the monitor the window is on (the main one before there is a window), in pixels
-void window_view_size(int &w, int &h);  // what the picture is shown in: the setting's window, or the monitor when fullscreen
+void window_view_size(int &w, int &h);  // the resolution: the setting's window, or fullscreen the size chosen for it (the monitor's own as it comes)
 // native_vk.cpp: the most multisampling and anisotropy the GPU in use has (0: none); false until there is a device
 bool native_vk_limits(int &aa, int &aniso);
 void window_quit();                     // from any thread; closes the window and ends the program
@@ -44,6 +47,7 @@ void window_text_arm(bool on);
 void window_text_end();
 int window_text_next();
 bool window_delete_pressed();           // Delete, or Square / X on the gamepad: once a press
+bool window_key_down(int vk);          // a key of the keyboard is down now, the game's window in front (or the key script has it)
 int window_input_kind();                // the device last used: 0 the keyboard, 1 a gamepad (g_pad_playstation: which)
 // binding a key or a pad button from the menu: the game sees no input until the next press
 void window_capture_begin(int what);    // 1 a key, 2 a pad button

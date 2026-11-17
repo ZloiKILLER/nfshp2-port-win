@@ -44,3 +44,15 @@ PC_DEL_ICON
 CONTROLLER30
 LEFT_ARROW
 RIGHT_ARROW
+Pause Menu
+DEBUG.not.pretty
+PC Extras
+PC Cheats
+PC Cheats Effects
+PC Cheats Cars
+PC Cheats Cop Cars
+PC Cheats Tracks
+.part
+rb
+wb
+PC GPU

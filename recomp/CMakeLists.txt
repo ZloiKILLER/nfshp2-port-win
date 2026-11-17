@@ -26,7 +26,7 @@ endif()
 set(SHADER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/runtime/shaders)
 set(SHADER_OUT ${CMAKE_CURRENT_BINARY_DIR}/shaders)
 set(SHADER_HEADERS)
-foreach(s native.vert native.frag native_fold.vert native_fold.frag native_post.vert native_post.frag native_restore.frag native_grade.frag native_opaque.frag
+foreach(s native.vert native.frag native_fold.vert native_fold.frag native_post.vert native_post.frag native_restore.frag native_grade.frag native_opaque.frag native_extra.frag native_shadow.frag native_ao.frag native_ao_apply.frag
         native_smaa_edge.vert native_smaa_edge.frag native_smaa_weight.vert native_smaa_weight.frag native_smaa_blend.vert native_smaa_blend.frag)
     add_custom_command(OUTPUT ${SHADER_OUT}/${s}.spv.h
         COMMAND ${CMAKE_COMMAND} -E make_directory ${SHADER_OUT}
@@ -44,6 +44,19 @@ foreach(s native.vert native.frag)
         COMMENT "glslc ${s} CLIP_FAR")
     list(APPEND SHADER_HEADERS ${SHADER_OUT}/clip_${s}.spv.h)
 endforeach()
+# Particles: High: the scene's fragment shader with the soft sprite (SOFT); Shadows with multisampling: the shadow's over the samples (MSAA)
+add_custom_command(OUTPUT ${SHADER_OUT}/soft_native.frag.spv.h
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${SHADER_OUT}
+    COMMAND ${GLSLC} --target-env=vulkan1.1 -O -DSOFT -mfmt=c -o ${SHADER_OUT}/soft_native.frag.spv.h ${SHADER_DIR}/native.frag
+    DEPENDS ${SHADER_DIR}/native.frag
+    COMMENT "glslc native.frag SOFT")
+list(APPEND SHADER_HEADERS ${SHADER_OUT}/soft_native.frag.spv.h)
+add_custom_command(OUTPUT ${SHADER_OUT}/ms_native_shadow.frag.spv.h
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${SHADER_OUT}
+    COMMAND ${GLSLC} --target-env=vulkan1.1 -O -DMSAA -mfmt=c -o ${SHADER_OUT}/ms_native_shadow.frag.spv.h ${SHADER_DIR}/native_shadow.frag
+    DEPENDS ${SHADER_DIR}/native_shadow.frag
+    COMMENT "glslc native_shadow.frag MSAA")
+list(APPEND SHADER_HEADERS ${SHADER_OUT}/ms_native_shadow.frag.spv.h)
 add_custom_target(native_shaders DEPENDS ${SHADER_HEADERS})
 
 # Sound: STREAM.IRX translated ahead of time (tools/recomp/gen_iop.py, iop_stream_*.cpp in the generated folder), libsd on the software SPU2, host output
@@ -53,7 +66,7 @@ set(SOUND_SOURCES runtime/iop_cpu.cpp runtime/iop_kernel.cpp runtime/iop_libsd.c
 set(HOST_SOURCES runtime/host.cpp runtime/disc.cpp)
 if(WIN32)
     list(APPEND HOST_SOURCES runtime/speed.rc)
-    set_source_files_properties(runtime/speed.rc PROPERTIES OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/runtime/speed.ico;${CMAKE_CURRENT_SOURCE_DIR}/data/zdir_names_ntsc.txt;${CMAKE_CURRENT_SOURCE_DIR}/data/README.txt;${CMAKE_CURRENT_SOURCE_DIR}/data/ui/cursor.cur;${CMAKE_CURRENT_SOURCE_DIR}/data/lang/ENGLISH.txt;${CMAKE_CURRENT_SOURCE_DIR}/data/lang/FRENCH.txt;${CMAKE_CURRENT_SOURCE_DIR}/data/lang/GERMAN.txt;${CMAKE_CURRENT_SOURCE_DIR}/data/lang/ITALIAN.txt;${CMAKE_CURRENT_SOURCE_DIR}/data/lang/SPANISH.txt;${CMAKE_CURRENT_SOURCE_DIR}/data/lang/SWEDISH.txt")
+    set_source_files_properties(runtime/speed.rc PROPERTIES OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/runtime/speed.ico;${CMAKE_CURRENT_SOURCE_DIR}/data/zdir_names_ntsc.txt;${CMAKE_CURRENT_SOURCE_DIR}/data/README.txt;${CMAKE_CURRENT_SOURCE_DIR}/data/ui/cursor.cur;${CMAKE_CURRENT_SOURCE_DIR}/data/lang/ENGLISH.txt;${CMAKE_CURRENT_SOURCE_DIR}/data/lang/FRENCH.txt;${CMAKE_CURRENT_SOURCE_DIR}/data/lang/GERMAN.txt;${CMAKE_CURRENT_SOURCE_DIR}/data/lang/ITALIAN.txt;${CMAKE_CURRENT_SOURCE_DIR}/data/lang/SPANISH.txt;${CMAKE_CURRENT_SOURCE_DIR}/data/lang/SWEDISH.txt;${CMAKE_CURRENT_SOURCE_DIR}/../recompwin/savestransfer.exe")
 endif()
 
 # Gamepads: SDL3 inside the exe, nothing of it but the gamepad subsystem
@@ -76,7 +89,7 @@ if(NOT EXISTS ${SDL3_SOURCE}/CMakeLists.txt)
 endif()
 add_subdirectory(${SDL3_SOURCE} ${CMAKE_CURRENT_BINARY_DIR}/sdl3 EXCLUDE_FROM_ALL)
 
-add_executable(hp2recomp runtime/ps2.cpp runtime/mem_block.cpp runtime/pcmenu.cpp runtime/pcsettings.cpp runtime/pclang.cpp runtime/setup.cpp runtime/install.cpp runtime/pcplatform.cpp runtime/pad.cpp runtime/native.cpp runtime/native_tex.cpp runtime/native_vk.cpp runtime/hle_iop.cpp runtime/dma.cpp runtime/vif.cpp runtime/profile.cpp runtime/hot_math.cpp runtime/native_mem.cpp runtime/memwatch.cpp runtime/native_movie.cpp runtime/gs_regs.cpp runtime/pcconfig.cpp runtime/window.cpp ${SOUND_SOURCES} ${HOST_SOURCES} ${GEN_SOURCES})
+add_executable(hp2recomp runtime/ps2.cpp runtime/mem_block.cpp runtime/pcmenu.cpp runtime/pcsettings.cpp runtime/pclang.cpp runtime/setup.cpp runtime/install.cpp runtime/pcplatform.cpp runtime/pad.cpp runtime/native.cpp runtime/native_tex.cpp runtime/native_vk.cpp runtime/hle_iop.cpp runtime/dma.cpp runtime/vif.cpp runtime/profile.cpp runtime/phase.cpp runtime/cores.cpp runtime/hot_math.cpp runtime/native_mem.cpp runtime/memwatch.cpp runtime/native_movie.cpp runtime/gs_regs.cpp runtime/pcconfig.cpp runtime/window.cpp ${SOUND_SOURCES} ${HOST_SOURCES} ${GEN_SOURCES})
 target_include_directories(hp2recomp PRIVATE runtime ${GEN_DIR} ${VULKAN_INCLUDE} ${SHADER_OUT})
 # the playable build is recompwin/speed.exe, next to data/, hp2.ini and saves/
 if(NOT HP2_NAME)
@@ -142,3 +155,22 @@ elseif(HP2_PGO STREQUAL "USE")
     target_compile_options(hp2recomp PRIVATE -fprofile-use=${HP2_PGO_DATA} -Wno-profile-instr-out-of-date -Wno-profile-instr-unprofiled -Wno-backend-plugin)
 endif()
 target_link_libraries(hp2recomp PRIVATE user32 gdi32 ole32 comctl32 comdlg32 shell32 uuid SDL3::SDL3-static)
+
+# savestransfer.exe, beside speed.exe and optional: saves of the game from PS2 memory cards (.ps2/.mcd images, PCSX2's folder cards) and save
+# files (.psu, .max, .cbs) made new profiles of the port (savestransfer/savestransfer.cpp). A window program of its own; the game does not need it, speed.exe's setup installs it.
+set(SAVESTRANSFER_SOURCES savestransfer/savestransfer.cpp)
+if(WIN32)
+    list(APPEND SAVESTRANSFER_SOURCES savestransfer/savestransfer.rc)
+endif()
+add_executable(savestransfer ${SAVESTRANSFER_SOURCES})
+target_include_directories(savestransfer PRIVATE savestransfer)
+set_source_files_properties(savestransfer/savestransfer.rc PROPERTIES OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/savestransfer/savestransfer.ico")
+set_target_properties(savestransfer PROPERTIES CXX_STANDARD 17 RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/../recompwin)
+target_compile_options(savestransfer PRIVATE -O2)
+if(WIN32)
+    set_target_properties(savestransfer PROPERTIES WIN32_EXECUTABLE ON)     # a window; --list and --import write to the console it came from
+    target_link_options(savestransfer PRIVATE -Wl,/entry:wmainCRTStartup
+        "LINKER:/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'")
+endif()
+# speed.exe carries it (speed.rc, SAVESTRANSFER) and its setup puts it in the game's folder (install.cpp): built first
+add_dependencies(hp2recomp savestransfer)

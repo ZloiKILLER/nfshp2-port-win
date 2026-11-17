@@ -14,6 +14,24 @@ Player Names	Spelarnamn
 Set your player names.	Ange spelarnas namn.
 Languages	Språk
 Choose the language of the game.	Välj spelets språk.
+Extras	Extramaterial
+Bonus features of the game.	Spelets bonusfunktioner.
+The developers' debug menu, in the pause menu.	Utvecklarnas debugmeny, i pausmenyn.
+Cheat Menu	Fuskmeny
+F8 in the menus opens the game's cheats.	F8 i menyerna öppnar spelets fusk.
+Cheats	Fusk
+Effects	Effekter
+The game's easter eggs.	Spelets påskägg.
+Cars	Bilar
+Cars a code opens.	Bilar som en kod låser upp.
+Cop Cars	Polisbilar
+Cop cars for You're The Cop.	Polisbilar för polisläget.
+Tracks	Banor
+Tracks a code opens.	Banor som en kod låser upp.
+All	Alla
+Every one in this list, on or off.	Alla i den här listan, på eller av.
+Some	Några
+As if its code had been entered.	Som om dess kod hade matats in.
 Credits	Medverkande
 See who made this game.	Se vem som gjorde spelet.
 Master Volume	Huvudvolym
@@ -32,11 +50,10 @@ Off	Av
 Selected	Vald
 Current	Aktuell
 Maximum	Maximal
+Ultra	Ultra
 Original	Original
 Fullscreen	Helskärm
 Windowed	Fönster
-Smooth	Mjuk
-Sharp	Skarp
 First	Första
 Second	Andra
 Auto	Auto
@@ -62,12 +79,16 @@ Choose one to delete.	Välj en att ta bort.
 Resolution	Upplösning
 The window, the screen's resolution and the render scale.	Fönstret, skärmens upplösning och renderingsskalan.
 Frame Rate	Bildfrekvens
-The race's frame rate. The PS2's was 30.	Bildfrekvens under lopp. PS2 hade 30.
+The PS2's was 30. Above 60 the game still runs at 60, with pictures drawn in between.	PS2 hade 30. Över 60 går spelet fortfarande i 60, med bilder ritade emellan.
 Draw Distance	Siktavstånd
-How far away scenery still shows. 100% is the PS2's.	Hur långt bort miljön syns. 100 % som på PS2.
+How far away scenery still shows. Original: as on the PS2. Advanced: twice as far. High: four times. Maximum: six times.	Hur långt bort miljön syns. Original: som på PS2. Avancerat: dubbelt så långt. Hög: fyra gånger. Maximal: sex gånger.
 Level of Detail	Detaljnivå
 Maximum: scenery and cars always at their most detailed models. Original: as on the PS2.	Maximal: miljö och bilar alltid med sina mest detaljerade modeller. Original: som på PS2.
 Reflections	Reflektioner
+Shadows	Skuggor
+The cars' shadows. High: the body's own outline, lying on whatever is under it. Maximum: finer still.	Bilarnas skuggor. Hög: karossens egen kontur, lagd på det som finns under. Maximum: ännu finare.
+Particles	Partiklar
+Smoke, sparks and dust. Advanced: the same, with soft edges.	Rök, gnistor och damm. Avancerat: samma, med mjuka kanter.
 High	Hög
 The reflections on the cars. Advanced: new every frame. High: new every frame, at twice the resolution.	Reflektionerna på bilarna. Avancerat: nya i varje bild. Hög: nya i varje bild, i dubbel upplösning.
 Show FPS	Visa FPS
@@ -76,16 +97,13 @@ Advanced	Avancerat
 Anti-aliasing, texture filtering, brightness, contrast and gamma.	Kantutjämning, texturfiltrering, ljusstyrka, kontrast och gamma.
 Window	Fönster
 Window or borderless fullscreen. Alt+Enter switches too.	Fönster eller kantlös helskärm. Alt+Enter växlar också.
-The size of the window. Fullscreen fills the monitor.	Fönstrets storlek. Helskärm fyller skärmen.
-Aspect Ratio	Bildformat
-The race's picture, no wider than the window. The menus stay 4:3.	Loppets bild, inte bredare än fönstret. Menyerna förblir 4:3.
-A 4:3 window shows the race in 4:3. A wider one has the wider pictures.	Ett 4:3-fönster visar loppet i 4:3. Ett bredare har de bredare bilderna.
-Fullscreen is the monitor's own resolution. Windowed has the sizes.	Helskärm har skärmens egen upplösning. I fönster finns storlekarna.
-On: each frame waits for the screen, no tearing. Off: shown at once.	På: varje bild väntar på skärmen, inga revor. Av: visas direkt.
+The picture's size. Fullscreen stretches it to the monitor.	Bildens storlek. Helskärm sträcker ut den över skärmen.
+The race's picture: as wide as the resolution, or 4:3. The menus stay 4:3.	Loppets bild: lika bred som upplösningen, eller 4:3. Menyerna förblir 4:3.
+A 4:3 resolution shows the race in 4:3. A wider one has the wider picture.	En 4:3-upplösning visar loppet i 4:3. En bredare har den breda bilden.
 Render Scale	Renderingsskala
-The picture's detail, times the PS2's 512 x 448.	Bildens detaljer, gånger PS2:ans 512 x 448.
-Scaling	Skalning
-How the picture is scaled to the window.	Hur bilden skalas till fönstret.
+How finely the picture is drawn: 100% is the resolution itself.	Hur fint bilden ritas: 100% är själva upplösningen.
+Aspect Ratio	Bildformat
+On: each frame waits for the screen, no tearing. Off: shown at once.	På: varje bild väntar på skärmen, inga revor. Av: visas direkt.
 Anti-Aliasing	Kantutjämning
 Smoother edges.	Mjukare kanter.
 Anisotropic Filtering	Anisotropisk filtrering
@@ -98,6 +116,22 @@ Contrast	Kontrast
 The difference between light and dark.	Skillnaden mellan ljust och mörkt.
 Gamma	Gamma
 Above 1.00 the dark parts get lighter.	Över 1.00 blir de mörka delarna ljusare.
+Ambient Occlusion	Omgivningsocklusion
+Soft shading where surfaces meet: under cars, by walls and kerbs.	Mjuk skuggning där ytor möts: under bilar, vid murar och kantstenar.
+Unlimited	Obegränsat
+Monitor	Bildskärm
+The screen the game is shown on.	Skärmen som spelet visas på.
+Automatic	Automatiskt
+Select GPU	Välj grafikkort
+Which graphics card draws the game. Changing it restarts the game.	Vilket grafikkort som ritar spelet. Ett byte startar om spelet.
+The game chooses: a separate graphics card before a built-in one.	Spelet väljer: ett separat grafikkort före ett inbyggt.
+Draw the game with this graphics card.	Rita spelet med det här grafikkortet.
+The game will restart to draw with another graphics card. Continue?	Spelet startar om för att använda ett annat grafikkort. Fortsätta?
+This is the choice in use.	Det här är det aktuella valet.
+In Use	Används
+Dithering	Dithering
+Smooth gradients without colour steps.	Mjuka övergångar utan färgsteg.
+Low	Låg
 Defaults	Standard
 Brightness, contrast and gamma as they were.	Ljusstyrka, kontrast och gamma som de var.
 The picture is back to the defaults.	Bilden är återställd.
@@ -222,8 +256,12 @@ R Stick	H spak
 #900011	Anslut en handkontroll.
 #940001	Tryck på \x80 för att delta i detta evenemang.
 Select, then press the key for it. Esc cancels.	Välj och tryck på tangenten. Esc avbryter.
-Zone Freeze	Zon: frys
-Zone Zoom	Zon: zooma
+Zone Freeze / Helicopter	Zon: frys / Helikopter
+Zone Zoom / Road Block	Zon: zooma / Vägspärr
+Racer: Zone Freeze. Cop: call the helicopter.	Förare: frys zon. Polis: helikopter.
+Racer: Zone Zoom. Cop: ask for a road block.	Förare: zooma zon. Polis: vägspärr.
+Horn. Police car: siren. Cop: next suspect.	Tuta. Polis: siren, nästa misstänkt.
+The cop's turbo: a few seconds faster.	Polisens turbo: snabbare i några sekunder.
 Select, then type its name. A gamepad gets the letter grid.	Välj och skriv namnet. Med handkontroll visas bokstavsrutnätet.
 Capitals	Versaler
 Delete the profile %s? Its save and its controls will be gone.	Ta bort profilen %s? Dess sparfil och kontroller försvinner.

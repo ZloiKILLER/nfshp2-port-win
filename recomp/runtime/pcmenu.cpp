@@ -140,6 +140,7 @@ bool pc_racing() { return g_pc_ctx && LW(gp() - 21420) == 6; }
 // Player::SetInputMode: 0 none, 1 pause menu, 2 racing, 3 frozen zone, 4 AI demo, 5 pre-race,
 // 6 finish, 7 instant replay. One player on a PC
 static u32 g_player_mode;
+static u32 g_player_modes[2];               // each player's own, by the Player's number
 
 // two players now: in a race, and on the screens where both choose at once (SetTwoPlayerScreenMode, src/FMenus.cpp)
 static u32 g_two_player_screens;
@@ -148,6 +149,9 @@ static u32 g_two_player_screens;
 bool pc_skip_wanted() { return pc_racing() && (g_player_mode == 5 || g_player_mode == 6); }
 bool pc_two_player_race() { return pc_racing() && LW(gp() - 20920) == 2; }     // Player::NumPlayers
 bool pc_two_player_screen() { return g_two_player_screens != 0; }
+// the word at 0x31ab0c (RaceSettings +274 words in: what RealDriver's horn and boost and Player::SetInputMode ask) is set in a race
+// where a player is the cop
+bool pc_cop_mode() { return pc_racing() && LW(0x31ab0c) != 0; }
 
 void HOOK_SetTwoPlayerScreenMode__Fi(Ctx &c, void (*orig)(Ctx &))
 {
@@ -191,7 +195,12 @@ u32 pc_screen_hash()
     return menu ? LW(menu + 20) : 0;
 }
 
+u32 pc_input_mode() { return g_player_mode; }
 bool pc_race_menu() { return pc_racing() && (g_player_mode == 0 || g_player_mode == 6 || (g_player_mode != 1 && menu_on_screen())); }
+static std::string screen_name();
+// The pause menu is the screen that is up. The player's mode does not always say so: paused while the zone camera is on (mode 3), the
+// mode stays what it was.
+bool pc_pause_menu() { return pc_racing() && menu_on_screen() && screen_name() == "Pause Menu"; }
 // the name of the screen that is up (FlailerScreenNode +16 its FlailerScreenConfig, +8 the config's ScreenName), "" with none
 static std::string screen_name()
 {
@@ -224,8 +233,35 @@ bool pc_cursor_wanted()
     if (!pc_racing()) return !screen.empty() && screen != "BootAutoload";
     return g_player_mode == 1 || g_player_mode == 6 || menu_on_screen() || pc_replay_playing();
 }
-bool pc_hud_up() { return pc_racing() && (g_player_mode == 2 || g_player_mode == 3); }
+// The race's HUD is what the 2D is: on a wide picture its left and right parts keep to the screen's edges (native.cpp, wide_place).
+// Not while a menu is up over the race, whatever the player's mode says: a menu's lines are short and stand left of the middle, so
+// each would be taken for a part of the HUD's left side and pulled out of its panel toward the edge, the shorter the further. A
+// tester's picture showed just that (fullscreen 16:9, the pause menu's texts left of their panel, Quit Race furthest); the pause
+// menu opened in the usual way has mode 1 and was never touched by this, so some way leads to a menu with the mode of driving, as
+// the Race Over menu is known to be. With a menu up all of the 2D is narrowed around the middle as one block. The log says which
+// menu and which mode when it happens, once for each.
+bool pc_hud_up()
+{
+    if (!pc_racing() || (g_player_mode != 2 && g_player_mode != 3)) return false;
+    if (!menu_on_screen()) return true;
+    static u32 told;
+    const u32 screen = pc_screen_hash();
+    if (told != screen) {
+        told = screen;
+        fprintf(stderr, "hud: a menu (%08x, \"%s\") is up while the input mode is %u: its 2D is laid out as one block\n", screen, screen_name().c_str(), g_player_mode);
+    }
+    return false;
+}
 bool pc_car_input() { return pc_racing() && g_player_mode != 0 && g_player_mode != 1 && g_player_mode != 6 && !menu_on_screen(); }
+// The same for one of two players. With two in a race each Player has its own mode (g_player_modes, by Player +88, its number): one
+// busted (mode 6 or none) while the other drives on. g_player_mode, what the rest goes by, is then the mode of a player who drives
+// if there is one. One mode for both took the second player's car away when the first was busted: his keys became a menu's.
+bool pc_car_input_port(int port)
+{
+    if (!pc_two_player_race()) return pc_car_input();
+    const u32 mode = g_player_modes[port & 1];
+    return mode != 0 && mode != 1 && mode != 6 && !menu_on_screen();
+}
 
 // ---- Flailer: the chunk layouts of this (retail) build ---------------------------------
 // project  : Next, Prev, NameHash +8, ScreenList +12 (Head, Tail)
@@ -1129,11 +1165,25 @@ static bool page_event(PcPage &pg, u32 self, u32 msg, u32 data)
     return true;
 }
 
+// ---- Extras: DEBUG.not.pretty ---------------------------------------------------------------
+// The pause menu has an eighth item the developers left in, Debug (MENUITEM_8, 0x52e039fa): PauseMenu::Activate (0x170738) shows it
+// when a function that the released game has returning 0 (0x16fdb0) says so, and hides it otherwise. Its screen, "Debug Menu"
+// (PauseDebugMenu, src/PauseMenu.cpp), is the developers' own: the finishing place, car-to-car collisions, the screen's prints, the
+// weather, the mirror, the environment mapping, the players' debug info, the easy AI. With the switch on (Options > Extras) the
+// item is shown as the game would show it (GrayMenuItem, 0x16d198: 1 is shown and live). Nothing of it is made prettier.
+void HOOK_Activate__9PauseMenuUi(Ctx &c, void (*orig)(Ctx &))
+{
+    g_pc_ctx = &c;
+    const u32 screen = c.r[5].w[0];
+    orig(c);
+    if (g_cfg.debug_menu) pc_call(0x16d198, 0x52e039fa, 1, screen);
+}
+
 // ---- Options -------------------------------------------------------------------------------
-// Eight rows over the screen's seven slots, scrolling as a page does. A row of the game's goes to it as the item that does its job
+// Nine rows over the screen's seven slots, scrolling as a page does. A row of the game's goes to it as the item that does its job
 // (Audio 1, Display 3, Load/Save 4, Names 5, Credits 6; item 7, Languages, is hidden on NTSC); the others open the port's pages.
 // The labels and the help line are the port's, by the row.
-enum { OPT_GAME, OPT_CONTROLS, OPT_GRAPHICS, OPT_PROFILES, OPT_LANGUAGES };
+enum { OPT_GAME, OPT_CONTROLS, OPT_GRAPHICS, OPT_PROFILES, OPT_LANGUAGES, OPT_EXTRAS };
 static const struct {
     const char *label, *blurb;
     int kind, item;
@@ -1145,6 +1195,7 @@ static const struct {
     {"Profiles", "Choose, add or delete a profile.", OPT_PROFILES, 4},
     {"Player Names", "Set your player names.", OPT_GAME, 5},
     {"Languages", "Choose the language of the game.", OPT_LANGUAGES, 0},
+    {"Extras", "Bonus features of the game.", OPT_EXTRAS, 0},
     {"Credits", "See who made this game.", OPT_GAME, 6},
 };
 static const int kOptionsRows = (int)(sizeof kOptions / sizeof kOptions[0]);
@@ -1210,6 +1261,7 @@ static bool options_event(u32 self, u32 msg, u32 data, Ctx &c, void (*orig)(Ctx 
         if (o.kind == OPT_CONTROLS) pc_open_page(g_controls_page.c_str());
         else if (o.kind == OPT_GRAPHICS) pc_open_page(g_graphics_page.c_str());
         else if (o.kind == OPT_LANGUAGES) pc_open_page(g_languages_page.c_str());
+        else if (o.kind == OPT_EXTRAS) pc_open_page("PC Extras");
         else if (o.kind == OPT_PROFILES && !g_profiles_page.empty()) pc_open_page(g_profiles_page.c_str());
         else {
             u32 mine = LW(data);
@@ -1474,14 +1526,22 @@ void pc_delete_hint(const char *page, bool pad, bool show, const char *text)
 }
 
 // ---- hooks -----------------------------------------------------------------------------
-// HP2_FLDUMP=<file>: every Flailer project as it is loaded, one line per object
+// HP2_FLDUMP=<file>: every Flailer project as the port leaves it at load (its own pages and rows in), one line per object. The mod
+// manager's Menu screens tab reads it to show the menus as the port draws them.
+static void port_edits(u32 tail);
+
 static void on_project_loaded(u32 tail)
 {
+    port_edits(tail);
     if (const char *path = getenv("HP2_FLDUMP"))
         if (FILE *f = fopen(path, "a")) {
             dump_project(f, tail);
             fclose(f);
         }
+}
+
+static void port_edits(u32 tail)
+{
     if (LW(tail + 8) != FRONTB_PROJECT) return;
     g_page_alloc = true;
     for (PcPage *pg : pages()) build_page(tail, *pg);
@@ -1626,8 +1686,25 @@ void HOOK_DrawScreen__20JoystickConfigScreen(Ctx &c, void (*orig)(Ctx &))
 void HOOK_SetInputMode__6Player16PlayerInputModes(Ctx &c, void (*orig)(Ctx &))
 {
     g_pc_ctx = &c;
-    g_player_mode = c.r[5].w[0];
+    {
+        const u32 who = LW(c.r[4].w[0] + 88) & 1, mode = c.r[5].w[0];
+        g_player_modes[who] = mode;
+        g_player_mode = mode;
+        if (pc_two_player_race()) {
+            // the mode of a player who drives, if one does; else the first player's
+            g_player_mode = g_player_modes[0];
+            for (u32 m : g_player_modes)
+                if (m == 2 || m == 3) g_player_mode = m;
+        }
+    }
+    static const bool diag = getenv("HP2_DIAG") != nullptr;
+    if (diag) fprintf(stderr, "input mode %u (player %08x)\n", g_player_mode, c.r[4].w[0]);
+    const u32 player = c.r[4].w[0], asked = c.r[5].w[0];
     orig(c);
+    {   // TEMP HP2_BUSTTEST=1: the Busted overlay (Player::StartBustedDisplay, 0x228f08) as the race starts, to see its 2D
+        static const bool test = getenv("HP2_BUSTTEST") != nullptr;
+        if (test && asked == 2) pc_call(0x228f08, player);
+    }
     pc_paint_buttons();
 }
 
@@ -1636,6 +1713,7 @@ void HOOK_HandleEvent__11NewMainMenu13ScreenMessageP18ScreenCallbackData(Ctx &c,
 {
     g_pc_ctx = &c;
     u32 self = c.r[4].w[0], msg = c.r[5].w[0], data = c.r[6].w[0];
+    pc_profile_loaded();
     if (msg == 21 && g_asking) {
         ask_answer(data);
     } else if ((msg != 1 && msg != 4) || LW(data) != menuitem_hash(4)) {

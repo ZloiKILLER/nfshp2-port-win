@@ -8,6 +8,8 @@
 //
 // HP2_IOPLOG=<file>: kernel events and the modules' printf (default: the HLE log).
 #include "iop.h"
+#include "phase.h"
+#include "cores.h"
 #include "disc.h"
 
 #include <algorithm>
@@ -744,8 +746,108 @@ static Thread *pick()
     return best;
 }
 
+// when the next timer or delayed thread is due; `now` + 100 ms when none is
+static u64 iop_next_wake(u64 now)
+{
+    u64 wake = now + 100000;
+    for (auto &tp : g_timers)
+        if (tp.second.armed && tp.second.next < wake) wake = tp.second.next;
+    for (auto &tp : g_threads)
+        if (tp.second.state == TH_WAIT_DELAY && tp.second.wake < wake) wake = tp.second.wake;
+    return wake;
+}
+
+// A wait too short to sleep through: Windows sleeps a millisecond at the least, and the sound driver's delays inside a call are
+// tens of microseconds. Up to this long the clock is watched instead.
+static const u64 kShortWaitUs = 300;
+static void iop_wait_out(u64 wake)
+{
+    while (now_us() < wake) {
+#if defined(__x86_64__) || defined(_M_X64)
+        __builtin_ia32_pause();
+#endif
+    }
+}
+
+// Who runs the IOP's processor now (under g_mtx): its own thread, or the game's thread for the length of a call (iop_call_rpc).
+static bool g_iop_running;
+
+// One turn of the IOP: the requests taken in, the timers and interrupts that are due, and a slice of the thread that is ready.
+// False when nothing is ready (idle). The lock is held on entry and on return, and not while the IOP's code runs.
+static bool iop_turn(std::unique_lock<std::mutex> &lock)
+{
+    // requests from the EE
+    while (!g_jobs.empty()) {
+        ModuleJob *job = g_jobs.front();
+        g_jobs.pop_front();
+        lock.unlock();
+        u32 entry;
+        if (load_irx(*job, entry)) {
+            int id = create_thread(entry, 0x4000, 8);
+            Thread &t = g_threads[id];
+            start_thread(t, 0);
+            t.job = job;
+            lock.lock();
+        } else {
+            lock.lock();
+            job->result = -1;
+            job->done = true;
+            g_cv_ee.notify_all();
+        }
+    }
+    while (!g_incoming.empty()) {
+        RpcReq *r = g_incoming.front();
+        g_incoming.pop_front();
+        auto s = g_servers.find(r->sid);
+        if (s != g_servers.end()) {
+            s->second.pending.push_back(r);
+        } else {
+            r->done = true;
+            g_cv_ee.notify_all();
+        }
+    }
+    lock.unlock();
+
+    u64 now = now_us();
+    dispatch_rpc();
+    if (!g_intr_off) {
+        for (auto &tp : g_timers) {
+            Timer &t = tp.second;
+            if (!t.armed || t.next > now) continue;
+            u32 next = run_intr(t.handler, t.common, 0);
+            if (!next) { t.armed = false; continue; }
+            t.compare = next;
+            t.next += (u64)(next / SYSCLK_PER_US);
+            if (t.next + 100000 < now) t.next = now;
+        }
+        while (!g_pending.empty() && !g_intr_off) {
+            Pending p = g_pending.front();
+            g_pending.pop_front();
+            run_intr(p.fn, p.a0, p.a1);
+        }
+    }
+    for (auto &tp : g_threads)
+        if (tp.second.state == TH_WAIT_DELAY && tp.second.wake <= now) {
+            tp.second.regs.r[2] = 0;
+            make_ready(tp.second);
+        }
+
+    Thread *t = pick();
+    if (t) {
+        g_cur = t;
+        iop_execute(t->regs, 20000);
+        lock.lock();
+        return true;
+    }
+    g_cur = nullptr;
+    lock.lock();
+    return false;
+}
+
 static void iop_main()
 {
+    phase_thread("iop");
+    cores_thread(CORE_SOUND);
 #ifdef _WIN32
     // The sound driver keeps its streams fed on its timer (every 16.7 ms) and sleeps between. Windows' sleeps go by the system's tick, 15.6 ms
     // unless asked: a tick late, a stream of speech could run dry and stop. A 1 ms tick for the process, and this thread ahead of the
@@ -754,80 +856,24 @@ static void iop_main()
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 #endif
     std::unique_lock<std::mutex> lock(g_mtx);
+    g_iop_running = true;
     for (;;) {
-        // requests from the EE
-        while (!g_jobs.empty()) {
-            ModuleJob *job = g_jobs.front();
-            g_jobs.pop_front();
+        if (iop_turn(lock)) continue;
+        // idle: sleep until the next timer or delayed thread, or a request from the EE. The processor is free meanwhile: the game's
+        // thread may run it for a call of its own (iop_call_rpc)
+        const u64 now = now_us();
+        const u64 wake = iop_next_wake(now);
+        if (wake > now && wake - now <= kShortWaitUs && g_jobs.empty() && g_incoming.empty() && g_pending.empty()) {
             lock.unlock();
-            u32 entry;
-            if (load_irx(*job, entry)) {
-                int id = create_thread(entry, 0x4000, 8);
-                Thread &t = g_threads[id];
-                start_thread(t, 0);
-                t.job = job;
-                lock.lock();
-            } else {
-                lock.lock();
-                job->result = -1;
-                job->done = true;
-                g_cv_ee.notify_all();
-            }
-        }
-        while (!g_incoming.empty()) {
-            RpcReq *r = g_incoming.front();
-            g_incoming.pop_front();
-            auto s = g_servers.find(r->sid);
-            if (s != g_servers.end()) {
-                s->second.pending.push_back(r);
-            } else {
-                r->done = true;
-                g_cv_ee.notify_all();
-            }
-        }
-        lock.unlock();
-
-        u64 now = now_us();
-        dispatch_rpc();
-        if (!g_intr_off) {
-            for (auto &tp : g_timers) {
-                Timer &t = tp.second;
-                if (!t.armed || t.next > now) continue;
-                u32 next = run_intr(t.handler, t.common, 0);
-                if (!next) { t.armed = false; continue; }
-                t.compare = next;
-                t.next += (u64)(next / SYSCLK_PER_US);
-                if (t.next + 100000 < now) t.next = now;
-            }
-            while (!g_pending.empty() && !g_intr_off) {
-                Pending p = g_pending.front();
-                g_pending.pop_front();
-                run_intr(p.fn, p.a0, p.a1);
-            }
-        }
-        for (auto &tp : g_threads)
-            if (tp.second.state == TH_WAIT_DELAY && tp.second.wake <= now) {
-                tp.second.regs.r[2] = 0;
-                make_ready(tp.second);
-            }
-
-        Thread *t = pick();
-        if (t) {
-            g_cur = t;
-            iop_execute(t->regs, 20000);
+            iop_wait_out(wake);
             lock.lock();
             continue;
         }
-        g_cur = nullptr;
-        // idle: sleep until the next timer or delayed thread, or a request from the EE
-        u64 wake = now + 100000;
-        for (auto &tp : g_timers)
-            if (tp.second.armed && tp.second.next < wake) wake = tp.second.next;
-        for (auto &tp : g_threads)
-            if (tp.second.state == TH_WAIT_DELAY && tp.second.wake < wake) wake = tp.second.wake;
-        lock.lock();
+        g_iop_running = false;
         if (g_jobs.empty() && g_incoming.empty() && g_pending.empty() && wake > now_us())
             g_cv_iop.wait_for(lock, std::chrono::microseconds(wake - now_us()));
+        g_cv_iop.wait(lock, [] { return !g_iop_running; });     // the game's thread has it: till it lets go
+        g_iop_running = true;
     }
 }
 
@@ -875,9 +921,63 @@ void iop_call_rpc(u32 sid, u32 fno, u32 ee_send, u32 ssize, u32 ee_recv, u32 rsi
     RpcReq req = {sid, fno, ee_send, ssize, ee_recv, rsize, false};
     std::unique_lock<std::mutex> lock(g_mtx);
     g_incoming.push_back(&req);
+    // The IOP idle (as a rule: its work is a few percent of a core): this thread runs it for the call, the same turns its own thread
+    // would have made, without the two threads waking each other (0.85 ms a frame of the game's thread for 0.14 ms of the driver's
+    // work, measured 2026-11-14). When the call's handler comes to wait for something (a timer, a delay), or the IOP's thread is in
+    // the middle of its own work, the call goes to that thread as it always did. HP2_IOPTHREAD=1: always to the thread.
+    static const bool own_thread = getenv("HP2_IOPTHREAD") != nullptr;
+    // TEMP (HP2_IOPSTAT=1): the calls by how they ended, with their time and the turns the caller made
+    static const bool stat = getenv("HP2_IOPSTAT") != nullptr;
+    static u64 n_calls, n_self, n_busy, us_self, us_handed, turns_all;
+    const u64 t0 = stat ? now_us() : 0;
+    bool was_busy = g_iop_running;
+    u64 turns = 0;
+    if (!own_thread && !g_iop_running) {
+        g_iop_running = true;
+        while (!req.done) {
+            if (iop_turn(lock)) {
+                turns++;
+                continue;
+            }
+            // nothing ready and the call not answered: its handler waits. A short delay is waited out here; anything longer is the
+            // IOP's own thread's to sleep through
+            const u64 now = now_us(), wake = iop_next_wake(now);
+            if (wake > now && wake - now > kShortWaitUs) break;
+            lock.unlock();
+            iop_wait_out(wake);
+            lock.lock();
+        }
+        g_iop_running = false;
+    }
     g_cv_iop.notify_all();
-    while (!g_cv_ee.wait_for(lock, std::chrono::seconds(2), [&] { return req.done; }))
-        KLOG("IOP: RPC %08x fn %u has no answer after 2 s\n", sid, fno);
+    const bool self = req.done;
+    if (!self && stat) {
+        static int told;
+        const u64 now = now_us();
+        if (told++ < 60)
+            for (auto &tp : g_threads) {
+                const Thread &t = tp.second;
+                if (t.state == TH_DORMANT || t.state == TH_WAIT_RPC) continue;
+                fprintf(stderr, "iopstat: handed (fn %u): thread %d prio %d %s%s, delay left %lld us, sema %u, ra %08x\n", fno, tp.first, t.prio,
+                        t.state == TH_READY ? "ready" : t.state == TH_WAIT_SEMA ? "waits for a semaphore" : "waits for a delay", t.serving ? " (serving the call)" : "",
+                        t.state == TH_WAIT_DELAY ? (long long)(t.wake - now) : 0ll, t.wait_sema, t.regs.r[31]);
+            }
+    }
+    if (!self)
+        while (!g_cv_ee.wait_for(lock, std::chrono::seconds(2), [&] { return req.done; }))
+            KLOG("IOP: RPC %08x fn %u has no answer after 2 s\n", sid, fno);
+    if (stat) {
+        const u64 us = now_us() - t0;
+        n_calls++, turns_all += turns;
+        if (self) n_self++, us_self += us;
+        else us_handed += us, n_busy += was_busy;
+        if (n_calls % 600 == 0) {
+            fprintf(stderr, "iopstat: %llu calls: %llu finished by the caller (%.0f us each, %.1f turns), %llu handed to the thread (%.0f us each; %llu found it busy)\n",
+                    (unsigned long long)n_calls, (unsigned long long)n_self, n_self ? (double)us_self / n_self : 0.0, (double)turns_all / n_calls,
+                    (unsigned long long)(n_calls - n_self), n_calls - n_self ? (double)us_handed / (n_calls - n_self) : 0.0, (unsigned long long)n_busy);
+            n_calls = n_self = n_busy = us_self = us_handed = turns_all = 0;
+        }
+    }
 }
 
 void iop_sif_from_ee(u32 iop_dst, u32 ee_src, u32 size)

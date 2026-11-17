@@ -16,12 +16,16 @@ u32 pc_alloc(u32 size);         // zeroed guest memory that stays; early, as the
 bool pc_racing();               // the game flow is in a race (else the frontend or loading)
 bool pc_skip_wanted();          // a race waits to be started or left: Enter is the button it waits for
 bool pc_two_player_race();      // a race of two players
+bool pc_cop_mode();             // the race is one where a player is the cop (You're the Cop)
 bool pc_two_player_screen();    // a screen where two players choose at once
 bool pc_replay_playing();       // a replay is on screen, with its bar of buttons
 // keys: this port's player drives with the keyboard now, which has its own layout whatever the gamepad's is; else the chosen one is back
 void pc_keyboard_layout(int port, bool keys);
+bool pc_car_input_port(int port);        // the same for player 1 (0) or player 2 (1) of a race of two
 bool pc_car_input();            // the player has the car or a race's own controls (not a menu, the pause menu included)
 bool pc_race_menu();
+u32 pc_input_mode();            // Player::SetInputMode's last: 2 is a car being driven
+bool pc_pause_menu();           // the pause menu is up, whatever the player's mode is
 u32 pc_screen_hash();           // the screen whose menu is up, 0 with none
 bool pc_cursor_wanted();
 int pc_mouse_buttons();         // PcButton bits the mouse holds down in the menus now
@@ -89,6 +93,8 @@ int pc_name_grid_mode();        // 0 no name is typed, 1 the keyboard types it, 
 void pc_set_blurb(const std::string &text);
 // registered by pcsettings.cpp
 void pc_settings_register();
+void pc_profile_loaded();       // the main menu is up: the profile's save is in the game's memory
+void pc_save_on_exit();         // the window's thread: the profile's save, as the game is left from its menus
 // pcplatform.cpp: the button icons for the bindings and the device in use; once per menu frame
 void pc_paint_buttons();
 std::string pc_text_cursor(u32 font_hash);      // the blinking cursor of a text being typed, in that font

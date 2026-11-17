@@ -117,6 +117,20 @@ hook elSetupLightContext__FP13eLightContextP8bMatrix4T1P8bVector4P5eView 0x11597
 hook eDisplayFrame__Fv
 hook Think__15AICarControllerf 0x191148
 hook DoSteering__10RealDriverf12JoystickPort 0x13b630
+hook JoyHandler_ResetCar__10RealDriver12JoystickPort8JoyEventUcPv 0x13c028
+hook BuildRideInfo__18FrontendPlayerInfoP8RideInfo7CarTypeUii 0x1879b8
+hook PickTrackNumberForExpressGame__Fv 0x216aa8
+hook GenerateJoyEvents__Fv 0x153e48
+hook RequestZone__6Playeribbb 0x177c88
+hook SetTimeScale__5WorldffPFi_vi 0x14d620
+hook BuildQuaternionTable__14AnimatedDriverP10eAnimationP11bQuaternionP8bVector3 0x1aa2f0
+hook CalculateSteeringFrameNumber__14AnimatedDriver 0x1aa0a0
+hook GetFrameNumber__15AnimationPlayer 0x1a91b8
+hook GetRotation__15eAnimationSolidP11bQuaternionif 0x1a7700
+hook GetRotations__15eAnimationSolidP11bQuaternionf 0x1a7830
+hook GetTranslation__15eAnimationSolidP8bVector3f 0x1a78e0
+hook Render__10NisManagerP5eView 0x1b2c90
+hook SetupForRendering__10NisManager 0x1b13f0
 hook Callback__14BootAutoLoader13ScreenMessageP18ScreenCallbackData 0x247ab0
 hook HandleEvent__9NameEntry13ScreenMessageP18ScreenCallbackData 0x24d870
 hook HandleEvent__12MemcardSaver13ScreenMessageP18ScreenCallbackData 0x246138
@@ -189,3 +203,50 @@ hook bMalloc__FiPCcii 0x2577c0
 hook bFree__FPv 0x257850
 hook bResizeMalloc__FPvi 0x2578e0
 hook TakeSnapshot__13ReplayManagerPCc 0x13e9f0
+
+# HP2_PHASES (phase.cpp): the game's functions that are phases of a frame as they are
+hook Think__3Carf 0x131a30
+hook GlobalCopThink__Ff 0x227cf8
+hook DoWheelForces__3Car 0x1346d8
+hook Drive__3Carf 0x131a80
+hook BeginMovement__3Carf 0x131cc8
+hook DoTimestepMove__5Worldf 0x14d898
+hook FinishMovement__3Carf 0x131da8
+hook DoTimestepCollisions__5Worldf 0x14d940
+hook DoTimeStep__16AcidEffectSystemf 0x128718
+hook emProcessAllEvents__Fv 0x1ba520
+hook FakeEngineTask__3Car 0x132a70
+hook Update__5soundv 0x1af4c0
+hook ServiceQueuedFiles__Fv 0x1ad850
+hook LoadResourceIfFileTransferFinished__12ResourceFile 0x1994f0
+hook WaitUntilVSync__Fv 0x111d70
+hook eWaitUntilRenderingDone__Fv 0x111dd8
+hook MenuSystemTick__Fv 0x16d420
+hook ServiceGameFlow__Fv 0x1680e8
+hook DoCulling__20GrandSceneryCullInfo 0x150d98
+hook StuffScenery__20GrandSceneryCullInfoP5eView 0x150eb8
+hook RenderCars__FP5eView 0x124060
+hook RenderPlayers__6PlayerP5eView 0x180ae0
+hook RenderWorldObjects__FP5eView 0x1cdb20
+hook RenderEffects__16AcidEffectSystemP5eView 0x128da0
+hook AttachSolidPolys__FP9eDmaChainT0 0x10bb20
+hook AttachAlphaPolys__FP9eDmaChainT0 0x10b838
+hook eSetCurrentRenderTarget__FP13eRenderTarget 0x105840
+# the loading at the disk's speed (pcplatform.cpp)
+hook ServiceResourceLoading__Fv 0x199788
+hook BeginRead__10QueuedFile 0x1ad760
+hook DetermineVisibleStrips__6eModelPC8bMatrix4ii 0x10d390
+# the game's own assert, said in the log before it stops the game; who keeps the sound's voices (ps2.cpp)
+hook bAssertFail__FPCcT0i 0x250ac0
+hook bSnd_LockChannels__FUs 0x2638a0
+hook bSnd_UnlockChannels__FUsUs 0x2639a0
+# TEMP HP2_TRAFFICLOG: where each traffic car is across its driving line, and what it is doing (native.cpp)
+hook Think__13TrafficDriverf 0x18c4d8
+# the AI drivers' averages over a number of samples: at 60 frames a window is half as long (native.cpp, HP2_PIDTIME)
+hook __7Averagei 0x18fbf0
+hook Record__8PidErrorff 0x18ff30
+# Extras > DEBUG.not.pretty: the pause menu's hidden Debug item (pcmenu.cpp)
+hook Activate__9PauseMenuUi 0x170738
+# Particles: High (native.cpp): the port's own particles are born by the game's emitters, and go when the game's are killed
+hook TriggerEmitter__16AcidEffectSystemP11AcidEmitterfP3Car 0x127700
+hook KillAllActiveEffects__16AcidEffectSystem 0x1276a8

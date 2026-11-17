@@ -1,4 +1,6 @@
-// The game's folder from the disc image (install.h). The layout and the exports are those of tools/recomp/unpack_data.py, export_textures.py and
+// The game's folder from the disc image (install.h). The install only unpacks; the exports (every texture as a PNG, every text as UTF-8) are
+// not part of it since 2026-11-13 and are left for a tool for the assets: install_exports, reached by HP2_EXPORTS=<data folder> alone.
+// The layout and the exports are those of tools/recomp/unpack_data.py, export_textures.py and
 // export_text.py, made again here so that the exe and an .iso give the same folder: the archive's files and the texts to the byte, the PNGs to the
 // pixel (their deflate is this file's, not zlib's). The textures are exported in a fixed order (the Python tool's workers raced for which file a
 // picture that several share is written from).
@@ -776,8 +778,11 @@ bool write_port_files(const fs::path &root)
         size_t n;
         if (!resource(f.res, p, n) || !write_file(root / f.path, p, n)) return false;
     }
-    std::error_code ec;
-    fs::create_directories(root / L"data" / L"replace", ec);
+    // the Saves Manager (recomp/savestransfer): beside speed.exe. Not having it written (open while the game is updated) fails nothing:
+    // the game does not need it
+    const uint8_t *p;
+    size_t n;
+    if (resource(L"SAVESTRANSFER", p, n)) write_file(root / L"savestransfer.exe", p, n);
     return true;
 }
 
@@ -906,7 +911,7 @@ bool install_game(Iso &iso, const std::wstring &root_dir, InstallSteps &steps)
         if (!head.empty() && !iso.read_file(*zz, (uint64_t)e.at * SECTOR, head.data(), head.size())) return steps.why = "The disc image cannot be read.", false;
         bool packed, twin;
         const std::string rel = place(e.hash, names, all_names, head, &packed, &twin);
-        steps.progress((int)(700 * written / std::max<uint64_t>(total, 1)), L"Unpacking " + latin1_w(rel));
+        steps.progress((int)(990 * written / std::max<uint64_t>(total, 1)), L"Unpacking " + latin1_w(rel));
         if (!twin) {
             buf.resize(e.size);
             if (e.size && !iso.read_file(*zz, (uint64_t)e.at * SECTOR, buf.data(), buf.size())) return steps.why = "The disc image cannot be read.", false;
@@ -923,11 +928,6 @@ bool install_game(Iso &iso, const std::wstring &root_dir, InstallSteps &steps)
     }
     if (!write_file(data / L"index.txt", index.data(), index.size())) return steps.why = "The folder cannot be written.", false;
     if (!write_port_files(root)) return steps.why = "The port's own files could not be written.", false;
-
-    InstallSteps sub;
-    sub.stop = steps.stop;
-    sub.progress = [&](int pm, const std::wstring &w) { steps.progress(700 + pm * 290 / 1000, w); };
-    if (!install_exports(data.wstring(), sub)) return steps.why = sub.why, false;
     steps.progress(1000, L"Done");
     return true;
 }

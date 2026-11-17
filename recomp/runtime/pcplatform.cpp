@@ -8,6 +8,7 @@
 #include "pcmenu.h"
 #include "hw.h"
 #include "pcconfig.h"
+#include "phase.h"
 
 #include <atomic>
 #include <cmath>
@@ -146,6 +147,13 @@ void HOOK_Loader__15LanguageManagerP6bChunk(Ctx &c, void (*orig)(Ctx &))
 static const u32 kKeyboardLayout = 0x1e;
 static u32 g_layout_chosen[2];
 static bool g_layout_keys[2];
+// The game does not look the buttons up by that word each time: a handler is tied to its buttons when it is added
+// (Joystick::ConnectEventNodeConfig, 0x153c50: FindScannerConfig by the event, the pad's type and this word), and tied again only when
+// the pad's type changes. The race's handlers are added by Player::SetInputMode, which comes while the screen before it is still up
+// and the word is the gamepad's; the keyboard's word came a pad read later and changed nothing, so the keys went by the gamepad's
+// layout (the throttle's key braking) until the type happened to be read anew, seconds into the race. So when the word is changed
+// here the port's handlers are tied again, by the game's own function, before the next events are made (HOOK_GenerateJoyEvents).
+static bool g_layout_changed[2];
 
 void pc_keyboard_layout(int port, bool keys)
 {
@@ -157,11 +165,31 @@ void pc_keyboard_layout(int port, bool keys)
     if (off) return;
     if (keys) {
         if (!g_layout_keys[port]) g_layout_chosen[port] = LW(at), g_layout_keys[port] = true;
-        if (LW(at) != kKeyboardLayout) SW(at, kKeyboardLayout);
+        if (LW(at) != kKeyboardLayout) SW(at, kKeyboardLayout), g_layout_changed[port] = true;
     } else if (g_layout_keys[port]) {
+        if (LW(at) != g_layout_chosen[port]) g_layout_changed[port] = true;
         SW(at, g_layout_chosen[port]);
         g_layout_keys[port] = false;
     }
+}
+
+// GenerateJoyEvents (0x153e48), once a frame: the handlers of a port whose layout word the port has changed, tied to their buttons anew
+// (the list is the Joystick's own: head at +0, each node's next at +0, the Joystick itself its end). HP2_NOLAYOUTTIE=1: as it was.
+void HOOK_GenerateJoyEvents__Fv(Ctx &c, void (*orig)(Ctx &))
+{
+    static const bool off = getenv("HP2_NOLAYOUTTIE") != nullptr;
+    for (int port = 0; port < 2; port++) {
+        if (!g_layout_changed[port]) continue;
+        g_layout_changed[port] = false;
+        if (off) continue;
+        g_pc_ctx = &c;
+        const u32 joy = 0x2f9530 + (u32)port * 0xcc;
+        int n = 0;
+        for (u32 node = LW(joy); node && node != joy && n < 256; node = LW(node), n++) pc_call(0x153c50, joy, node);
+        static int told;
+        if (told < 8) told++, fprintf(stderr, "layout: port %d has configuration %x now, %d handlers tied to it\n", port, LW(joy + 0xc8), n);
+    }
+    orig(c);
 }
 
 namespace {
@@ -960,10 +988,53 @@ static double now_ms()
     QueryPerformanceCounter(&t);
     return (double)t.QuadPart * 1000.0 / (double)f.QuadPart;
 }
+// ServiceResourceLoading (0x199788): a step of the game's loading. Each call lets the queue of files read one piece (128 KB at the
+// most, ServiceQueuedFiles) and turns one file that has come whole into what it is (LoadResourceIfFileTransferFinished); it returns
+// whether nothing is left (gp-19944, the files still wanted, is 0). The main loop calls it once a frame, which paced the loading to
+// a PS2's drive: a piece a frame, 4 to 8 MB a second. The disk here reads a piece in microseconds, so the step is repeated while
+// files are wanted, for up to 8 ms of a frame: the loading's screen keeps its frames, the loading takes what the work takes. The
+// order of the reads and of the files' callbacks is the game's own. HP2_PS2LOADING=1: a step a frame, as it was.
+void HOOK_ServiceResourceLoading__Fv(Ctx &c, void (*orig)(Ctx &))
+{
+    orig(c);
+    static const bool paced = getenv("HP2_PS2LOADING") != nullptr;
+    if (paced) return;
+    // Busy: resource files still wanted (gp-19944), or reads of the file layer on their way (its list of AsyncEntry at gp-14696 is
+    // not empty: the list's head points at itself when it is). A read is a state machine made for a drive (AsyncRealCDRead,
+    // 0x256130): the step that sends it says "in progress", and the step that finds it done comes with the next service, a frame
+    // later on the PS2. Here the read is done when it is sent, so the next service can follow at once. It has to be a service from
+    // here, the main loop: finishing the read inside the call that starts it hung the game (bReadAsync's callers, the films' and the
+    // music's ring buffer among them, count on the callback coming after they have returned).
+    const u32 gp = c.r[28].w[0], list = gp - 14696;
+    auto busy = [&] { return LW(gp - 19944) != 0 || LW(list) != list; };
+    if (!busy()) return;
+    const double until = now_ms() + 8.0;
+    for (int idle = 0; idle < 3;) {
+        const u32 head = LW(list), state = head != list ? LW(head + 12) : 0, left = head != list ? LW(head + 24) : 0, wanted = LW(gp - 19944);
+        orig(c);
+        if (!busy() || now_ms() >= until) break;
+        const u32 head2 = LW(list);
+        const bool moved = head2 != head || LW(gp - 19944) != wanted || (head2 != list && (LW(head2 + 12) != state || LW(head2 + 24) != left));
+        idle = moved ? 0 : idle + 1;
+    }
+}
+
+// QueuedFile::BeginRead (0x1ad760): the next piece of a queued file, min(the piece's size at +72, what is left of the file), read
+// straight into the file's own buffer (+8) at its place. The piece is 1 MB as the constructor has it and 128 KB as the loaders set
+// it (ChangeQueuedFileParams): the pace of a PS2's drive, nothing the data needs. Here the piece is the whole file: one read a file.
+// HP2_PS2LOADING=1: the game's pieces.
+void HOOK_BeginRead__10QueuedFile(Ctx &c, void (*orig)(Ctx &))
+{
+    static const bool paced = getenv("HP2_PS2LOADING") != nullptr;
+    if (!paced) SW(c.r[4].w[0] + 72, 0x7fffffff);
+    orig(c);
+}
+
 static bool g_in_gettimestep;
 void HOOK_GetTimestep__5World(Ctx &c, void (*orig)(Ctx &))
 {
     const double t0 = now_ms();
+    Phase timed(PH_WAIT_TICK);
     g_in_gettimestep = true;
     orig(c);
     g_in_gettimestep = false;
@@ -1015,6 +1086,7 @@ static void ee_sites_log()
 void HOOK_DoTimestep__5Worldf(Ctx &c, void (*orig)(Ctx &))
 {
     const double t0 = now_ms();
+    Phase timed(PH_WORLD_REST);
 #ifdef EE_COUNT
     uint64_t at_entry[8];
     memcpy(at_entry, g_ee_count, sizeof at_entry);

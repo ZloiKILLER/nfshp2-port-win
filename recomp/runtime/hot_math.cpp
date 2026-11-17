@@ -373,3 +373,31 @@ void hot_math_selftest()
             (unsigned long long)total, (unsigned long long)by[0], (unsigned long long)by[1], (unsigned long long)by[2], (unsigned long long)sure,
             (unsigned long long)wrong, (unsigned long long)near_n, (unsigned long long)near_sure);
 }
+
+// A box against a view's matrix as ClassifyAABB answers it, for the port's own callers (the culling in native.cpp). Nothing shared is
+// written: it may be called from any thread.
+static u32 classify_any(const float lo[3], const float hi[3], const Mat &m)
+{
+    static const bool no_fast = getenv("HP2_NOAABBFAST") != nullptr;
+    const v4f l = {lo[0], lo[1], lo[2], 0.0f}, h = {hi[0], hi[1], hi[2], 0.0f};
+    const int fast = no_fast ? -1 : classify_fast(l, h, m);
+    return fast >= 0 ? (u32)fast : classify_exact(l, h, m);
+}
+u32 hot_classify_aabb(const float lo[3], const float hi[3], u32 matrix) { return classify_any(lo, hi, load_mat(matrix)); }
+// the same against a matrix of the port's own (hot_mul_matrix's)
+u32 hot_classify_aabb_host(const float lo[3], const float hi[3], const float matrix[16])
+{
+    Mat m;
+    memcpy(&m, matrix, 64);
+    return classify_any(lo, hi, m);
+}
+
+// eMulMatrix's product (a times b as the game multiplies them: each row of a through b), into the port's own memory. From any thread.
+void hot_mul_matrix(float out[16], u32 a_addr, u32 b_addr)
+{
+    const Mat a = load_mat(a_addr), b = load_mat(b_addr);
+    for (int i = 0; i < 4; i++) {
+        const v4f row = mul4(b, a.r[i]);
+        memcpy(out + i * 4, &row, 16);
+    }
+}

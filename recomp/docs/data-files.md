@@ -21,7 +21,7 @@ python tools/recomp/export_text.py       data/text/
 | `REPLAY/` | 36 | 4 MB | demo-mode replays `.replay`; those with no known name in `DEMO/`, by the author written in them |
 | `NIS/`, `MARKERS/`, `LANGUAGES/` | | 2 MB | cutscenes `.nis` + `.CAM`, `.markers`, string tables `.lang` |
 
-Ours, which the game does not read: `textures/`, `text/`, `replace/`. Not read by the game, as far as is known: `KEY.TXT`, a line of hex digits between two x; `NFS.TAG` holds "Hello." and the name fits its hash, as does `NG2.TAG`. Names are not read from anywhere: `index.txt` is what matters.
+Ours, which the game does not read: `textures/`, `text/` (made by the Python tools or `HP2_EXPORTS=<data folder>`; since 2026-11-13 the install makes neither, nor `replace/`). Not read by the game, as far as is known: `KEY.TXT`, a line of hex digits between two x; `NFS.TAG` holds "Hello." and the name fits its hash, as does `NG2.TAG`. Names are not read from anywhere: `index.txt` is what matters.
 
 Extensions of ours, all the game's `.BIN`: `.tex` a texture pack, `.geo` geometry, `.lang` strings, `.replay`, `.nis`, `.markers`, `.sndbank`. `.BUN` is a file of chunks. The disc keeps 81 of them compressed (`.LZC`, a COMP container: the tracks, the cars' geometry, `FRONTB`, `GLOBALB`, `INGAMEB`, `PRERACEANIM`); the installer writes them unpacked, as `.BUN` or `.geo`, under the compressed file's hash, and the game takes them as they are (2026-11-11; installs of 0.12 and before have the `.LZC` files and an `unused/` folder with the disc's own plain copies of 58 of them, and run as they are). The disc's plain copy and the unpacked file are the same bytes, so the copy's line of `index.txt` names the same file: 405 lines, 344 files.
 
@@ -35,7 +35,7 @@ Some names stand twice in ZDIR with one hash (`CARS/TEXTURES`, `GLOBAL/HUDTEX`, 
 
 `data/textures/<file>/<NAME>.png` are all of them, a picture found in several files once; `data/textures/index.csv` says where each is used. The alpha is doubled, as a PNG is read by everyone else: 255 is the GS's 0x80.
 
-A PNG in `data/replace/` (any subfolder) takes a texture's place:
+Since 2026-11-13 the game looks for no replacements by itself and the install makes no `data/replace/` (the user: a tool for the assets comes later). The mechanism is still in the program, behind `HP2_REPLACE=<folder>`. A PNG in that folder (any subfolder) takes a texture's place:
 
 - `<NAME>.png` wherever that name is used; `<NAME>@<crc>.png` for one exact texture, the crc from `index.csv`, when one name has several pictures. The name is checked first with the crc.
 - Its size is the texture's times a whole number. Larger ones go through the GPU's filter, since the GS's levels would be wrong for them, and get a new chain of levels if the texture had any.
@@ -47,7 +47,7 @@ A PNG in `data/replace/` (any subfolder) takes a texture's place:
 
 - `HP2_DISCCHECK=1`: the built archive against the real two files, then exits. 2026-11-05, in this layout: ZDIR the same, ZZDATA 3116437504 bytes, 0 differ.
 - `HP2_FILELOG=<file>`: each file of `data/` at its first read, with the time.
-- `HP2_TEXCHECK=1` with `export_textures.py --replace-all` in `data/replace/`: each texture the game uses against its PNG. 2026-11-05, menus and a race, 200+ textures, 0 differ.
+- `HP2_TEXCHECK=1` with `export_textures.py --replace-all` into a folder named by `HP2_REPLACE` (then: in `data/replace/`): each texture the game uses against its PNG. 2026-11-05, menus and a race, 200+ textures, 0 differ.
 
 ## Not known yet
 

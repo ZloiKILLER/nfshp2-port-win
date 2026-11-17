@@ -6,6 +6,8 @@
 //
 // The game addresses its data by sector (sceCdRead of ZZDATA.BIN); the sectors
 // come from the virtual disc over the game folder (disc.h).
+#include "stall.h"
+#include "phase.h"
 #include "ps2.h"
 
 #include <sys/stat.h>
@@ -259,6 +261,8 @@ void HLE_sceSifBindRpc(Ctx &c)
 
 void HLE_sceSifCallRpc(Ctx &c)
 {
+    StallTimer timed(g_stall_rpc_us);
+    Phase phase(PH_RPC);
     // (cd, fno, mode, send, ssize, receive, rsize, end_func, end_param)
     u32 cd = A0, fno = A1, recv = T1, rsize = T2, endf = T3;
     u32 endp = LW(c.r[29].w[0]);
@@ -342,14 +346,28 @@ void HLE_sceCdSearchFile(Ctx &c)
     RET(ok ? 1 : 0);
 }
 
+// HP2_CDLOG=1: each read as "cd: <ms since the first> ms: <sectors> sectors at <lsn>, read in <us> us"
+static void cd_log(u32 lsn, u32 sectors, long long us)
+{
+    static const bool on = getenv("HP2_CDLOG") != nullptr;
+    if (!on) return;
+    static const auto t0 = std::chrono::steady_clock::now();
+    fprintf(stderr, "cd: %.1f ms: %u sectors at %u, read in %lld us\n",
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), sectors, lsn, us);
+}
+
 void HLE_sceCdRead(Ctx &c)
 {
     u32 lsn = A0, sectors = A1, buf = A2;
+    StallTimer timed(g_stall_cd_us);
+    Phase phase(PH_DISC);
     static int n;
     if (n++ < 8) LOG("sceCdRead lsn %u x%u -> %08x\n", lsn, sectors, buf);
+    const auto t0 = std::chrono::steady_clock::now();
     std::vector<u8> tmp((size_t)sectors * 2048);
     bool ok = disc_read(lsn, sectors, tmp.data());
     for (size_t i = 0; i < tmp.size(); i++) SB(buf + (u32)i, tmp[i]);
+    cd_log(lsn, sectors, std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
     g_cd_error = ok ? 0 : 0x32;
     RET(ok ? 1 : 0);
 }
@@ -359,6 +377,10 @@ void HLE_sceCdReadChain(Ctx &c)
 {
     static int n;
     bool ok = true;
+    StallTimer timed(g_stall_cd_us);
+    Phase phase(PH_DISC);
+    const auto t0 = std::chrono::steady_clock::now();
+    u32 first = 0, all = 0;
     for (u32 tag = A0;; tag += 12) {
         u32 lsn = LW(tag), sectors = LW(tag + 4), buf = LW(tag + 8);
         if (lsn == 0xFFFFFFFF || sectors == 0xFFFFFFFF) break;
@@ -366,7 +388,10 @@ void HLE_sceCdReadChain(Ctx &c)
         std::vector<u8> tmp((size_t)sectors * 2048);
         ok &= disc_read(lsn, sectors, tmp.data());
         for (size_t i = 0; i < tmp.size(); i++) SB(buf + (u32)i, tmp[i]);
+        if (!all) first = lsn;
+        all += sectors;
     }
+    cd_log(first, all, std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
     g_cd_error = ok ? 0 : 0x32;
     RET(ok ? 1 : 0);
 }

@@ -5,6 +5,7 @@ void native_notice_saved();     // "SAVED" over the picture for a moment
 #include <cstdint>
 #include <cstdlib>
 #include <mutex>
+#include <string>
 #include <vector>
 
 struct NativeVertex {
@@ -117,9 +118,21 @@ struct NativeDraw {
     uint8_t tfx;                            // TEX0's: 0 modulate, 1 decal, 2 highlight, 3 highlight2
     uint8_t lod_l;                          // TEX1's L
     uint8_t target;                         // the game's TARGET_ID: 1 the player's view, 8..13 the envmap views
-    uint16_t flags;                         // vi07 of the strips: 0x80 lit, 0x40 road, 0x100 sphere map, 4 gloss map
+    uint32_t flags;                         // vi07 of the strips (16 bits): 0x80 lit, 0x40 road, 0x100 sphere map, 4 gloss map; 0x10000: the
+                                            // port's own particles (native.vert's PARTICLE)
     int light;                              // into NativeFrame::lights, -1: none
     bool indexed = false;                   // a strip's: first and count are into NativeFrame::indices, else into NativeFrame::vertices
+    uint32_t ranges = 0;                    // a strip's, drawn by ranges: this many of NativeFrame::ranges from `first`; count is their sum
+    bool has_mid = false;                   // clip_mid is there: the draw halfway from the frame before (NativeFrame::doubled)
+    float clip_mid[16];
+    bool mid_verts = false;                 // particles: the picture between draws the vertices from mid_first instead, with clip
+    uint32_t mid_first = 0;
+};
+
+// Vertices of the GPU's buffer one after another (the cache below dyn_base, this frame's own from it): a strip, or several that lie one
+// after another there. A strip's indices were never more than "the next vertex", so a draw of strips is a few of these and no indices.
+struct NativeRange {
+    uint32_t first, count;
 };
 
 // a run of strips new to the GPU's vertex cache: fresh[src, src + count) goes to the cache at dst
@@ -133,13 +146,40 @@ struct NativeLight {
 };
 
 // what the game lays over the view between two draws, without geometry of its own
-enum NativeFxKind { FX_FOG, FX_GREY, FX_DOF };
+enum NativeFxKind { FX_FOG, FX_GREY, FX_DOF, FX_SHADOW, FX_AO };
 struct NativeFx {
     uint32_t at;                            // the draws before it in NativeFrame::draws are under it
     uint8_t kind;
+    uint8_t target;                         // FX_SHADOW: the view's number; its shadows are NativeFrame::shadows' with that target
     bool darken;                            // the fog's mode 1: Cd As
     float rect[4];                          // the view in the target's pixels: x, y, w, h over 512 x 448
     uint32_t palette[256];                  // by Z >> 8, RGBA with the GS's bytes
+    float m[16];                            // FX_AO: the picture's (x, y, depth, 1) to the world with the camera at 0
+};
+
+// Shadows: High (native.cpp). A car's draw once more as the sun sees it, into the car's cell of the shadow map
+struct NativeShadowCaster {
+    uint32_t draw;                          // of NativeFrame::draws
+    uint16_t cell;
+    uint16_t glass;                         // not 0: the car's glass, which goes into the glass's own half of the map (a faint shadow)
+    float clip[16];
+};
+// a shadow laid over a view by the picture's depth (native_shadow.frag)
+struct NativeShadow {
+    uint8_t kind;                           // 0 the patch under a car, with its texture; 1 the car's outline from the sun, its cell of the map
+    uint8_t target;                         // the view's: 1, 2 the players', 7 the mirror
+    uint16_t cell;
+    bool has_mid;
+    float to[16], to_mid[16];               // the picture's (x, y, depth, 1) to the shadow's (u, v, the third); and halfway to this frame
+    float view[4];                          // the view in the target, GS pixels (as NativeDraw::view)
+    float colour[4];                        // kind 0: the polygon's colour over 128; kind 1: a is the shadow's strength
+    float base, low, high;                  // kind 0: the polygon's height, and how far below and above it the shadow still lies
+    float size;                             // the car's length over the view's width where it stands
+    NativeTexture *tex;                     // kind 0
+    float box[4];                           // where in the view it can fall at all: left, top, right, bottom, each -1..1 (shadow_end)
+    float metres[2];                        // kind 0: the patch's size along u and along v
+    float soft;                             // kind 1: how far the soft edge reaches at its widest, in the cell's own 0..1; its `low`
+                                            // is the narrowest, its `high` how much wider it gets for each 1 of the third the car is above
 };
 
 struct NativeDepthRect {
@@ -148,12 +188,19 @@ struct NativeDepthRect {
 
 struct NativeFrame {
     std::vector<NativeVertex> vertices;     // this frame's own: the 2D and the GIF packets, and strips the cache had no room for
-    NativeRaw<uint32_t> indices;            // the strips': into the GPU's buffer, the cache below dyn_base, this frame's vertices from it
+    NativeRaw<uint32_t> indices;            // the strips': into the GPU's buffer, the cache below dyn_base, this frame's vertices from it.
+                                            // Only with HP2_INDEXED=1 (the way before the ranges, kept for comparing)
+    NativeRaw<NativeRange> ranges;          // the strips' vertices as ranges of that buffer, a draw's one after another
+    size_t strip_vertices = 0;              // the strips' vertices in all: the count the logs give
     std::vector<NativeVertex> fresh;        // the strips the cache gets this frame
     std::vector<NativeFreshRun> fresh_runs;
     uint32_t dyn_base = 0;                  // where vertices start in the GPU's buffer, as the indices were made: the cache's size
     uint32_t epoch = 0;                     // g_native_epoch as the game's thread knew it when it made the frame: a frame made for a cache the
                                             // GPU no longer has (an older epoch) is not drawn
+    uint32_t cache_top = 0;                 // the cache's vertices in use as the frame was made
+    uint32_t cache_short = 0;               // not 0: the cache had no room. The strips' vertices that found none in this frame, or
+                                            // what it held when it was emptied for room before it: the GPU's buffer then grows
+                                            // (native_vk.cpp, vertices_grow)
     uint32_t number = 0;                    // the game's count of frames
     bool dumping = false;                   // F11, HP2_SHOTSTEPS: this frame's picture is wanted
     std::vector<NativeTexUpload> uploads;   // the textures decoded for this frame
@@ -169,9 +216,35 @@ struct NativeFrame {
     uint8_t back_samples[4 * 49 * 28];      // frame's end
     bool env_linear = true;                 // the envmap views' MMag
     bool wide = false;                      // this frame fills the picture; the menus keep to 4:3 in the middle of it
+    bool doubled = false;                   // more pictures a second than frames: drawn several times, each at its place between the
+    int pictures = 0;                       // frame before and this one (clip_mid and clip give the line); so many a second are asked
+    bool mid_views = false;                 // and the mirror and the cars' reflections are drawn for the picture between too (Reflections: High)
     std::vector<NativeDepthRect> depth_rects;   // eTransferZBufferRect's: what the next frame's FetchVRAM wants of this frame's depth
+    std::vector<NativeShadowCaster> casters;    // Shadows: High
+    std::vector<NativeShadow> shadows;
+    uint8_t shadow_level = 0;               // the setting as the frame was made
+    uint32_t rvm_shadow_at = 0xffffffffu;   // the mirror's shadows go over its draws before this one of NativeFrame::draws, under the rest
 };
 
+// The limits' log (native.cpp, limits_frame: speed.log's "limits:" line): how full each of the renderer's buffers got at its
+// fullest, and its size as it is now. The renderer's thread writes, the game's reads.
+enum NativeLimitId { NL_OWN_VERTS, NL_LIGHTS, NL_MERGE_DRAWS, NL_MERGE_CMDS, NL_TEXTURES, NL_STAGING, NL_DEPTH, NL_PALETTES, NL_COUNT };
+struct NativeLimit {
+    std::atomic<uint64_t> peak{0}, cap{0};
+};
+extern NativeLimit g_native_limits[NL_COUNT];
+inline void native_limit(int id, uint64_t used, uint64_t cap)
+{
+    NativeLimit &l = g_native_limits[id];
+    if (used > l.peak.load(std::memory_order_relaxed)) l.peak.store(used, std::memory_order_relaxed);
+    l.cap.store(cap, std::memory_order_relaxed);
+}
+// a frame's lights at most: the port's own (the particles' tables) stop there; the renderer's buffer of them grows up to it
+static const uint32_t kNativeLightsMost = 1u << 17;
+
+struct Ctx;
+uint32_t native_particles_begin(Ctx &c);    // around AcidEffectSystem::RenderEffects (phase.cpp)
+void native_particles_end(Ctx &c, uint32_t from);
 void native_read_list(uint32_t list);       // an eDmaDataList as AttachDmaDataListMain gets it
 void native_end_frame();
 NativeTexture *native_texture(uint32_t texture_info, uint32_t frame);
@@ -187,7 +260,9 @@ bool native_vk_draw(NativeFrame &frame);
 extern std::atomic<uint32_t> g_native_epoch;
 void native_render_wait();                  // the game's thread: until the renderer's has no frame in hand
 float native_narrow();                      // 4:3 over the race's aspect: 1 or less
-int native_aspect();                        // that aspect, 0 4:3, 1 16:10, 2 16:9: this frame's
+void native_vk_gpus(std::vector<std::string> &names, std::string &now);    // the graphics cards there are, and the one that draws
+int native_vk_screen_hz();                  // the refresh rate of the screen the window is on, 0: not known
+int native_aspect();                        // that aspect, 0: 4:3, else the picture's width over its height times 10000: this frame's
 void native_dump_next();                    // TEMP (HP2_F11DUMP): the frame after next dumped, its draws and pictures
 bool native_dumping_now();
 // the last frame's depth over a rect of depth_rects, the GS's PSMZ24 words: false if it has not been read

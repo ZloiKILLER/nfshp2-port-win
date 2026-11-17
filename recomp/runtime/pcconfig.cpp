@@ -18,15 +18,16 @@ int pc_aspect_limit()
 {
     int w = 0, h = 0;
     window_view_size(w, h);
-    if (w <= 0 || h <= 0) return 2;
+    if (w <= 0 || h <= 0) return 17778;
+    // the resolution's own shape, width over height times 10000, from 16:10 up to 4:1 (21:9, 32:9 and all between); narrower: 4:3
     const double r = (double)w / h;
-    return r >= 16.0 / 9.0 - 0.02 ? 2 : r >= 16.0 / 10.0 - 0.02 ? 1 : 0;
+    if (r < 16.0 / 10.0 - 0.02) return 0;
+    return (int)((r < 4.0 ? r : 4.0) * 10000.0 + 0.5);
 }
 
 int pc_aspect()
 {
-    const int limit = pc_aspect_limit();
-    return g_cfg.aspect < limit ? g_cfg.aspect : limit;
+    return g_cfg.aspect ? pc_aspect_limit() : 0;
 }
 
 int g_pad_playstation;
@@ -250,8 +251,8 @@ static void write_controls(FILE *f)
         for (char &ch : n) ch = (char)tolower((unsigned char)ch);
         fprintf(f, "key_%s=%d      ; %s | %s\n", n.c_str(), g_cfg.key[b][0], pc_button_action(b), pc_key_name(g_cfg.key[b][0]).c_str());
     }
-    fprintf(f, "key_zone_freeze=%d      ; Zone Freeze\n", g_cfg.key_zone[0][0]);
-    fprintf(f, "key_zone_zoom=%d      ; Zone Zoom\n", g_cfg.key_zone[1][0]);
+    fprintf(f, "key_zone_freeze=%d      ; Zone Freeze; a cop's call for the helicopter\n", g_cfg.key_zone[0][0]);
+    fprintf(f, "key_zone_zoom=%d      ; Zone Zoom; a cop's call for a road block\n", g_cfg.key_zone[1][0]);
     fprintf(f, "\n[player2]\n");
     fprintf(f, "player2=%d          ; 0 = the second gamepad, or half of the keyboard; 1 = the first gamepad, player 1 has the keyboard\n", g_cfg.player2);
     for (int b = 0; b < PCB_COUNT; b++) {
@@ -281,28 +282,45 @@ void pc_config_save()
     fprintf(f, "; NFS Hot Pursuit 2 (recompiled): settings. The game's Options > PC Settings changes them.\n");
     fprintf(f, "; Environment variables (HP2_NOSOUND ...) win over this file.\n\n");
     fprintf(f, "[video]\n");
-    fprintf(f, "scale=%d            ; the picture, times the PS2's: 1 to 8\n", g_cfg.scale);
     fprintf(f, "fullscreen=%d       ; 1 = borderless fullscreen (Alt+Enter)\n", g_cfg.fullscreen);
     fprintf(f, "window=%d,%d     ; the window's picture\n", g_cfg.win_w, g_cfg.win_h);
-    fprintf(f, "smooth=%d           ; 1 = smooth picture scaling, 0 = sharp\n", g_cfg.smooth);
-    fprintf(f, "aspect=%d           ; the race's picture: 0 = 4:3, 1 = 16:10, 2 = 16:9\n", g_cfg.aspect);
+    fprintf(f, "fullscreen_size=%d,%d ; the picture's size in fullscreen, stretched to the monitor; 0,0 = the monitor's own\n", g_cfg.fs_w, g_cfg.fs_h);
+    fprintf(f, "render_scale=%d   ; percent of the resolution the picture is drawn at: 20 to 200 in steps of 20\n", g_cfg.render_scale);
+    fprintf(f, "aspect=%d           ; the race's picture: 0 = 4:3, 1 = as wide as the resolution (16:10, 16:9, 21:9, 32:9 ...)\n", g_cfg.aspect ? 1 : 0);
     fprintf(f, "aa_mode=%d          ; anti-aliasing: 0 = off, 1 = MSAA, 2 = SMAA\n", g_cfg.aa_mode);
     fprintf(f, "aa_level=%d         ; 2 or 4: MSAA samples, SMAA quality\n", g_cfg.aa_level);
     fprintf(f, "aniso=%d            ; anisotropic filtering: 0 = off, 2, 4, 8, 16\n", g_cfg.aniso);
+    fprintf(f, "dithering=%d        ; dithering against colour banding: 0 = off, 1 = on\n", g_cfg.deband);
+    fprintf(f, "ambient_occlusion=%d ; soft shading where surfaces meet, in a race: 0 = off, 1 = on\n", g_cfg.ao);
+    fprintf(f, "ambient_occlusion_reach=%d    ; how far it reaches, centimetres (20 to 400)\n", g_cfg.ao_reach);
+    fprintf(f, "ambient_occlusion_strength=%d ; how dark it is, percent (10 to 300)\n", g_cfg.ao_strength);
+    fprintf(f, "shadow_softness=%d  ; the shadows' soft edge at High and up, percent (25 to 200)\n", g_cfg.shadow_softness);
+    fprintf(f, "monitor=%d          ; the screen the game is shown on: 0 = where the window is, 1 and up = that screen\n", g_cfg.monitor);
+    fprintf(f, "; the graphics card that draws the game, by its name as Options, Graphics, Resolution, Select GPU lists it; empty: the game chooses\n");
+    fprintf(f, "gpu=%s\n", g_cfg.gpu);
     fprintf(f, "brightness=%d       ; percent, -50 to 50\n", g_cfg.brightness);
     fprintf(f, "contrast=%d        ; percent, 50 to 150\n", g_cfg.contrast);
     fprintf(f, "gamma=%d           ; percent, 50 to 200: above 100 lighter\n", g_cfg.gamma);
-    fprintf(f, "frame_rate=%d       ; the race's, 30 or 60\n", g_cfg.frame_rate);
+    fprintf(f, "frame_rate=%d       ; the race's: 30, 60, or more (120, 144 ... 500; 1000 = unlimited: the game's 60 with pictures drawn between its frames)\n",
+            pc_picture_rate());
     fprintf(f, "vsync=%d            ; 1 = the picture waits for the screen (no tearing), 0 = shown at once\n", g_cfg.vsync);
-    fprintf(f, "draw_distance=%d   ; percent, 100 to 400: 100 is the PS2's\n", g_cfg.draw_distance);
+    fprintf(f, "draw_distance=%d   ; percent of the PS2's: 100 = original, 200 = advanced, 400 = high, 600 = maximum\n", g_cfg.draw_distance);
     fprintf(f, "profile=%s\n", g_cfg.last_profile);
     fprintf(f, "language=%s     ; ENGLISH, FRENCH, GERMAN, ITALIAN, SPANISH, SWEDISH, or one of data\\lang\\\n", g_cfg.language);
     fprintf(f, "show_fps=%d\n", g_cfg.show_fps);
     fprintf(f, "max_detail=%d       ; 1 = every object at its most detailed model, 0 = the PS2's levels of detail\n", g_cfg.max_detail);
+    fprintf(f, "particles=%d        ; smoke, sparks, dust: 0 = original (drawn as the game draws them), 1 = advanced (the same particles with soft edges)\n", g_cfg.particles);
+    fprintf(f, "shadows=%d          ; the cars' shadows: 0 = the PS2's, 1 = high (the body's outline, lying on what is under it, in the mirror and far off too), 2 = maximum (finer), 3 = ultra (a test: finer again, 256 MB of the card's memory)\n", g_cfg.shadows);
     fprintf(f, "reflections=%d      ; the cars' reflections: 0 = the PS2's, 1 = advanced (new every frame), 2 = high (new every frame, twice the resolution)\n", g_cfg.reflections);
     fprintf(f, "\n");
     fprintf(f, "log=%s             ; on = the game writes speed.log (4 MB at most: its first and its last 2 MB), off = it writes no log at all\n", g_cfg.log ? "on" : "off");
     fprintf(f, "[audio]\nvolume=%d           ; percent\n\n", g_cfg.volume);
+    fprintf(f, "[extras]\ndebug_menu=%d       ; 1 = the developers' Debug item in the pause menu (Options > Extras > DEBUG.not.pretty)\n", g_cfg.debug_menu);
+    fprintf(f, "cheat_menu=%d       ; 1 = F8 in the menus opens the game's cheats (Options > Extras > Cheat Menu)\n", g_cfg.cheat_menu);
+    fprintf(f, "cheats=");          // the entries of the game's table of codes that are on (recomp/docs/cheats.md has their numbers)
+    for (int i = 0, n = 0; i < (int)sizeof g_cfg.cheats; i++)
+        if (g_cfg.cheats[i]) fprintf(f, "%s%d", n++ ? "," : "", i);
+    fprintf(f, "\n\n");
     write_controls(f);
     fclose(f);
 }
@@ -325,8 +343,7 @@ static bool read_settings(const std::string &path, bool &old_controls)
         for (char *e = key + strlen(key); e > key && (e[-1] == ' ' || e[-1] == '\t'); *--e = 0) {}
         while (*val == ' ' || *val == '\t') val++;
         int n = atoi(val);
-        if (!strcmp(key, "scale")) g_cfg.scale = clampi(n, 1, 8);
-        else if (!strcmp(key, "controls")) old_controls = n < 2;
+        if (!strcmp(key, "controls")) old_controls = n < 2;
         else if (!strcmp(key, "pad_layout")) g_pad_layout_old = n < 2;
         else if (!strcmp(key, "profile")) {
             snprintf(g_cfg.last_profile, sizeof g_cfg.last_profile, "%s", val);
@@ -339,7 +356,6 @@ static bool read_settings(const std::string &path, bool &old_controls)
             for (char *e = g_cfg.language; *e; e++) *e = (char)toupper((unsigned char)*e);
         }
         else if (!strcmp(key, "fullscreen")) g_cfg.fullscreen = n != 0;
-        else if (!strcmp(key, "smooth")) g_cfg.smooth = n != 0;
         else if (!strcmp(key, "aspect")) g_cfg.aspect = clampi(n, 0, 2);
         else if (!strcmp(key, "aa")) {      // an older hp2.ini: multisampling, 0, 2, 4 or 8
             g_cfg.aa_mode = n >= 2;
@@ -347,23 +363,48 @@ static bool read_settings(const std::string &path, bool &old_controls)
         }
         else if (!strcmp(key, "aa_mode")) g_cfg.aa_mode = clampi(n, 0, 2);
         else if (!strcmp(key, "aa_level")) g_cfg.aa_level = n >= 4 ? 4 : 2;
+        else if (!strcmp(key, "dithering")) g_cfg.deband = n != 0;
+        else if (!strcmp(key, "ambient_occlusion")) g_cfg.ao = n != 0;
+        else if (!strcmp(key, "ambient_occlusion_reach")) g_cfg.ao_reach = clampi(n, 20, 400);
+        else if (!strcmp(key, "ambient_occlusion_strength")) g_cfg.ao_strength = clampi(n, 10, 300);
+        else if (!strcmp(key, "shadow_softness")) g_cfg.shadow_softness = clampi(n, 25, 200);
+        else if (!strcmp(key, "monitor")) g_cfg.monitor = clampi(n, 0, 16);
+        else if (!strcmp(key, "gpu")) {
+            snprintf(g_cfg.gpu, sizeof g_cfg.gpu, "%s", val);
+            for (char *e = g_cfg.gpu + strlen(g_cfg.gpu); e > g_cfg.gpu && (unsigned char)e[-1] <= ' '; *--e = 0) {}
+        }
         else if (!strcmp(key, "aniso")) g_cfg.aniso = n >= 16 ? 16 : n >= 8 ? 8 : n >= 4 ? 4 : n >= 2 ? 2 : 0;
         else if (!strcmp(key, "brightness")) g_cfg.brightness = clampi(n, -50, 50);
         else if (!strcmp(key, "contrast")) g_cfg.contrast = clampi(n, 50, 150);
         else if (!strcmp(key, "gamma")) g_cfg.gamma = clampi(n, 50, 200);
-        else if (!strcmp(key, "frame_rate")) g_cfg.frame_rate = n == 60 ? 60 : 30;
+        else if (!strcmp(key, "frame_rate")) g_cfg.frame_rate = n >= 60 ? 60 : 30, g_cfg.pictures = n > 60 ? clampi(n, 61, 1000) : 0;
         else if (!strcmp(key, "vsync")) g_cfg.vsync = n != 0;
-        else if (!strcmp(key, "draw_distance")) g_cfg.draw_distance = clampi(n, 100, 400);
+        else if (!strcmp(key, "draw_distance")) g_cfg.draw_distance = clampi(n, 100, 600);
         else if (!strcmp(key, "show_fps")) g_cfg.show_fps = n != 0;
         else if (!strcmp(key, "max_detail")) g_cfg.max_detail = n != 0;
         else if (!strcmp(key, "reflections")) g_cfg.reflections = clampi(n, 0, 2);
+        else if (!strcmp(key, "shadows")) g_cfg.shadows = clampi(n, 0, 3);
+        else if (!strcmp(key, "particles")) g_cfg.particles = clampi(n, 0, 1);      // (2 was High till 2026-11-17: Advanced now)
         else if (!strcmp(key, "log")) g_cfg.log = log_value(val);
         else if (!strcmp(key, "volume")) g_cfg.volume = clampi(n, 0, 100);
+        else if (!strcmp(key, "debug_menu")) g_cfg.debug_menu = n != 0;
+        else if (!strcmp(key, "cheat_menu")) g_cfg.cheat_menu = n != 0;
+        else if (!strcmp(key, "cheats")) {
+            memset(g_cfg.cheats, 0, sizeof g_cfg.cheats);
+            for (const char *at = val; at && *at;) {
+                const int i = atoi(at);
+                if (i >= 0 && i < (int)sizeof g_cfg.cheats && (*at >= '0' && *at <= '9')) g_cfg.cheats[i] = 1;
+                at = strchr(at, ',');
+                if (at) at++;
+            }
+        }
         else if (!strcmp(key, "deadzone")) g_cfg.pad_deadzone = clampi(n, 0, 50);
         else if (!strcmp(key, "steering")) g_cfg.pad_steering = clampi(n, 50, 200);
         else if (!strcmp(key, "icons")) g_cfg.pad_icons = clampi(n, 0, 2);
         else if (!strcmp(key, "player2")) g_cfg.player2 = clampi(n, 0, 1);
         else if (!strcmp(key, "window")) sscanf(val, "%d,%d", &g_cfg.win_w, &g_cfg.win_h);
+        else if (!strcmp(key, "fullscreen_size")) sscanf(val, "%d,%d", &g_cfg.fs_w, &g_cfg.fs_h);
+        else if (!strcmp(key, "render_scale")) g_cfg.render_scale = clampi((n + 10) / 20 * 20, 20, 200);
         else if (!strcmp(key, "key_zone_freeze")) sscanf(val, "%d,%d", &g_cfg.key_zone[0][0], &g_cfg.key_zone[0][1]);
         else if (!strcmp(key, "key_zone_zoom")) sscanf(val, "%d,%d", &g_cfg.key_zone[1][0], &g_cfg.key_zone[1][1]);
         else if (!strcmp(key, "key2_zone_freeze")) sscanf(val, "%d,%d", &g_cfg.key2_zone[0][0], &g_cfg.key2_zone[0][1]);

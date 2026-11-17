@@ -1,6 +1,7 @@
 // The renderer, the Vulkan side: a picture of its own, blitted to the window through a swapchain (native.h). The picture's size has
 // nothing to do with the GS's: clip space is resolution-free.
 #include "native.h"
+#include "stall.h"
 #include <mutex>
 
 #include "hw.h"
@@ -61,6 +62,24 @@ static const uint32_t kGradeFrag[] =
 static const uint32_t kOpaqueFrag[] =
 #include "native_opaque.frag.spv.h"
     ;
+static const uint32_t kExtraFrag[] =
+#include "native_extra.frag.spv.h"
+    ;
+static const uint32_t kShadowFrag[] =
+#include "native_shadow.frag.spv.h"
+    ;
+static const uint32_t kAoFrag[] =
+#include "native_ao.frag.spv.h"
+    ;
+static const uint32_t kAoApplyFrag[] =
+#include "native_ao_apply.frag.spv.h"
+    ;
+static const uint32_t kShadowFragMs[] =
+#include "ms_native_shadow.frag.spv.h"
+    ;
+static const uint32_t kFragSoft[] =
+#include "soft_native.frag.spv.h"
+    ;
 // SMAA: Jimenez and others' "Enhanced Subpixel Morphological Antialiasing" (shaders/smaa, MIT), its three passes and two tables
 static const uint32_t kSmaaEdgeVert[] =
 #include "native_smaa_edge.vert.spv.h"
@@ -102,19 +121,37 @@ static const uint32_t kSmaaBlendFrag[] =
     X(vkCmdBindDescriptorSets) X(vkCmdCopyBufferToImage) X(vkCmdBlitImage) X(vkDestroyImage) X(vkDestroyImageView)  \
     X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdClearColorImage) X(vkCreateSemaphore) X(vkDeviceWaitIdle)         \
     X(vkCreateSwapchainKHR) X(vkDestroySwapchainKHR) X(vkGetSwapchainImagesKHR) X(vkAcquireNextImageKHR) X(vkQueuePresentKHR) \
-    X(vkCreateQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults) X(vkCmdCopyBuffer) X(vkCmdBindIndexBuffer) X(vkCmdDrawIndexed)
+    X(vkCreateQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults) X(vkCmdCopyBuffer) X(vkCmdBindIndexBuffer) X(vkCmdDrawIndexed) X(vkCmdDrawIndirect) \
+    X(vkCmdCopyImage)
 #define NV_DECLARE(name) static PFN_##name name;
 static PFN_vkGetInstanceProcAddr gipa;
 static PFN_vkCreateInstance vkCreateInstance;
 NV_INSTANCE(NV_DECLARE)
 NV_DEVICE(NV_DECLARE)
 
-// the picture's size: scale in hp2.ini times 512 x 448; HP2_NATIVESIZE=<w>x<h> sets it
+// The picture's size: the resolution's (the window's; fullscreen, the size chosen for it, which blit_to_window stretches to the
+// monitor), times Render Scale (20 to 200 %, 100 as it comes). The window shows a 4:3 box of 444 of the picture's 448 lines
+// (blit_to_window), the race's wider one beside it, so the picture has as many lines as that box has pixels of height, times
+// 448 / 444, and the width that goes with them: at 100 % in a window the picture reaches it pixel for pixel.
+// HP2_NATIVESIZE=<w>x<h> sets the 4:3 picture's size whatever the window's.
 static int W = 1024, H = 896;       // the race's picture
 static int W43 = 1024;              // the 4:3 middle of it
-// a frame's vertices, 32 bytes each: 4 million. The draw distance takes a race at 200% to half a million and more, the mirror and 16:9 with it
-static const VkDeviceSize kMaxBytes = 128 * 1024 * 1024, kStaging = 64 * 1024 * 1024, kFoldBytes = 1024 * 1024, kLightBytes = 4 * 1024 * 1024;
-static const VkDeviceSize kFpsBytes = 256 * 1024, kDepthBytes = 8 * 1024 * 1024;
+static int g_lines;                 // the height of the window's 4:3 box the picture is to be made for (track_lines); 0: not known yet
+// A frame's vertices when they are drawn from the host's copy (no cache), 32 bytes each: 32 million at most (4 million till
+// 2026-11-17). The copy itself grows with what a frame needs (vertex_room).
+static const VkDeviceSize kMaxBytes = (VkDeviceSize)1024 * 1024 * 1024, kFoldBytes = 1024 * 1024;
+static const VkDeviceSize kFpsBytes = 256 * 1024;
+// The buffers that grow (2026-11-17, the user: "let a buffer grow as it fills, all the buffers"). Each starts at the size it
+// always had and is made anew, twice the size or more, when a frame needs more of it: at the frame's start, when the GPU is done
+// with the last frame and nothing reads the old one (lights_room, merge_room, staging_room, depth_room, texture_set,
+// vertices_grow). They are not among what rebuild() takes apart: they outlive a change of settings at the size they have
+// grown to. HP2_SMALLBUFS=1 starts them all tiny, so that an ordinary race goes through every one's growing: a test of this
+// code, not a setting.
+static const bool g_small_bufs = getenv("HP2_SMALLBUFS") != nullptr;
+static const VkDeviceSize kLightStart = g_small_bufs ? 64 * 1024 : 4 * 1024 * 1024, kLightMost = 64 * 1024 * 1024;
+static const VkDeviceSize kStagingStart = g_small_bufs ? 1024 * 1024 : 64 * 1024 * 1024, kStagingMost = (VkDeviceSize)1024 * 1024 * 1024;
+static const VkDeviceSize kDepthStart = g_small_bufs ? 4096 : 8 * 1024 * 1024, kDepthMost = 256 * 1024 * 1024;
+static const uint32_t kTexSets = g_small_bufs ? 64 : 4096;      // a descriptor pool's textures; a full one is followed by another
 // The cars' reflections: the six views round the car and the sphere map they are folded into. The PS2's sizes, or twice them with
 // Graphics, Reflections at High (set where the renderer is made: that is part of settings_key).
 static int ENV_SIZE = 64, SPHERE_SIZE = 256;
@@ -124,6 +161,7 @@ struct VkTex {
     VkImageView view;
     VkDeviceMemory mem;
     VkDescriptorSet set;
+    VkDescriptorPool pool;                  // the one its set is from (texture_set)
     uint32_t used;
     uint32_t born;                          // the frame it was uploaded at
     NativeTexture *owner;
@@ -138,7 +176,19 @@ struct Push {
     int bits16;
     int tex_mode;
     float snap[2];
+    int merged;
+    float between;                          // native.vert's particles: where this picture is between the last step and this one
 };
+
+// A merged draw's own (native.vert's DrawData), and how many of them and of their commands a picture's buffers have room for at
+// first and at most (they grow with the frames: merge_room): past that the draws go out one by one as before
+struct DrawData {
+    float clip[16];
+    int light;
+    int pad[3];
+};
+static const uint32_t kMergeDrawsStart = g_small_bufs ? 256 : 1u << 16, kMergeCmdsStart = g_small_bufs ? 1024 : 1u << 18;
+static const uint32_t kMergeDrawsMost = 1u << 20, kMergeCmdsMost = 1u << 22;
 
 struct FoldVertex { float s, t, u, v; };
 
@@ -153,9 +203,77 @@ struct PostPush {
     float rect[4];
 };
 
+// More pictures a second than the game makes frames (NativeFrame::doubled, pictures): a frame is drawn several times, each picture at
+// its own place between the frame before and this one: g_pic_f, 1 is the frame itself. A draw's matrix there is on the line through
+// its clip_mid (the place halfway) and its clip; so are the vertices of the draws that have a second copy (mid_verts), and the
+// port's own particles are simply at that time (native.vert). g_between: the picture is not the frame itself. What a frame does
+// once (the copy for the next frame's blend with the last picture, the depth the sun's flare reads, the pictures taken for the
+// tests) is left to its last picture, g_pic_last.
+// the graphics cards there are, by name, and the one that draws (setup; native_vk_gpus for the menu)
+static std::mutex g_gpu_mutex;
+static std::vector<std::string> g_gpu_names;
+static std::string g_gpu_now;
+static bool g_between;
+static float g_pic_f = 1.0f;
+// Particles: High, the soft sprites: this picture has its copy of the depth, and the port's sprites from here on are drawn as balls
+static bool g_soft_now;
+static const uint32_t kParticleFlag = 0x10000;      // NativeDraw::flags: a draw of the port's own particles (native.cpp, kPartFlag)
+static const uint32_t kSoft2dFlag = 0x40000;        // and of the port's sprites of the game's particles (native.cpp, kSoft2dFlag)
+static const uint32_t kSoftKinds = kParticleFlag | kSoft2dFlag;     // what may be drawn as a ball of smoke
+static const uint32_t kSoftFlag = 0x20000;          // the constants' flags only: native.vert's SOFT_FRONT
+static bool g_pic_last = true;
+
+// a draw's matrix for this picture: exactly clip_mid at the half and clip at 1, as when there were only those two
+static void picture_clip(float *out, const NativeDraw &d)
+{
+    if (!g_between || !d.has_mid) {
+        memcpy(out, d.clip, sizeof d.clip);
+    } else if (g_pic_f == 0.5f) {
+        memcpy(out, d.clip_mid, sizeof d.clip);
+    } else {
+        const float t = 2.0f * g_pic_f - 1.0f;
+        for (int i = 0; i < 16; i++) out[i] = d.clip_mid[i] * (1.0f - t) + d.clip[i] * t;
+    }
+}
+
+// The effects laid over the picture (NativeFrame::fx) are as many as the frame has. Those that read a palette (the fog, the depth of
+// field, the grey: all but the shadows) have a row each of the palette image, and it has so many: one past them is left out. There
+// were 8 rows and 8 effects of any kind at most (till 2026-11-17), the shadows, which read none, among them.
+static const int kPaletteRows = 32;
+// an effect's row of the palette image; -1: it reads none
+static bool fx_palette(uint8_t kind) { return kind != FX_SHADOW && kind != FX_AO; }
+static int fx_row(const NativeFrame &frame, size_t i)
+{
+    if (!fx_palette(frame.fx[i].kind)) return -1;
+    int row = 0;
+    for (size_t k = 0; k < i; k++) row += fx_palette(frame.fx[k].kind);
+    return row;
+}
+
+// Shadows: the map of the cars as the sun sees them is so many cells across and down, a car each (native.cpp, kShadowCells). The
+// image is twice as many down: the upper half has the cars' bodies, the lower, cell for cell, their glass (kShadowRows in all).
+static const int kShadowAcross = 8, kShadowDown = 4, kShadowRows = kShadowDown * 2;
+
+// native_shadow.frag's
+struct ShadowPush {
+    float to[16];
+    float rect[4];
+    float colour[4];
+    float view[4];
+    float mode, texel, low, high;
+};
+
+// native_extra.frag's
+struct ExtraPush {
+    float rect[4];
+    float size[2];
+    float frame;
+    float lines;
+};
+
 static struct {
     bool ready, failed;
-    int key;                                // the settings this was all made for
+    uint64_t key;                           // the settings this was all made for
     VkPhysicalDeviceProperties props;
     bool can_aniso;
     bool clip_far;                          // shaderClipDistance: the far plane by a clip distance, the scene's shaders without a discard but for the alpha test
@@ -168,7 +286,8 @@ static struct {
     // from there; read over the bus at every pass, the host's copy cost the scene most of its time. Both grow with what a frame needs.
     VkBuffer vb_dev, vb_stage, readback;   // vertex_room
     VkDeviceMemory vb_dev_mem, vb_stage_mem;
-    VkDeviceSize vb_cap, dyn_off, idx_off;
+    VkDeviceSize vb_cap, dyn_off;
+    VkDeviceSize vb_total, vb_side;         // the GPU's buffer, and the end of it that is a frame's own (vb_layout)
     uint32_t cache_verts;
     bool vb_in_vram;
     VkBuffer vb;                            // the frame's: what the draws read, vertices and indices
@@ -190,6 +309,19 @@ static struct {
     VkPipelineLayout smaa_layout[3];
     VkDescriptorSet smaa_scene_set, smaa_edges_set, smaa_weights_set, smaa_area_set, smaa_search_set;
     VkBuffer smaa_stage;
+    // The port's dithering (native_extra.frag)
+    VkPipeline extra_pipeline;
+    VkPipelineLayout extra_layout;
+    VkDescriptorSetLayout extra_set_layout;
+    VkDescriptorSet extra_set;
+    // The draws merged: runs of draws alike but for the matrix and the light go out as one vkCmdDrawIndirect each. draws_buf has
+    // each such draw's matrix and light (the vertex shader's D[]), cmds_buf the commands, a range of vertices each
+    bool can_merge;
+    VkBuffer draws_buf, cmds_buf;
+    void *draws_map, *cmds_map;
+    uint32_t merge_draws, merge_cmds;       // used so far this frame
+    uint32_t draws_cap, cmds_cap;           // what the two have room for (merge_room)
+    VkDeviceMemory draws_mem, cmds_mem;
     VkPipeline grade_pipeline;              // brightness, contrast, gamma
     VkPipelineLayout grade_layout;
     VkDescriptorSet grade_set;
@@ -217,19 +349,64 @@ static struct {
     VkDescriptorSetLayout post_set_layout;
     VkPipelineLayout post_layout;
     VkPipeline post_pipeline[3];            // over, darken, opaque
+    // Shadows: High (native.cpp). The map: 8 x 4 cells of depth, a car each as the sun sees it, the furthest kept. shadow_cast draws a
+    // car into its cell; shadow_pipeline lays a shadow over the picture (the post pass) or over the mirror (rvm_post_pass)
+    VkImage shadow_map;
+    VkImageView shadow_view, rvm_depth_view;
+    VkRenderPass shadow_pass, rvm_post_pass;
+    VkRenderPass env_pass_load;             // env_pass with what is there kept: the rest of the mirror after its shadows
+    VkFramebuffer shadow_fb, rvm_post_fb;
+    VkPipeline shadow_cast, shadow_pipeline;
+    VkPipelineLayout shadow_layout;
+    VkDescriptorSet shadow_set, rvm_post_set;
+    int palette_rows;                       // of the palette image: how many this frame's effects have (upload_palettes)
+    int shadow_cell;                        // a cell's side in texels: 256, at Maximum 512, at Ultra 1024
+    bool shadow_ready;                      // the map has been drawn at least once
+    // Shadows with multisampling: laid over the samples themselves (ms_read_pass: the picture's samples, their depth read and not
+    // written), each sample by its own depth. Null where the card cannot shade by the sample: over the resolved picture then, as before
+    bool sample_shading;
+    VkImageView depth_ms_view;
+    VkRenderPass ms_read_pass;
+    VkFramebuffer ms_read_fb;
+    VkPipeline shadow_ms_pipeline;
+    VkDescriptorSet ms_post_set;
+    // Ambient Occlusion (native.cpp, ao_end): made at every second pixel into an image of its own (ao_pass, native_ao.frag), then
+    // laid over the picture from it (ao_apply_pipeline, native_ao_apply.frag, in the post pass, blended as the shadows are)
+    VkImage ao;
+    VkImageView ao_view;
+    VkRenderPass ao_pass;
+    VkFramebuffer ao_fb;
+    VkPipeline ao_pipeline, ao_apply_pipeline;
+    VkDescriptorSet ao_set;
+    int ao_w, ao_h;
+    // Particles: High, the soft sprites (native.frag, SOFT): a copy of the picture's depth made before a picture's first such sprite
+    // (copy_depth_soft), and the scene's pipelines again with that shader, by the samples (0 one, 1 the picture's), the blend, the depth test
+    VkImage depth_copy;
+    VkImageView depth_copy_view;
+    VkDescriptorSet soft_set;
+    VkPipelineLayout soft_layout;
+    VkPipeline soft_pipeline[2][NB_COUNT][2];
+    bool soft_ok;
     bool prev_ready;
     VkPipelineLayout layout;
     VkDescriptorSetLayout set_layout;
     VkDescriptorPool pool;
+    std::vector<VkDescriptorPool> tex_pools;    // more of them for the textures' sets, as the ones before filled up (texture_set)
     VkSampler sampler[32];                  // repeat s, repeat t, mag linear, min linear, mip linear
     VkBuffer staging;
     void *staging_map;
+    VkDeviceMemory staging_mem;
+    VkDeviceSize staging_cap;               // its size (staging_room)
+    VkDeviceSize staging_want;              // a texture that did not fit it whole: so much before the next frame's uploads
+    VkDeviceSize staging_refused;           // not 0: so much could not be had, a texture of that size or more stays as it is
     std::vector<VkTex *> textures;
     uint32_t frame;
     VkDescriptorSetLayout light_layout;
     VkDescriptorSet light_set;
     VkBuffer lights, lights_stage, fold_vb;  // the lights as the vertices: the host's copy, the GPU's (lights == lights_stage without one)
     void *lights_map, *fold_map;
+    VkDeviceMemory lights_mem, lights_stage_mem;
+    VkDeviceSize light_cap;                 // the lights' buffers in bytes (lights_room)
     VkImage env[6], sphere, env_depth;
     VkRenderPass env_pass, fold_pass;
     VkFramebuffer env_fb[6], sphere_fb;
@@ -251,6 +428,7 @@ static struct {
     VkSwapchainKHR swapchain;
     std::vector<VkImage> swap_images;
     int swap_w, swap_h;                     // the swapchain's images
+    int lines;                              // g_lines as the picture was made for it
     int swap_cw, swap_ch;                   // the window's client size it was made for
     bool swap_stale;                        // to be made again
     bool swap_check;                        // "suboptimal" was said: made again only if the surface's size is no longer the swapchain's
@@ -270,6 +448,8 @@ static struct {
     // eTransferZBufferRect's rects of the last frame
     VkBuffer depth_rb;
     void *depth_rb_map;
+    VkDeviceMemory depth_rb_mem;
+    VkDeviceSize depth_cap;                 // its size (depth_room)
     std::vector<NativeDepthRect> depth_rects;
     std::vector<VkDeviceSize> depth_places;
     float depth_ox, depth_sx;
@@ -368,9 +548,18 @@ static bool make_buffer(VkBuffer &b, void **map, VkDeviceSize size, VkBufferUsag
 // then its indices, 256 MB or less where there is not the room. The host's copy (vb_stage) holds a frame's own vertices, the strips new to
 // the cache and the indices, one after another, and grows when a frame needs more; the GPU copies what it holds at the frame's start.
 // Without the GPU's buffer (HP2_HOSTBUFFERS, or no memory) the host's copy is drawn from, and there is no cache.
-static const VkDeviceSize kSide = 16 * 1024 * 1024;  // a frame's own vertices, and its indices, in the GPU's buffer
+// The end of the buffer that is a frame's own (vb_side): its vertices, then its indices right after them (there are none but with
+// HP2_INDEXED=1), 32 MB at first. Till 2026-11-17 it was 16 MB for the vertices and 16 MB for the indices, and a frame with more
+// of either was not drawn at all. Now both the buffer and that end of it grow (vertices_grow).
+static const VkDeviceSize kVbSideStart = g_small_bufs ? 1024 * 1024 : 32 * 1024 * 1024, kVbTotalMost = (VkDeviceSize)1024 * 1024 * 1024;
 
 static uint32_t cache_verts_now() { return g.vb_in_vram ? g.cache_verts : 0; }
+static void vb_layout(VkDeviceSize total, VkDeviceSize side)
+{
+    g.vb_total = total, g.vb_side = side;
+    g.cache_verts = (uint32_t)((total - side) / sizeof(NativeVertex));
+    g.dyn_off = (VkDeviceSize)g.cache_verts * sizeof(NativeVertex);
+}
 // what the game's thread reads of it: as it stood when the last frame was done
 static std::atomic<uint32_t> g_cache_cap_pub{0};
 uint32_t native_vk_cache_vertices() { return g_cache_cap_pub.load(); }
@@ -381,12 +570,11 @@ static void device_vertices()
     if (tried || getenv("HP2_HOSTBUFFERS")) return;
     tried = true;
     for (VkDeviceSize total : {(VkDeviceSize)256 << 20, (VkDeviceSize)128 << 20, (VkDeviceSize)64 << 20}) {
+        if (g_small_bufs && total != (VkDeviceSize)64 << 20) continue;
         if (make_buffer_in(g.vb_dev, nullptr, total, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, &g.vb_dev_mem)) {
             g.vb_in_vram = true;
-            g.cache_verts = (uint32_t)((total - 2 * kSide) / sizeof(NativeVertex));
-            g.dyn_off = (VkDeviceSize)g.cache_verts * sizeof(NativeVertex);
-            g.idx_off = g.dyn_off + kSide;
+            vb_layout(total, kVbSideStart);
             fprintf(g_hle_log, "native: %llu MB of the GPU's memory for the vertices, %u of them cached\n", (unsigned long long)(total >> 20), g.cache_verts);
             return;
         }
@@ -410,6 +598,254 @@ static bool vertex_room(VkDeviceSize bytes)
                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, VK_MEMORY_PROPERTY_HOST_CACHED_BIT, &g.vb_stage_mem))
         return false;
     g.vb_cap = cap;
+    return true;
+}
+
+// ---- the buffers that grow ------------------------------------------------------------------------------
+NativeLimit g_native_limits[NL_COUNT];
+
+// A buffer kept by hand: made, or made anew at another size in place of the one there (which is then destroyed: only with no
+// frame of the GPU's in flight). Not written down for rebuild(). False: none could be made, and the old one stays.
+static bool own_buffer(VkBuffer &b, VkDeviceMemory &mem, void **map, VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags need,
+                       VkMemoryPropertyFlags prefer = 0)
+{
+    const bool tracked = g_tracking;
+    g_tracking = false;
+    VkBuffer made = VK_NULL_HANDLE;
+    VkDeviceMemory made_mem = VK_NULL_HANDLE;
+    void *made_map = nullptr;
+    const bool ok = make_buffer_in(made, map ? &made_map : nullptr, size, usage, need, prefer, &made_mem);
+    g_tracking = tracked;
+    if (!ok) return false;
+    if (b) {
+        vkDestroyBuffer(g.dev, b, nullptr);
+        vkFreeMemory(g.dev, mem, nullptr);
+    }
+    b = made, mem = made_mem;
+    if (map) *map = made_map;
+    return true;
+}
+
+// the scene's second set: the lights, and the merged draws' matrices and lights. Written again when either buffer is another
+static void bind_frame_buffers()
+{
+    if (!g.light_set || !g.lights || !g.draws_buf) return;
+    VkDescriptorBufferInfo lbi = {g.lights, 0, g.light_cap};
+    VkDescriptorBufferInfo dbi = {g.draws_buf, 0, (VkDeviceSize)g.draws_cap * sizeof(DrawData)};
+    VkWriteDescriptorSet w[2] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
+    for (uint32_t i = 0; i < 2; i++) {
+        w[i].dstSet = g.light_set;
+        w[i].dstBinding = i;
+        w[i].descriptorCount = 1;
+        w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    }
+    w[0].pBufferInfo = &lbi;
+    w[1].pBufferInfo = &dbi;
+    vkUpdateDescriptorSets(g.dev, 2, w, 0, nullptr);
+}
+
+// The frame's lights (NativeLight, 352 bytes each): the host's copy and the GPU's (the same buffer without one). 4 MB at first,
+// 11915 lights: a frame with more had none of its lights copied, and its lit draws read the frame before's. Now twice the room
+// and more when a frame has more, up to 64 MB. False: no room for so many, and none could be made.
+static bool lights_room(VkDeviceSize bytes)
+{
+    if (bytes <= g.light_cap) return true;
+    VkDeviceSize cap = g.light_cap ? g.light_cap : kLightStart;
+    while (cap < bytes && cap < kLightMost) cap *= 2;
+    if (cap < bytes) return false;
+    const VkBuffer old_dev = g.lights != g.lights_stage ? g.lights : (VkBuffer)VK_NULL_HANDLE;
+    const VkDeviceMemory old_dev_mem = g.lights_mem;
+    if (!own_buffer(g.lights_stage, g.lights_stage_mem, &g.lights_map, cap, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, VK_MEMORY_PROPERTY_HOST_CACHED_BIT))
+        return false;
+    VkBuffer dev = VK_NULL_HANDLE;
+    VkDeviceMemory dev_mem = VK_NULL_HANDLE;
+    if (!getenv("HP2_HOSTBUFFERS"))
+        own_buffer(dev, dev_mem, nullptr, cap, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (old_dev) {
+        vkDestroyBuffer(g.dev, old_dev, nullptr);
+        vkFreeMemory(g.dev, old_dev_mem, nullptr);
+    }
+    g.lights = dev ? dev : g.lights_stage;
+    g.lights_mem = dev_mem;
+    if (g.light_cap)
+        fprintf(g_hle_log, "native: a frame has %llu lights, the buffer of them grows from %llu to %llu KB\n", (unsigned long long)(bytes / sizeof(NativeLight)),
+                (unsigned long long)(g.light_cap >> 10), (unsigned long long)(cap >> 10));
+    g.light_cap = cap;
+    bind_frame_buffers();
+    return true;
+}
+
+// The merged draws' buffers: room for so many draws and so many of their commands (a range of vertices each). A picture that
+// has more than there is room for sends the rest out one by one, which is only slower.
+static bool merge_room(uint32_t draws, uint32_t cmds)
+{
+    if (draws <= g.draws_cap && cmds <= g.cmds_cap) return true;
+    uint32_t dc = g.draws_cap ? g.draws_cap : kMergeDrawsStart, cc = g.cmds_cap ? g.cmds_cap : kMergeCmdsStart;
+    while (dc < draws && dc < kMergeDrawsMost) dc *= 2;
+    while (cc < cmds && cc < kMergeCmdsMost) cc *= 2;
+    const uint32_t was_d = g.draws_cap, was_c = g.cmds_cap;
+    if (dc != g.draws_cap && own_buffer(g.draws_buf, g.draws_mem, &g.draws_map, (VkDeviceSize)dc * sizeof(DrawData), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+        g.draws_cap = dc;
+    if (cc != g.cmds_cap && own_buffer(g.cmds_buf, g.cmds_mem, &g.cmds_map, (VkDeviceSize)cc * sizeof(VkDrawIndirectCommand), VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+                                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+        g.cmds_cap = cc;
+    if ((was_d && g.draws_cap != was_d) || (was_c && g.cmds_cap != was_c))
+        fprintf(g_hle_log, "native: a frame has %u draws in %u ranges, the merged draws' buffers grow from %u and %u to %u and %u\n", draws, cmds, was_d, was_c,
+                g.draws_cap, g.cmds_cap);
+    bind_frame_buffers();
+    return g.draws_cap && g.cmds_cap;
+}
+
+// What the textures and the palettes go to the GPU through, 64 MB at first. A frame's textures that do not fit wait for the next
+// frame; one that is larger than all of it (a replacement of 4096 x 4096 with its levels is 85 MB) was never uploaded. Now the
+// buffer is made for it before the next frame's uploads (upload_texture sets staging_want), up to 1 GB.
+static bool staging_room(VkDeviceSize bytes)
+{
+    if (bytes <= g.staging_cap) return true;
+    VkDeviceSize cap = g.staging_cap ? g.staging_cap : kStagingStart;
+    while (cap < bytes && cap < kStagingMost) cap *= 2;
+    if (cap < bytes) return false;
+    if (!own_buffer(g.staging, g.staging_mem, &g.staging_map, cap, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+        return false;
+    if (g.staging_cap)
+        fprintf(g_hle_log, "native: a texture of %llu KB: the buffer the textures are uploaded through grows from %llu to %llu MB\n",
+                (unsigned long long)(bytes >> 10), (unsigned long long)(g.staging_cap >> 20), (unsigned long long)(cap >> 20));
+    g.staging_cap = cap;
+    return true;
+}
+
+// The rects of the depth the game reads back (the sun's flare), at the picture's own scale: 8 MB at first. The rects past its
+// end were not read. A large picture (5120 x 2160 at a render scale of 200 %) can need more: made anew for what the frame asks.
+static void active_region(const NativeFrame &frame, float &ox, float &sx, float &sy);
+static VkDeviceSize depth_rects_bytes(const NativeFrame &frame)
+{
+    if (frame.depth_rects.empty()) return 0;
+    float ox, sx, sy;
+    active_region(frame, ox, sx, sy);
+    VkDeviceSize bytes = 0;
+    for (const NativeDepthRect &r : frame.depth_rects) {
+        const int x0 = std::clamp((int)(ox + r.x * sx), 0, W - 1), y0 = std::clamp((int)(r.y * sy), 0, H - 1);
+        const int w = std::clamp((int)std::ceil(r.w * sx), 1, W - x0), h = std::clamp((int)std::ceil(r.h * sy), 1, H - y0);
+        bytes += (VkDeviceSize)w * h * 4;
+    }
+    return bytes;
+}
+static bool depth_room(VkDeviceSize bytes)
+{
+    if (bytes <= g.depth_cap) return true;
+    VkDeviceSize cap = g.depth_cap ? g.depth_cap : kDepthStart;
+    while (cap < bytes && cap < kDepthMost) cap *= 2;
+    if (cap < bytes) return false;
+    if (!own_buffer(g.depth_rb, g.depth_rb_mem, &g.depth_rb_map, cap, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+        return false;
+    if (g.depth_cap) {
+        fprintf(g_hle_log, "native: the depth read back for a frame is %llu KB, its buffer grows from %llu to %llu KB\n", (unsigned long long)(bytes >> 10),
+                (unsigned long long)(g.depth_cap >> 10), (unsigned long long)(cap >> 10));
+        g.depth_rects.clear();              // what the old buffer held of the last frame is gone with it
+        g.depth_places.clear();
+    }
+    g.depth_cap = cap;
+    return true;
+}
+
+// The GPU's buffer of vertices grows too. It is the strips' cache, then a frame's own vertices (vb_side). Looked at once a frame,
+// with no frame in flight, by what the frame says of itself:
+//  - its own vertices (and indices) take more than half of their end of the buffer: that end is made twice the size, and again,
+//    until they take half of it or less. It was a fixed 16 MB, and a frame past it was not drawn: the picture stood still;
+//  - the cache was emptied for want of room before this frame, or strips found no room in it this frame (cache_short): a buffer
+//    twice the size, up to 1 GB, is asked for (if the card has no room for it, it is not asked again), so that a track with
+//    more in it does not have the cache emptied over and over. Not sooner: the demos at Draw Distance 200 take the cache to
+//    4.2 million vertices of the 7.3 at 256 MB without its ever being emptied, and growing costs what an emptying costs;
+//  - a frame's own vertices that fit no end of the buffer the card can give: the host's copy is drawn from, with no cache
+//    (as with HP2_HOSTBUFFERS), which is slower and draws everything.
+// The cache's place and size are what the frames are made for (NativeFrame::dyn_base), so a change of either costs the frame in
+// hand and the one being made (they are not drawn, the picture stands for two frames) and empties the cache: the game's thread
+// hears of both by g_native_epoch and native_vk_cache_vertices, as when the renderer is made anew. True: so it is now.
+static bool vertices_grow(const NativeFrame &frame, VkDeviceSize own)
+{
+    static bool refused;
+    VkDeviceSize side = g.vb_side, total = g.vb_total;
+    while (side < own * 2 && side < kVbTotalMost / 2) side *= 2;
+    bool short_now = frame.cache_short != 0;
+    while (!refused && total < kVbTotalMost && (side > total / 2 || short_now)) {
+        total *= 2;
+        short_now = false;
+    }
+    if (total > g.vb_total) {
+        VkBuffer made = VK_NULL_HANDLE;
+        VkDeviceMemory made_mem = VK_NULL_HANDLE;
+        for (; total > g.vb_total; total /= 2)
+            if (make_buffer_in(made, nullptr, total, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                               VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, &made_mem))
+                break;
+        if (total > g.vb_total) {
+            vkDestroyBuffer(g.dev, g.vb_dev, nullptr);
+            vkFreeMemory(g.dev, g.vb_dev_mem, nullptr);
+            g.vb_dev = made, g.vb_dev_mem = made_mem;
+        } else {
+            refused = true;
+            fprintf(g_hle_log, "native: the vertex cache has %u of %u vertices in use (%u found no room this frame), and the GPU has no room for a larger buffer\n",
+                    frame.cache_top, g.cache_verts, frame.cache_short);
+        }
+    }
+    while (side > total / 2 && side > g.vb_side) side /= 2;
+    if (own > side) {
+        fprintf(g_hle_log, "native: a frame's own vertices are %llu KB, more than the GPU's buffer can take (%llu MB of %llu): drawn from the host's memory from now on, "
+                           "without the cache\n", (unsigned long long)(own >> 10), (unsigned long long)(side >> 20), (unsigned long long)(total >> 20));
+        vkDestroyBuffer(g.dev, g.vb_dev, nullptr);
+        vkFreeMemory(g.dev, g.vb_dev_mem, nullptr);
+        g.vb_dev = VK_NULL_HANDLE;
+        g.vb_in_vram = false;
+        return true;
+    }
+    if (total == g.vb_total && side == g.vb_side) return false;
+    const uint32_t was = g.cache_verts;
+    const VkDeviceSize was_total = g.vb_total, was_side = g.vb_side;
+    vb_layout(total, side);
+    fprintf(g_hle_log, "native: the GPU's buffer of vertices grows: %llu MB with %llu MB a frame's own (it was %llu and %llu), %u vertices cached (%u); the frame had "
+                       "%llu KB of its own, the cache %u in use, %u without room\n", (unsigned long long)(total >> 20), (unsigned long long)(side >> 20),
+            (unsigned long long)(was_total >> 20), (unsigned long long)(was_side >> 20), g.cache_verts, was, (unsigned long long)(own >> 10), frame.cache_top,
+            frame.cache_short);
+    return true;
+}
+
+// A texture's descriptor set. The pool made with the rest (g.pool) has room for kTexSets of them (4096); it was the only one,
+// and nothing looked whether a set was had. Now a pool that is full is followed by another (written down for rebuild(), which
+// takes the textures apart with the rest). False: no set.
+static bool texture_set(VkTex *t)
+{
+    VkDescriptorSetAllocateInfo da = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    da.descriptorSetCount = 1;
+    da.pSetLayouts = &g.set_layout;
+    for (size_t i = 0; i <= g.tex_pools.size(); i++) {
+        da.descriptorPool = i ? g.tex_pools[i - 1] : g.pool;
+        if (vkAllocateDescriptorSets(g.dev, &da, &t->set) == VK_SUCCESS) {
+            t->pool = da.descriptorPool;
+            return true;
+        }
+    }
+    VkDescriptorPoolSize size = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kTexSets};
+    VkDescriptorPoolCreateInfo dp = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dp.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+    dp.maxSets = kTexSets;
+    dp.poolSizeCount = 1;
+    dp.pPoolSizes = &size;
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    const bool tracked = g_tracking;
+    g_tracking = true;
+    const VkResult made = vkCreateDescriptorPool(g.dev, &dp, nullptr, &pool);
+    g_tracking = tracked;
+    if (made != VK_SUCCESS) return false;
+    g.tex_pools.push_back(pool);
+    fprintf(g_hle_log, "native: %zu textures on the GPU, more than the pools of their sets take: pool %zu of %u more\n", g.textures.size(), g.tex_pools.size() + 1,
+            kTexSets);
+    da.descriptorPool = pool;
+    if (vkAllocateDescriptorSets(g.dev, &da, &t->set) != VK_SUCCESS) return false;
+    t->pool = pool;
     return true;
 }
 
@@ -469,7 +905,7 @@ static std::vector<VkTex *> g_dead_textures;
 
 static void free_texture(VkTex *t)
 {
-    vkFreeDescriptorSets(g.dev, g.pool, 1, &t->set);
+    vkFreeDescriptorSets(g.dev, t->pool, 1, &t->set);
     vkDestroyImageView(g.dev, t->view, nullptr);
     vkDestroyImage(g.dev, t->image, nullptr);
     vkFreeMemory(g.dev, t->mem, nullptr);
@@ -567,8 +1003,12 @@ static bool upload_texture(NativeTexUpload &tex, VkDeviceSize &at)
     tex.gpu_levels = tex.levels;
     if (g.aniso && !often) more_levels(tex);
     VkDeviceSize bytes = (VkDeviceSize)tex.px.size() * 4;
-    if (bytes > kStaging) return true;      // never fits: it stays as it is
-    if (at + bytes > kStaging) return false;
+    if (bytes > g.staging_cap) {            // larger than all of the staging: that grows before the next frame's uploads (draw_frame)
+        if (bytes > kStagingMost || (g.staging_refused && bytes >= g.staging_refused)) return true;     // never fits: it stays as it is
+        if (bytes > g.staging_want) g.staging_want = bytes;
+        return false;
+    }
+    if (at + bytes > g.staging_cap) return false;
     if (was) {
         g.textures.erase(std::find(g.textures.begin(), g.textures.end(), was));
         was->owner = nullptr;               // replaced, not let go: the game's thread goes on counting it as loaded
@@ -599,11 +1039,15 @@ static bool upload_texture(NativeTexUpload &tex, VkDeviceSize &at)
     vi.format = VK_FORMAT_R8G8B8A8_UNORM;
     vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, levels, 0, 1};
     vkCreateImageView(g.dev, &vi, nullptr, &t->view);
-    VkDescriptorSetAllocateInfo da = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-    da.descriptorPool = g.pool;
-    da.descriptorSetCount = 1;
-    da.pSetLayouts = &g.set_layout;
-    vkAllocateDescriptorSets(g.dev, &da, &t->set);
+    if (!texture_set(t)) {                  // no set for it and no pool for another: left without a picture
+        static int told;
+        if (told++ < 5) fprintf(g_hle_log, "native: no descriptor set for a texture (%zu of them on the GPU)\n", g.textures.size());
+        vkDestroyImageView(g.dev, t->view, nullptr);
+        vkDestroyImage(g.dev, t->image, nullptr);
+        vkFreeMemory(g.dev, t->mem, nullptr);
+        delete t;
+        return true;
+    }
     // The sampler is the GPU's filter's (a draw with tex_mode's bit 32); the GS's own sampling fetches texels and does not ask it. With the
     // setting's anisotropic filter every texture is taken linear between texels and levels when small: "nearest, mip linear", which most of
     // the world's textures have, is the GS's way of saving time, and it is what kept the filter off them.
@@ -728,6 +1172,29 @@ static bool setup()
     VkPhysicalDevice pd[8], phys = VK_NULL_HANDLE;
     vkEnumeratePhysicalDevices(inst, &n, pd);
     uint32_t family = UINT32_MAX;
+    // The player's own choice first (Options > Graphics > Resolution > Select GPU; hp2.ini's gpu, by name; the user, 2026-11-17), if it is
+    // there and can show on the window. And the names of all of them, for that menu.
+    {
+        std::vector<std::string> names;
+        for (uint32_t i = 0; i < n; i++) {
+            VkPhysicalDeviceProperties p;
+            vkGetPhysicalDeviceProperties(pd[i], &p);
+            if (std::find(names.begin(), names.end(), std::string(p.deviceName)) == names.end()) names.push_back(p.deviceName);
+            if (phys || !g_cfg.gpu[0] || strcmp(p.deviceName, g_cfg.gpu)) continue;
+            uint32_t qn = 16;
+            VkQueueFamilyProperties qp[16];
+            vkGetPhysicalDeviceQueueFamilyProperties(pd[i], &qn, qp);
+            for (uint32_t q = 0; q < qn && !phys; q++) {
+                VkBool32 shows = VK_FALSE;
+                vkGetPhysicalDeviceSurfaceSupportKHR(pd[i], q, g.surface, &shows);
+                if ((qp[q].queueFlags & VK_QUEUE_GRAPHICS_BIT) && shows) phys = pd[i], family = q;
+            }
+            if (!phys) fprintf(g_hle_log, "native: %s, the card chosen, cannot show on the window: another is taken\n", p.deviceName);
+        }
+        if (g_cfg.gpu[0] && !phys) fprintf(g_hle_log, "native: the card chosen (%s) is not there or cannot be used: the game chooses\n", g_cfg.gpu);
+        std::lock_guard<std::mutex> hold(g_gpu_mutex);
+        g_gpu_names = names;
+    }
     for (int want_discrete = 1; want_discrete >= 0 && !phys; want_discrete--)
         for (uint32_t i = 0; i < n && !phys; i++) {
             VkPhysicalDeviceProperties p;
@@ -745,6 +1212,12 @@ static bool setup()
         }
     if (!phys) return false;
     g.phys = phys;
+    {
+        VkPhysicalDeviceProperties p;
+        vkGetPhysicalDeviceProperties(phys, &p);
+        std::lock_guard<std::mutex> hold(g_gpu_mutex);
+        g_gpu_now = p.deviceName;
+    }
     vkGetPhysicalDeviceMemoryProperties(phys, &g.mem);
     bool exclusive_ext = false;
     {
@@ -769,6 +1242,12 @@ static bool setup()
     want.depthClamp = has.depthClamp;       // the GS clamps Z; without it the nearest of the mirror's geometry is clipped
     want.samplerAnisotropy = has.samplerAnisotropy;
     want.shaderClipDistance = has.shaderClipDistance;
+    want.sampleRateShading = has.sampleRateShading;     // the shadows over a multisampled picture, a sample at a time (gl_SampleID)
+    g.sample_shading = has.sampleRateShading != VK_FALSE && !getenv("HP2_NOMSSHADOW");
+    // the draws merged (draw_target): many draws in one call, each with an instance number of its own. HP2_NOMERGE=1: one by one
+    want.multiDrawIndirect = has.multiDrawIndirect;
+    want.drawIndirectFirstInstance = has.drawIndirectFirstInstance;
+    g.can_merge = has.multiDrawIndirect && has.drawIndirectFirstInstance && !getenv("HP2_NOMERGE");
     g.clip_far = has.shaderClipDistance && !getenv("HP2_NOCLIPFAR");
     g.can_aniso = has.samplerAnisotropy != VK_FALSE;
     g.depth_clamp = want.depthClamp;
@@ -799,7 +1278,12 @@ static bool setup()
 }
 
 // the picture's size, the multisampling, the filter: what the settings say
-static int settings_key() { return g_cfg.scale | native_aspect() << 4 | g_cfg.msaa() << 8 | g_cfg.aniso << 16 | (g_cfg.aa_mode == 2) << 24 | (g_cfg.reflections == 2) << 25; }
+static uint64_t settings_key()
+{
+    const uint32_t rest = (uint32_t)(g_cfg.msaa() << 8 | g_cfg.aniso << 16 | (g_cfg.aa_mode == 2) << 24 | (g_cfg.reflections == 2) << 25 |
+                                     (g_cfg.shadows >= 2 ? g_cfg.shadows - 1 : 0) << 26);
+    return (uint64_t)(uint32_t)native_aspect() << 32 | rest;
+}
 
 // what the menu may offer: the most samples the picture can have, the most anisotropy
 bool native_vk_limits(int &aa, int &aniso)
@@ -818,8 +1302,43 @@ bool native_vk_limits(int &aa, int &aniso)
     return true;
 }
 
+// the height of the 4:3 box the window has now: by the swapchain's images, before there are any by the window itself
+static int lines_now()
+{
+    int w = g.swapchain ? g.swap_w : 0, h = g.swapchain ? g.swap_h : 0;
+    if (w <= 0 || h <= 0) {
+        RECT r = {};
+        GetClientRect((HWND)window_handle(), &r);
+        w = r.right, h = r.bottom;
+    }
+    if (w <= 0 || h <= 0) return 0;         // no area (minimized): what there was stays
+    if (g_cfg.fullscreen && g_cfg.fs_w > 0 && g_cfg.fs_h > 0) w = std::min(w, g_cfg.fs_w), h = std::min(h, g_cfg.fs_h);
+    const int lines = std::min(h, w * 3 / 4);
+    return std::clamp((lines * std::clamp(g_cfg.render_scale, 20, 200) + 50) / 100, 224, 4320);
+}
+
+// Each frame: the window's size as the picture is to follow it. A size that stays a quarter of a second counts, so a window being dragged
+// by its edge does not make the renderer again at every step (the picture is scaled to it meanwhile).
+static void track_lines()
+{
+    static const bool fixed = getenv("HP2_NATIVESIZE") != nullptr;
+    if (fixed) return;
+    static int seen;
+    static ULONGLONG since;
+    const int now = lines_now();
+    if (!now || now == g_lines) {
+        seen = now;
+        return;
+    }
+    const ULONGLONG t = GetTickCount64();
+    if (now != seen) seen = now, since = t;
+    else if (t - since >= 250) g_lines = now;
+}
+
 static bool setup_resources()
 {
+    if (!g_lines) g_lines = lines_now();
+    g.lines = g_lines;
     g.key = settings_key();
     const VkPhysicalDeviceProperties &props = g.props;
     const uint32_t family = g.family;
@@ -834,30 +1353,41 @@ static bool setup_resources()
 
     ENV_SIZE = !exact && g_cfg.reflections == 2 ? 128 : 64;
     SPHERE_SIZE = ENV_SIZE * 4;
-    W43 = 512 * g_cfg.scale;
-    H = 448 * g_cfg.scale;
+    {
+        const int lines = g_lines ? g_lines : 720;
+        H = (lines * 448 + 443) / 444;
+        W43 = (lines * 4 / 3 + 1) & ~1;
+    }
     if (const char *e = getenv("HP2_NATIVESIZE")) sscanf(e, "%dx%d", &W43, &H);
     W = (int)(W43 / native_narrow() + 0.5f) & ~1;
-    if (!make_buffer(g.fps_buf, &g.fps_map, kFpsBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT) ||
-        !make_buffer(g.depth_rb, &g.depth_rb_map, kDepthBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT))
-        return false;
+    // (the buffers that grow are made once and kept through rebuild(): depth_room and the like only look, the second time)
+    if (!make_buffer(g.fps_buf, &g.fps_map, kFpsBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT) || !depth_room(kDepthStart)) return false;
     VkSemaphoreCreateInfo semaphore = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     if (vkCreateSemaphore(g.dev, &semaphore, nullptr, &g.acquired) || vkCreateSemaphore(g.dev, &semaphore, nullptr, &g.rendered)) return false;
-    if (!make_buffer(g.staging, &g.staging_map, kStaging, VK_BUFFER_USAGE_TRANSFER_SRC_BIT) ||
-        !make_buffer_in(g.lights_stage, &g.lights_map, kLightBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, VK_MEMORY_PROPERTY_HOST_CACHED_BIT) ||
+    g.light_set = VK_NULL_HANDLE;           // the one before went with its pool: none to write till it is made again below
+    if (!staging_room(kStagingStart) || !lights_room(kLightStart) ||
         !make_buffer(g.fold_vb, &g.fold_map, kFoldBytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT) ||
         !make_buffer(g.readback, &g.rb_map, (VkDeviceSize)W * H * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT))
         return false;
-    if (getenv("HP2_HOSTBUFFERS") || !make_buffer_in(g.lights, nullptr, kLightBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                                                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
-        g.lights = g.lights_stage;
     VkImageView cv, dv;
     if (!make_image(g.color, cv, VK_FORMAT_B8G8R8A8_UNORM, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                     VK_IMAGE_ASPECT_COLOR_BIT) ||
         !make_image(g.depth, dv, VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                     VK_IMAGE_ASPECT_DEPTH_BIT))
         return false;
+    g.ms_read_pass = VK_NULL_HANDLE;
+    g.ms_read_fb = VK_NULL_HANDLE;
+    g.shadow_ms_pipeline = VK_NULL_HANDLE;
+    g.depth_ms_view = VK_NULL_HANDLE;
+    g.soft_ok = false;
+    g.depth_copy = VK_NULL_HANDLE;
+    g.depth_copy_view = VK_NULL_HANDLE;
+    if (!getenv("HP2_NOSOFT")) {            // the soft sprites' copy of the depth; a card that cannot have one keeps the sprites as they were
+        VkImage copy = VK_NULL_HANDLE;
+        VkImageView copy_view = VK_NULL_HANDLE;
+        if (make_image(copy, copy_view, VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_DEPTH_BIT))
+            g.depth_copy = copy, g.depth_copy_view = copy_view;
+    }
     // the picture so far, down to the GS's half buffer and a level past it; the last frame; the palettes
     g.scene_levels = 2;
     for (int m = W; m > 256; m >>= 1) g.scene_levels++;
@@ -865,7 +1395,7 @@ static bool setup_resources()
     if (!make_image(g.scene, scene_view, VK_FORMAT_B8G8R8A8_UNORM,
                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT, W, H, g.scene_levels) ||
         !make_image(g.prev, prev_view, VK_FORMAT_B8G8R8A8_UNORM, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT) ||
-        !make_image(g.palette, palette_view, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT, 256, 8))
+        !make_image(g.palette, palette_view, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT, 256, kPaletteRows))
         return false;
 
     // Every render pass waits for all that came before it, and all that comes after waits for it, the layout changes at its start and end
@@ -921,6 +1451,13 @@ static bool setup_resources()
     // the envmap views: the same formats, read back by the fold
     at[0].finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     if (vkCreateRenderPass(g.dev, &rp, nullptr, &g.env_pass)) return false;
+    // the same going on with what a pass before left (the mirror, after its shadows)
+    at[0].loadOp = at[1].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    at[0].initialLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    at[1].initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    if (vkCreateRenderPass(g.dev, &rp, nullptr, &g.env_pass_load)) return false;
+    at[0].loadOp = at[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    at[0].initialLayout = at[1].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
     // Multisampling: the picture proper is in samples, and each pass ends by resolving it, colour and depth, into the images everything else reads
     if (g.samples != VK_SAMPLE_COUNT_1_BIT) {
@@ -928,7 +1465,7 @@ static bool setup_resources()
         auto create2 = track_vkCreateRenderPass2;
         VkImageView msc, msd;
         if (!real_vkCreateRenderPass2 || !make_image(g.color_ms, msc, VK_FORMAT_B8G8R8A8_UNORM, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1, g.samples) ||
-            !make_image(g.depth_ms, msd, VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1, g.samples))
+            !make_image(g.depth_ms, msd, VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1, g.samples))
             return false;
         VkAttachmentDescription2 a2[4] = {};
         for (int i = 0; i < 4; i++) {
@@ -989,6 +1526,37 @@ static bool setup_resources()
         mf.attachmentCount = 4;
         mf.pAttachments = all4;
         if (vkCreateFramebuffer(g.dev, &mf, nullptr, &g.fb)) return false;
+        // Shadows: over the samples, their depth read by the shader and not written: no resolve, the picture's passes do that
+        g.depth_ms_view = msd;
+        if (g.sample_shading) {
+            VkAttachmentDescription ra[2] = {};
+            for (int i = 0; i < 2; i++) {
+                ra[i].format = i ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_B8G8R8A8_UNORM;
+                ra[i].samples = g.samples;
+                ra[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+                ra[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+                ra[i].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+                ra[i].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+                ra[i].initialLayout = ra[i].finalLayout = i ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            }
+            VkAttachmentReference rcr = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL}, rdr = {1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL};
+            VkSubpassDescription rsub = {};
+            rsub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+            rsub.colorAttachmentCount = 1;
+            rsub.pColorAttachments = &rcr;
+            rsub.pDepthStencilAttachment = &rdr;
+            VkRenderPassCreateInfo rrp = rp;
+            rrp.attachmentCount = 2;
+            rrp.pAttachments = ra;
+            rrp.pSubpasses = &rsub;
+            if (vkCreateRenderPass(g.dev, &rrp, nullptr, &g.ms_read_pass)) return false;
+            VkImageView two[2] = {msc, msd};
+            VkFramebufferCreateInfo rf = fb;
+            rf.renderPass = g.ms_read_pass;
+            rf.attachmentCount = 2;
+            rf.pAttachments = two;
+            if (vkCreateFramebuffer(g.dev, &rf, nullptr, &g.ms_read_fb)) return false;
+        }
     }
     VkImageView ed;
     if (!make_image(g.env_depth, ed, VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT, ENV_SIZE, ENV_SIZE)) return false;
@@ -1010,7 +1578,8 @@ static bool setup_resources()
     VkImageView rv, rd;
     if (!make_buffer(g.rvm_rb, &g.rvm_rb_map, (VkDeviceSize)g.rvm_w * g.rvm_h * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT)) return false;
     if (!make_image(g.rvm, rv, VK_FORMAT_B8G8R8A8_UNORM, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT, g.rvm_w, g.rvm_h) ||
-        !make_image(g.rvm_depth, rd, VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT, g.rvm_w, g.rvm_h))
+        !make_image(g.rvm_depth, rd, VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_DEPTH_BIT,
+                    g.rvm_w, g.rvm_h))
         return false;
     {
         VkImageView rvv[2] = {rv, rd};
@@ -1020,6 +1589,92 @@ static bool setup_resources()
         rf.width = g.rvm_w;
         rf.height = g.rvm_h;
         if (vkCreateFramebuffer(g.dev, &rf, nullptr, &g.rvm_fb)) return false;
+    }
+    // Shadows: High. The shadows over the mirror: its colour alone, its depth being read
+    {
+        g.rvm_depth_view = rd;
+        VkAttachmentDescription ma = at[0];
+        ma.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        ma.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        ma.initialLayout = ma.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        VkAttachmentReference mcr = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+        VkSubpassDescription msub = {};
+        msub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        msub.colorAttachmentCount = 1;
+        msub.pColorAttachments = &mcr;
+        VkRenderPassCreateInfo mrp = rp;
+        mrp.attachmentCount = 1;
+        mrp.pAttachments = &ma;
+        mrp.pSubpasses = &msub;
+        if (vkCreateRenderPass(g.dev, &mrp, nullptr, &g.rvm_post_pass)) return false;
+        VkFramebufferCreateInfo mf = fb;
+        mf.renderPass = g.rvm_post_pass;
+        mf.attachmentCount = 1;
+        mf.pAttachments = &rv;
+        mf.width = g.rvm_w;
+        mf.height = g.rvm_h;
+        if (vkCreateFramebuffer(g.dev, &mf, nullptr, &g.rvm_post_fb)) return false;
+    }
+    // and the map of the cars as the sun sees them: depth alone
+    {
+        // Ultra (a test setting, the user, 2026-11-17): 1024, a map of 8192 x 8192, 256 MB; not on a card with no image that large
+        g.shadow_cell = g_cfg.shadows >= 3 ? 1024 : g_cfg.shadows == 2 ? 512 : 256;
+        if ((uint32_t)(g.shadow_cell * kShadowRows) > g.props.limits.maxImageDimension2D) g.shadow_cell = 512;
+        g.shadow_ready = false;
+        if (!make_image(g.shadow_map, g.shadow_view, VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                        VK_IMAGE_ASPECT_DEPTH_BIT, g.shadow_cell * kShadowAcross, g.shadow_cell * kShadowRows))
+            return false;
+        VkAttachmentDescription sa = at[1];
+        sa.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        sa.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        sa.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        sa.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        VkAttachmentReference sdr = {0, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
+        VkSubpassDescription ssub = {};
+        ssub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        ssub.pDepthStencilAttachment = &sdr;
+        VkRenderPassCreateInfo srp = rp;
+        srp.attachmentCount = 1;
+        srp.pAttachments = &sa;
+        srp.pSubpasses = &ssub;
+        if (vkCreateRenderPass(g.dev, &srp, nullptr, &g.shadow_pass)) return false;
+        VkFramebufferCreateInfo sf = fb;
+        sf.renderPass = g.shadow_pass;
+        sf.attachmentCount = 1;
+        sf.pAttachments = &g.shadow_view;
+        sf.width = g.shadow_cell * kShadowAcross;
+        sf.height = g.shadow_cell * kShadowRows;
+        if (vkCreateFramebuffer(g.dev, &sf, nullptr, &g.shadow_fb)) return false;
+    }
+    // Ambient Occlusion: its image, half the picture each way, and the pass that makes it
+    {
+        g.ao_w = (W + 1) / 2, g.ao_h = (H + 1) / 2;
+        if (!make_image(g.ao, g.ao_view, VK_FORMAT_R8_UNORM, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT, g.ao_w,
+                        g.ao_h))
+            return false;
+        VkAttachmentDescription aa = at[0];
+        aa.format = VK_FORMAT_R8_UNORM;
+        aa.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        aa.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        aa.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        aa.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        VkAttachmentReference acr = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+        VkSubpassDescription asub = {};
+        asub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        asub.colorAttachmentCount = 1;
+        asub.pColorAttachments = &acr;
+        VkRenderPassCreateInfo arp = rp;
+        arp.attachmentCount = 1;
+        arp.pAttachments = &aa;
+        arp.pSubpasses = &asub;
+        if (vkCreateRenderPass(g.dev, &arp, nullptr, &g.ao_pass)) return false;
+        VkFramebufferCreateInfo af = fb;
+        af.renderPass = g.ao_pass;
+        af.attachmentCount = 1;
+        af.pAttachments = &g.ao_view;
+        af.width = g.ao_w;
+        af.height = g.ao_h;
+        if (vkCreateFramebuffer(g.dev, &af, nullptr, &g.ao_fb)) return false;
     }
     // the sphere map: kept from frame to frame
     VkImageView sv;
@@ -1070,10 +1725,13 @@ static bool setup_resources()
     sl.bindingCount = 1;
     sl.pBindings = &sb;
     if (vkCreateDescriptorSetLayout(g.dev, &sl, nullptr, &g.set_layout)) return false;
-    VkDescriptorSetLayoutBinding lb = {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr};
+    // the lights, and the merged draws' matrices and lights
+    VkDescriptorSetLayoutBinding lb[2] = {{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr},
+                                          {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr}};
     VkDescriptorSetLayoutCreateInfo ll = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    ll.bindingCount = 1;
-    ll.pBindings = &lb;
+    ll.bindingCount = 2;
+    ll.pBindings = lb;
+    if (!merge_room(kMergeDrawsStart, kMergeCmdsStart)) return false;
     if (vkCreateDescriptorSetLayout(g.dev, &ll, nullptr, &g.light_layout)) return false;
     VkDescriptorSetLayoutBinding pb[3] = {{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
                                           {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
@@ -1082,10 +1740,11 @@ static bool setup_resources()
     psl.bindingCount = 3;
     psl.pBindings = pb;
     if (vkCreateDescriptorSetLayout(g.dev, &psl, nullptr, &g.post_set_layout)) return false;
-    VkDescriptorPoolSize dps[2] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4100}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1}};
+    // the renderer's own sets and kTexSets of the textures'; the textures past those have pools of their own (texture_set)
+    VkDescriptorPoolSize dps[2] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kTexSets + 80}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2}};
     VkDescriptorPoolCreateInfo dp = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dp.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    dp.maxSets = 4100;
+    dp.maxSets = kTexSets + 40;
     dp.poolSizeCount = 2;
     dp.pPoolSizes = dps;
     if (vkCreateDescriptorPool(g.dev, &dp, nullptr, &g.pool)) return false;
@@ -1110,13 +1769,7 @@ static bool setup_resources()
     la.descriptorSetCount = 1;
     la.pSetLayouts = &g.light_layout;
     if (vkAllocateDescriptorSets(g.dev, &la, &g.light_set)) return false;
-    VkDescriptorBufferInfo lbi = {g.lights, 0, kLightBytes};
-    VkWriteDescriptorSet lw = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-    lw.dstSet = g.light_set;
-    lw.descriptorCount = 1;
-    lw.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    lw.pBufferInfo = &lbi;
-    vkUpdateDescriptorSets(g.dev, 1, &lw, 0, nullptr);
+    bind_frame_buffers();
     la.pSetLayouts = &g.set_layout;
     for (int i = 0; i < 6; i++) {
         if (vkAllocateDescriptorSets(g.dev, &la, &g.env_set[i])) return false;
@@ -1150,7 +1803,50 @@ static bool setup_resources()
         }
         vkUpdateDescriptorSets(g.dev, 3, pw, 0, nullptr);
     }
+    // the same for the shadows over the mirror: the mirror's depth
+    if (vkAllocateDescriptorSets(g.dev, &la, &g.rvm_post_set)) return false;
+    {
+        VkDescriptorImageInfo pi[3] = {{g.sampler[0], g.rvm_depth_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                                       {g.sampler[0], palette_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                                       {g.sampler[4 | 8], scene_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
+        VkWriteDescriptorSet pw[3] = {};
+        for (uint32_t i = 0; i < 3; i++) {
+            pw[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            pw[i].dstSet = g.rvm_post_set;
+            pw[i].dstBinding = i;
+            pw[i].descriptorCount = 1;
+            pw[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            pw[i].pImageInfo = &pi[i];
+        }
+        vkUpdateDescriptorSets(g.dev, 3, pw, 0, nullptr);
+    }
     la.pSetLayouts = &g.set_layout;
+    if (vkAllocateDescriptorSets(g.dev, &la, &g.shadow_set)) return false;
+    bind_view(g.shadow_set, g.shadow_view, g.sampler[0]);
+    if (vkAllocateDescriptorSets(g.dev, &la, &g.ao_set)) return false;
+    bind_view(g.ao_set, g.ao_view, g.sampler[0]);
+    if (g.depth_copy) {
+        if (vkAllocateDescriptorSets(g.dev, &la, &g.soft_set)) return false;
+        bind_view(g.soft_set, g.depth_copy_view, g.sampler[0]);
+    }
+    if (g.ms_read_pass) {                   // the post set's three, the first the samples' depth as the pass over them has it
+        la.pSetLayouts = &g.post_set_layout;
+        if (vkAllocateDescriptorSets(g.dev, &la, &g.ms_post_set)) return false;
+        VkDescriptorImageInfo pi[3] = {{g.sampler[0], g.depth_ms_view, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL},
+                                       {g.sampler[0], palette_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+                                       {g.sampler[4 | 8], scene_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
+        VkWriteDescriptorSet pw[3] = {};
+        for (uint32_t i = 0; i < 3; i++) {
+            pw[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            pw[i].dstSet = g.ms_post_set;
+            pw[i].dstBinding = i;
+            pw[i].descriptorCount = 1;
+            pw[i].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            pw[i].pImageInfo = &pi[i];
+        }
+        vkUpdateDescriptorSets(g.dev, 3, pw, 0, nullptr);
+        la.pSetLayouts = &g.set_layout;
+    }
 
     VkDescriptorSetLayout both[2] = {g.set_layout, g.light_layout};
     VkPushConstantRange pc = {VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(Push)};
@@ -1173,16 +1869,19 @@ static bool setup_resources()
     VkBool32 spec_alpha_test = VK_TRUE;
     VkSpecializationMapEntry spec_entry = {0, 0, sizeof(VkBool32)};
     VkSpecializationInfo spec = {1, &spec_entry, sizeof(VkBool32), &spec_alpha_test};
-    VkVertexInputBindingDescription bind = {0, sizeof(NativeVertex), VK_VERTEX_INPUT_RATE_VERTEX};
-    VkVertexInputAttributeDescription attr[5] = {{0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0},
+    // the second binding is the same buffer again, for the place of a vertex in the picture halfway (a_pos_mid): from further on
+    // in the buffer for a draw with a second copy of its vertices (NativeDraw::mid_verts), else the vertex itself
+    VkVertexInputBindingDescription bind[2] = {{0, sizeof(NativeVertex), VK_VERTEX_INPUT_RATE_VERTEX}, {1, sizeof(NativeVertex), VK_VERTEX_INPUT_RATE_VERTEX}};
+    VkVertexInputAttributeDescription attr[6] = {{0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0},
                                                  {1, 0, VK_FORMAT_R8G8B8A8_UNORM, 12},
                                                  {2, 0, VK_FORMAT_R32G32_SFLOAT, 16},
                                                  {3, 0, VK_FORMAT_R8G8B8A8_SNORM, 24},
-                                                 {4, 0, VK_FORMAT_R32_SFLOAT, 28}};
+                                                 {4, 0, VK_FORMAT_R32_SFLOAT, 28},
+                                                 {5, 1, VK_FORMAT_R32G32B32_SFLOAT, 0}};
     VkPipelineVertexInputStateCreateInfo vin = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
-    vin.vertexBindingDescriptionCount = 1;
-    vin.pVertexBindingDescriptions = &bind;
-    vin.vertexAttributeDescriptionCount = 5;
+    vin.vertexBindingDescriptionCount = 2;
+    vin.pVertexBindingDescriptions = bind;
+    vin.vertexAttributeDescriptionCount = 6;
     vin.pVertexAttributeDescriptions = attr;
     VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
     ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -1270,6 +1969,59 @@ static bool setup_resources()
     st[1].pSpecializationInfo = nullptr;
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
+    // Particles: High, the soft sprites: the scene's pipelines again with native.frag's SOFT, which reads the depth's copy as a third
+    // set. The first two sets and the constants are the scene's own, so what the scene has bound stays bound. No depth is written.
+    if (g.depth_copy) {
+        VkDescriptorSetLayout soft_sets[3] = {g.set_layout, g.light_layout, g.set_layout};
+        VkPipelineLayoutCreateInfo sli = li;
+        sli.setLayoutCount = 3;
+        sli.pSetLayouts = soft_sets;
+        if (vkCreatePipelineLayout(g.dev, &sli, nullptr, &g.soft_layout)) return false;
+        st[0].module = g.clip_far ? vert_clip : vert_old;
+        st[1].module = shader(kFragSoft, sizeof kFragSoft);
+        pi.layout = g.soft_layout;
+        ds.depthTestEnable = VK_TRUE;
+        ds.depthWriteEnable = VK_FALSE;
+        ba.colorWriteMask = 0xf;
+        for (int set = 0; set < (g.samples != VK_SAMPLE_COUNT_1_BIT ? 2 : 1); set++) {
+            pi.renderPass = set ? g.pass : g.env_pass;
+            ms.rasterizationSamples = set ? g.samples : VK_SAMPLE_COUNT_1_BIT;
+            for (int b = 0; b < NB_COUNT; b++) {
+                ba.blendEnable = b != NB_OPAQUE;
+                const bool by_dest = b == NB_DEST || b == NB_LERP_DEST;
+                ba.srcColorBlendFactor = by_dest ? VK_BLEND_FACTOR_DST_ALPHA : b == NB_KEEP ? VK_BLEND_FACTOR_ZERO : VK_BLEND_FACTOR_ONE;
+                ba.dstColorBlendFactor = b == NB_ALPHA ? VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA : b == NB_LERP_DEST ? VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA : VK_BLEND_FACTOR_ONE;
+                ba.colorBlendOp = b == NB_SUB ? VK_BLEND_OP_REVERSE_SUBTRACT : VK_BLEND_OP_ADD;
+                ba.srcAlphaBlendFactor = by_dest ? VK_BLEND_FACTOR_ZERO : VK_BLEND_FACTOR_ONE;
+                ba.dstAlphaBlendFactor = by_dest ? VK_BLEND_FACTOR_ONE : VK_BLEND_FACTOR_ZERO;
+                ba.alphaBlendOp = VK_BLEND_OP_ADD;
+                for (int t = 0; t < 2; t++) {
+                    ds.depthCompareOp = t ? VK_COMPARE_OP_GREATER_OR_EQUAL : VK_COMPARE_OP_ALWAYS;
+                    if (vkCreateGraphicsPipelines(g.dev, VK_NULL_HANDLE, 1, &pi, nullptr, &g.soft_pipeline[set][b][t])) return false;
+                }
+            }
+        }
+        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        ds.depthCompareOp = VK_COMPARE_OP_GREATER_OR_EQUAL;
+        ba.blendEnable = VK_FALSE;
+        pi.layout = g.layout;
+        g.soft_ok = true;
+    }
+
+    // Shadows: High: a car as the sun sees it, into its cell of the map. The scene's vertex shader alone: depth, the furthest kept
+    {
+        st[0].module = g.clip_far ? vert_clip : vert_old;
+        pi.stageCount = 1;
+        pi.renderPass = g.shadow_pass;
+        ds.depthTestEnable = ds.depthWriteEnable = VK_TRUE;
+        ds.depthCompareOp = VK_COMPARE_OP_GREATER;
+        cb.attachmentCount = 0;
+        if (vkCreateGraphicsPipelines(g.dev, VK_NULL_HANDLE, 1, &pi, nullptr, &g.shadow_cast)) return false;
+        cb.attachmentCount = 1;
+        pi.stageCount = 2;
+        ds.depthCompareOp = VK_COMPARE_OP_GREATER_OR_EQUAL;
+    }
+
     // the fold
     VkDescriptorSetLayout fold_sets[2] = {g.set_layout, g.set_layout};
     VkPushConstantRange fold_pc = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(int)};
@@ -1283,6 +2035,7 @@ static bool setup_resources()
     st[1].module = shader(kFoldFrag, sizeof kFoldFrag);
     VkVertexInputBindingDescription fbind = {0, sizeof(FoldVertex), VK_VERTEX_INPUT_RATE_VERTEX};
     VkVertexInputAttributeDescription fattr[2] = {{0, 0, VK_FORMAT_R32G32_SFLOAT, 0}, {1, 0, VK_FORMAT_R32G32_SFLOAT, 8}};
+    vin.vertexBindingDescriptionCount = 1;      // the scene's has two (the place halfway is the second)
     vin.pVertexBindingDescriptions = &fbind;
     vin.vertexAttributeDescriptionCount = 2;
     vin.pVertexAttributeDescriptions = fattr;
@@ -1315,6 +2068,53 @@ static bool setup_resources()
         ba.srcAlphaBlendFactor = m == 2 ? VK_BLEND_FACTOR_ONE : VK_BLEND_FACTOR_ZERO;
         ba.dstAlphaBlendFactor = m == 2 ? VK_BLEND_FACTOR_ZERO : VK_BLEND_FACTOR_ONE;
         if (vkCreateGraphicsPipelines(g.dev, VK_NULL_HANDLE, 1, &pi, nullptr, &g.post_pipeline[m])) return false;
+    }
+    // Shadows: High: a shadow over the picture by its depth (native_shadow.frag): the depth's set, and the patch's texture or the map
+    {
+        const VkPipelineColorBlendAttachmentState ba_was = ba;
+        VkDescriptorSetLayout shadow_sets[2] = {g.post_set_layout, g.set_layout};
+        VkPushConstantRange spc = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(ShadowPush)};
+        VkPipelineLayoutCreateInfo sl = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        sl.setLayoutCount = 2;
+        sl.pSetLayouts = shadow_sets;
+        sl.pushConstantRangeCount = 1;
+        sl.pPushConstantRanges = &spc;
+        if (vkCreatePipelineLayout(g.dev, &sl, nullptr, &g.shadow_layout)) return false;
+        st[1].module = shader(kShadowFrag, sizeof kShadowFrag);
+        pi.layout = g.shadow_layout;
+        ba.blendEnable = VK_TRUE;
+        ba.colorBlendOp = ba.alphaBlendOp = VK_BLEND_OP_ADD;
+        ba.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;           // the shader has multiplied by its alpha
+        ba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        ba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+        ba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        if (vkCreateGraphicsPipelines(g.dev, VK_NULL_HANDLE, 1, &pi, nullptr, &g.shadow_pipeline)) return false;
+        // Ambient Occlusion: laid over the picture with the shadows' own blend and sets; and made, unblended, into its image
+        st[1].module = shader(kAoApplyFrag, sizeof kAoApplyFrag);
+        if (vkCreateGraphicsPipelines(g.dev, VK_NULL_HANDLE, 1, &pi, nullptr, &g.ao_apply_pipeline)) return false;
+        st[1].module = shader(kAoFrag, sizeof kAoFrag);
+        ba.blendEnable = VK_FALSE;
+        pi.renderPass = g.ao_pass;
+        if (vkCreateGraphicsPipelines(g.dev, VK_NULL_HANDLE, 1, &pi, nullptr, &g.ao_pipeline)) return false;
+        ba.blendEnable = VK_TRUE;
+        pi.renderPass = g.post_pass;
+        if (g.ms_read_pass) {               // the same over the picture's samples, once a sample (the shader reads gl_SampleID)
+            st[1].module = shader(kShadowFragMs, sizeof kShadowFragMs);
+            pi.renderPass = g.ms_read_pass;
+            pi.pDepthStencilState = &ds;    // the pass has the depth, read by the shader: neither tested nor written (ds since the fold)
+            ms.rasterizationSamples = g.samples;
+            ms.sampleShadingEnable = VK_TRUE;
+            ms.minSampleShading = 1.0f;
+            if (vkCreateGraphicsPipelines(g.dev, VK_NULL_HANDLE, 1, &pi, nullptr, &g.shadow_ms_pipeline)) return false;
+            ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+            ms.sampleShadingEnable = VK_FALSE;
+            ms.minSampleShading = 0;
+            pi.pDepthStencilState = nullptr;
+            pi.renderPass = g.post_pass;
+        }
+        ba = ba_was;
+        st[1].module = shader(kPostFrag, sizeof kPostFrag);
+        pi.layout = g.post_layout;
     }
 
     // the picture back into the samples
@@ -1357,6 +2157,44 @@ static bool setup_resources()
         pi.layout = g.grade_layout;
         pi.renderPass = g.post_pass;
         if (vkCreateGraphicsPipelines(g.dev, VK_NULL_HANDLE, 1, &pi, nullptr, &g.grade_pipeline)) return false;
+    }
+
+    // The port's dithering (native_extra.frag): one pipeline over the finished picture, reading its copy. Made whatever the
+    // settings say: turning it on is then no remaking of the renderer.
+    {
+        VkDescriptorSetLayoutBinding eb = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
+        VkDescriptorSetLayoutCreateInfo esl = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        esl.bindingCount = 1;
+        esl.pBindings = &eb;
+        if (vkCreateDescriptorSetLayout(g.dev, &esl, nullptr, &g.extra_set_layout)) return false;
+        la.pSetLayouts = &g.extra_set_layout;
+        if (vkAllocateDescriptorSets(g.dev, &la, &g.extra_set)) return false;
+        la.pSetLayouts = &g.set_layout;
+        // the picture between its texels, clamped
+        VkDescriptorImageInfo ei = {g.sampler[4 | 8], scene_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+        VkWriteDescriptorSet ew = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        ew.dstSet = g.extra_set;
+        ew.dstBinding = 0;
+        ew.descriptorCount = 1;
+        ew.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        ew.pImageInfo = &ei;
+        vkUpdateDescriptorSets(g.dev, 1, &ew, 0, nullptr);
+        VkPushConstantRange epc = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(ExtraPush)};
+        VkPipelineLayoutCreateInfo el = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        el.setLayoutCount = 1;
+        el.pSetLayouts = &g.extra_set_layout;
+        el.pushConstantRangeCount = 1;
+        el.pPushConstantRanges = &epc;
+        if (vkCreatePipelineLayout(g.dev, &el, nullptr, &g.extra_layout)) return false;
+        st[0].module = shader(kPostVert, sizeof kPostVert);
+        st[1].module = shader(kExtraFrag, sizeof kExtraFrag);
+        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        ba.blendEnable = VK_FALSE;
+        ba.colorWriteMask = 0xf;
+        pi.pDepthStencilState = nullptr;
+        pi.layout = g.extra_layout;
+        pi.renderPass = g.post_pass;
+        if (vkCreateGraphicsPipelines(g.dev, VK_NULL_HANDLE, 1, &pi, nullptr, &g.extra_pipeline)) return false;
     }
 
     // SMAA: two images of the picture's size for the edges and the weights, the two tables, and a pipeline a pass
@@ -1480,6 +2318,7 @@ static bool rebuild()
     free_dead_textures();
     for (VkTex *t : g.textures) free_texture(t);
     g.textures.clear();
+    g.tex_pools.clear();                    // they are among what is undone here
     for (auto it = g_undo.rbegin(); it != g_undo.rend(); ++it) (*it)();
     g_undo.clear();
     g.color_ms = g.depth_ms = VK_NULL_HANDLE;
@@ -1659,6 +2498,11 @@ static void dp_read()
 }
 
 // every strip of a target from [first, last) of the draws, up to three passes each
+static const bool g_merge_stat = getenv("HP2_MERGESTAT") != nullptr;
+static struct {
+    unsigned long long frames, draws, singles, opaque, passes, pipelines, sets, calls, runs;
+} g_ms;
+
 static void draw_target(const NativeFrame &frame, int target, int vw, int vh, size_t first = 0, size_t last = SIZE_MAX)
 {
     const bool in_samples = target == 1 && g.samples != VK_SAMPLE_COUNT_1_BIT;
@@ -1670,8 +2514,10 @@ static void draw_target(const NativeFrame &frame, int target, int vw, int vh, si
     VkRect2D sc = {{0, 0}, {(uint32_t)vw, (uint32_t)vh}};
     vkCmdSetViewport(g.cmd, 0, 1, &vp);
     vkCmdSetScissor(g.cmd, 0, 1, &sc);
-    VkDeviceSize zero = 0;
-    vkCmdBindVertexBuffers(g.cmd, 0, 1, &g.vb, &zero);
+    const VkBuffer both[2] = {g.vb, g.vb};
+    const VkDeviceSize zeros[2] = {0, 0};
+    vkCmdBindVertexBuffers(g.cmd, 0, 2, both, zeros);
+    VkDeviceSize mid_off = 0;               // where the second binding starts: a draw's second copy of its vertices less its first
     vkCmdBindIndexBuffer(g.cmd, g.vb, g.draw_idx_off, VK_INDEX_TYPE_UINT32);
     vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.layout, 1, 1, &g.light_set, 0, nullptr);
     VkTex *road = frame.road_specular ? (VkTex *)frame.road_specular->vk : nullptr;
@@ -1680,12 +2526,21 @@ static void draw_target(const NativeFrame &frame, int target, int vw, int vh, si
     auto tex_mode = [](const NativeTexture &t) {
         return (t.repeat_s ? 1 : 0) | (t.repeat_t ? 2 : 0) | (t.mag_linear ? 4 : 0) | (t.min_linear ? 8 : 0) | (t.mip_linear ? 16 : 0) | (t.levels - 1) << 8;
     };
+    // Particles: High: a sprite of the port's own that blends and writes no depth is drawn as a ball of smoke (native.frag, SOFT),
+    // once this picture has its copy of the depth (g_soft_now). Its pipeline, null: drawn as it is
+    auto soft_of = [&](const NativeDraw &d) -> VkPipeline {
+        if (!g_soft_now || target != 1 || !(d.flags & kSoftKinds) || d.depth_write || d.blend == NB_OPAQUE || d.blend >= NB_COUNT) return VK_NULL_HANDLE;
+        return g.soft_pipeline[in_samples ? 1 : 0][d.blend][d.depth_test ? 1 : 0];
+    };
     // what is bound already: the passes of a strip go between a few pipelines and sets, and binding again what is there costs the GPU's front end
     VkPipeline bound_pipeline = VK_NULL_HANDLE;
     VkDescriptorSet bound_set = VK_NULL_HANDLE;
-    auto pass = [&](const NativeDraw &d, int which, VkDescriptorSet set, VkPipeline pipeline, float factor, bool textured) {
+    // merged_cmds not 0: d is the first of a run of draws, and the run's commands are merged_cmds of g.cmds_buf from merged_from
+    auto pass = [&](const NativeDraw &d, int which, VkDescriptorSet set, VkPipeline pipeline, float factor, bool textured, uint32_t merged_cmds = 0,
+                    uint32_t merged_from = 0) {
         Push p;
-        memcpy(p.clip, d.clip, sizeof p.clip);
+        p.merged = merged_cmds ? 1 : 0;
+        picture_clip(p.clip, d);
         p.scroll[0] = which == 2 ? 0 : d.scroll_s;
         p.scroll[1] = which == 2 ? 0 : d.scroll_t;
         p.alpha_test = d.alpha_test ? 1.0f : 0.0f;
@@ -1693,12 +2548,16 @@ static void draw_target(const NativeFrame &frame, int target, int vw, int vh, si
         p.textured = textured ? 1.0f : 0.0f;
         p.light = d.light;
         p.flags = d.flags;
+        // a sprite drawn as a ball (soft_of): the vertex shader tests it at the ball's front, and the depth's copy is its third set
+        const bool soft = g_soft_now && target == 1 && (d.flags & kSoftKinds) && pipeline == soft_of(d);
+        if (soft) p.flags |= kSoftFlag;
         p.pass = which;
         p.tfx = which == 0 ? d.tfx : 0;
         p.lod_l = which == 0 ? (float)d.lod_l : 0.0f;
         p.bits16 = target >= 8 && target <= 13;
         p.snap[0] = d.snap_x;
         p.snap[1] = d.snap_y;
+        p.between = g_pic_f;
         // the pictures of this renderer: clamped and linear, as TEX1's 0xe0 has it at level 0
         p.tex_mode = which == 2 && env_tex ? frame.env_mode | 64
                    : which == 2 || d.rt >= 0 || !d.tex ? 4 | 8 : which == 1 ? frame.road_mode : d.tex_mode;
@@ -1708,13 +2567,56 @@ static void draw_target(const NativeFrame &frame, int target, int vw, int vh, si
         static const bool af_old = getenv("HP2_AFOLD") != nullptr, af_flip = getenv("HP2_AFFLIP") != nullptr;
         const bool af_every = af_flip ? (g.frame / 120 & 1) != 0 : !af_old;
         if (which == 0 && d.tex && d.rt < 0 && (d.tex_upscaled || (g.aniso && (af_every || d.tex_min_linear) && d.snap_x != 0 && target < 8))) p.tex_mode |= 32;
+        if (g_merge_stat && target == 1) {
+            g_ms.passes++;
+            g_ms.pipelines += pipeline != bound_pipeline;
+            g_ms.sets += set != bound_set;
+            g_ms.calls += merged_cmds ? 1 : d.ranges ? d.ranges : 1;
+        }
         if (pipeline != bound_pipeline) vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
         if (set != bound_set) vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.layout, 0, 1, &set, 0, nullptr);
         bound_pipeline = pipeline;
         bound_set = set;
+        if (soft) vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.soft_layout, 2, 1, &g.soft_set, 0, nullptr);
         vkCmdPushConstants(g.cmd, g.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof p, &p);
-        if (d.indexed) vkCmdDrawIndexed(g.cmd, d.count, 1, d.first, 0, 0);
-        else vkCmdDraw(g.cmd, d.count, 1, g.draw_dyn_first + d.first, 0);
+        const VkDeviceSize mid_want = g_between && d.mid_verts && !merged_cmds && !d.ranges && !d.indexed
+                                          ? (VkDeviceSize)(d.mid_first - d.first) * sizeof(NativeVertex) : 0;
+        if (mid_want != mid_off) {
+            vkCmdBindVertexBuffers(g.cmd, 1, 1, &g.vb, &mid_want);
+            mid_off = mid_want;
+        }
+        if (merged_cmds) {
+            vkCmdDrawIndirect(g.cmd, g.cmds_buf, (VkDeviceSize)merged_from * sizeof(VkDrawIndirectCommand), merged_cmds, sizeof(VkDrawIndirectCommand));
+        } else if (d.ranges) {
+            // the strips' vertices where they lie in the buffer: the same triangles in the same order as their indices gave
+            const NativeRange *r = frame.ranges.data() + d.first;
+            for (uint32_t i = 0; i < d.ranges; i++) vkCmdDraw(g.cmd, r[i].count, 1, r[i].first, 0);
+        } else if (d.indexed) {
+            vkCmdDrawIndexed(g.cmd, d.count, 1, d.first, 0, 0);
+        } else {
+            vkCmdDraw(g.cmd, d.count, 1, g.draw_dyn_first + d.first, 0);
+        }
+    };
+    // The draws merged. A run: draws one after another, each of one pass, that have the same pipeline, texture and constants, all but
+    // the matrix and the light. Its draws' matrices and lights go into g.draws_buf, their ranges of vertices into g.cmds_buf as
+    // commands with the draw's number in that buffer as the instance, and the run is one vkCmdDrawIndirect: the commands are drawn in
+    // their order, so the picture is made of the same triangles in the same order as draw by draw. A draw of more passes (the
+    // road's shine, a car's reflection, a blend that leaves its alpha) ends the run and goes out as before.
+    struct RunKey {
+        VkPipeline pipeline;
+        VkDescriptorSet set;
+        float factor, scroll[2], snap[2], view[4];
+        int flags, tfx, lod_l, tex_mode, alpha_test, textured, upscaled, min_linear;
+    };
+    RunKey run_key;
+    const NativeDraw *run_first = nullptr;
+    uint32_t run_from = 0;
+    const bool merging = g.can_merge && !(g_dp_now && target == 1);
+    auto flush_run = [&] {
+        if (!run_first) return;
+        if (g.merge_cmds > run_from)
+            pass(*run_first, 0, run_key.set, run_key.pipeline, run_key.factor, run_key.textured != 0, g.merge_cmds - run_from, run_from);
+        run_first = nullptr;
     };
     if (last > frame.draws.size()) last = frame.draws.size();
     float last_view[4] = {-1, -1, -1, -1};
@@ -1741,6 +2643,7 @@ static void draw_target(const NativeFrame &frame, int target, int vw, int vh, si
             s.big += d.count > 3000;
         }
         if (target == 1 && memcmp(d.view, last_view, sizeof last_view)) {
+            flush_run();                    // the run so far is the last view's
             memcpy(last_view, d.view, sizeof last_view);
             float ox, sx, sy;
             active_region(frame, ox, sx, sy);
@@ -1764,7 +2667,67 @@ static void draw_target(const NativeFrame &frame, int target, int vw, int vh, si
         auto &pipes = pipes_at[d.alpha_test ? 1 : 0];
         auto &alpha_pipes = alpha_at[d.alpha_test ? 1 : 0];
         VkPipeline main_pipeline = pipes[d.blend][d.depth_write][d.depth_test];
+        if (VkPipeline soft = soft_of(d)) main_pipeline = soft;
         VkPipeline dest_pipeline = pipes[NB_DEST][0][d.depth_test];
+        if (g_merge_stat && target == 1) {
+            // a draw of one pass, and what a draw next to it must share to go out with it in one call
+            const bool alpha_extra = d.blend != NB_OPAQUE && d.blend != NB_KEEP && d.blend != NB_LERP_DEST && (has_road || (has_sphere && gloss));
+            const bool single = d.blend != NB_DEST && !alpha_extra && !has_road && !has_sphere;
+            struct Key {
+                VkPipeline pipeline;
+                VkDescriptorSet set;
+                float factor, scroll[2], snap[2], view[4];
+                int flags, tfx, lod_l, tex_mode, alpha_test, textured, strips;
+            } key = {main_pipeline, set, factor, {d.scroll_s, d.scroll_t}, {d.snap_x, d.snap_y}, {d.view[0], d.view[1], d.view[2], d.view[3]},
+                     (int)d.flags, d.tfx, d.lod_l, d.tex_mode, d.alpha_test, textured, d.ranges != 0};
+            static Key last;
+            static bool last_single;
+            g_ms.draws++;
+            g_ms.singles += single;
+            g_ms.opaque += d.blend == NB_OPAQUE;
+            if (!(single && last_single && !memcmp(&key, &last, sizeof key))) g_ms.runs++;
+            last = key;
+            last_single = single;
+        }
+        {
+            const bool alpha_extra = d.blend != NB_OPAQUE && d.blend != NB_KEEP && d.blend != NB_LERP_DEST && (target == 7 || has_road || (has_sphere && gloss));
+            const bool one_pass = d.blend != NB_DEST && !alpha_extra && !has_road && !has_sphere;
+            const uint32_t cmds = d.ranges ? d.ranges : 1;
+            // (a draw with a second copy of its vertices has its own start of the second binding in a picture between: not merged)
+            if (merging && one_pass && (d.ranges || !d.indexed) && !(g_between && d.mid_verts) && g.merge_draws < g.draws_cap &&
+                g.merge_cmds + cmds <= g.cmds_cap) {
+                RunKey key;
+                memset(&key, 0, sizeof key);
+                key.pipeline = main_pipeline;
+                key.set = set;
+                key.factor = factor;
+                key.scroll[0] = d.scroll_s, key.scroll[1] = d.scroll_t;
+                key.snap[0] = d.snap_x, key.snap[1] = d.snap_y;
+                memcpy(key.view, d.view, sizeof key.view);
+                key.flags = d.flags, key.tfx = d.tfx, key.lod_l = d.lod_l, key.tex_mode = d.tex_mode, key.alpha_test = d.alpha_test;
+                key.textured = textured, key.upscaled = d.tex_upscaled, key.min_linear = d.tex_min_linear;
+                if (!run_first || memcmp(&key, &run_key, sizeof key)) {
+                    flush_run();
+                    run_key = key;
+                    run_first = &d;
+                    run_from = g.merge_cmds;
+                }
+                DrawData &own = ((DrawData *)g.draws_map)[g.merge_draws];
+                picture_clip(own.clip, d);
+                own.light = d.light;
+                VkDrawIndirectCommand *cmd = (VkDrawIndirectCommand *)g.cmds_map + g.merge_cmds;
+                if (d.ranges) {
+                    const NativeRange *r = frame.ranges.data() + d.first;
+                    for (uint32_t k = 0; k < d.ranges; k++) cmd[k] = {r[k].count, 1, r[k].first, g.merge_draws};
+                } else {
+                    cmd[0] = {d.count, 1, g.draw_dyn_first + d.first, g.merge_draws};
+                }
+                g.merge_cmds += cmds;
+                g.merge_draws++;
+                continue;
+            }
+            flush_run();
+        }
         pass(d, 0, set, main_pipeline, factor, textured);
         if (d.blend == NB_DEST) pass(d, 0, set, main_pipeline, factor, textured);
         // A blend's alpha is its factor here, on the GS it is As. As matters if a later pass or the mirror's quad reads it.
@@ -1790,11 +2753,141 @@ static void draw_target(const NativeFrame &frame, int target, int vw, int vh, si
             if (target == 7) pass(d, 2, env_set, alpha_pipes[d.depth_test], -2.0f, true);
         }
     }
+    flush_run();
 }
 
 static VkBuffer g_env_log_rb;
 static void *g_env_log_map;
 static int g_env_log_have;
+
+// ---- Shadows: High (native.cpp, "Shadows: High and Maximum") ----
+static void depth_image_barrier(VkImage image, VkImageLayout from, VkImageLayout to)
+{
+    VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    b.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+    b.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+    b.oldLayout = from;
+    b.newLayout = to;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = image;
+    b.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(g.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+}
+
+// the cars as the sun sees them, each into its cell of the map: once for every picture, before anything reads the map
+static void draw_shadow_map(const NativeFrame &frame)
+{
+    if (!frame.shadow_level || (frame.casters.empty() && frame.shadows.empty())) return;
+    VkClearValue clear = {};
+    clear.depthStencil.depth = 0;
+    VkRenderPassBeginInfo rb = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    rb.renderPass = g.shadow_pass;
+    rb.framebuffer = g.shadow_fb;
+    rb.renderArea.extent = {(uint32_t)(g.shadow_cell * kShadowAcross), (uint32_t)(g.shadow_cell * kShadowRows)};
+    rb.clearValueCount = 1;
+    rb.pClearValues = &clear;
+    vkCmdBeginRenderPass(g.cmd, &rb, VK_SUBPASS_CONTENTS_INLINE);
+    vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.shadow_cast);
+    const VkBuffer both[2] = {g.vb, g.vb};
+    const VkDeviceSize zeros[2] = {0, 0};
+    vkCmdBindVertexBuffers(g.cmd, 0, 2, both, zeros);
+    vkCmdBindIndexBuffer(g.cmd, g.vb, g.draw_idx_off, VK_INDEX_TYPE_UINT32);
+    vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.layout, 1, 1, &g.light_set, 0, nullptr);
+    for (const NativeShadowCaster &k : frame.casters) {
+        if (k.draw >= frame.draws.size() || k.cell >= kShadowAcross * kShadowDown) continue;
+        const NativeDraw &d = frame.draws[k.draw];
+        if (!d.count) continue;
+        VkViewport vp = {(float)((k.cell % kShadowAcross) * g.shadow_cell), (float)((k.cell / kShadowAcross + (k.glass ? kShadowDown : 0)) * g.shadow_cell),
+                         (float)g.shadow_cell, (float)g.shadow_cell, 0, 1};
+        VkRect2D sc = {{(int32_t)vp.x, (int32_t)vp.y}, {(uint32_t)g.shadow_cell, (uint32_t)g.shadow_cell}};
+        vkCmdSetViewport(g.cmd, 0, 1, &vp);
+        vkCmdSetScissor(g.cmd, 0, 1, &sc);
+        Push p = {};
+        memcpy(p.clip, k.clip, sizeof p.clip);
+        p.blend_alpha = -2.0f;
+        p.light = -1;
+        p.between = 1.0f;
+        vkCmdPushConstants(g.cmd, g.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof p, &p);
+        if (d.ranges) {
+            const NativeRange *r = frame.ranges.data() + d.first;
+            for (uint32_t i = 0; i < d.ranges; i++) vkCmdDraw(g.cmd, r[i].count, 1, r[i].first, 0);
+        } else if (d.indexed) {
+            vkCmdDrawIndexed(g.cmd, d.count, 1, d.first, 0, 0);
+        } else {
+            vkCmdDraw(g.cmd, d.count, 1, g.draw_dyn_first + d.first, 0);
+        }
+    }
+    vkCmdEndRenderPass(g.cmd);
+    all_barrier();
+    g.shadow_ready = true;
+}
+
+// A view's shadows, inside a pass over its colour with its depth being read. The outline's shadow fades as the car gets small on
+// the real picture: all there above 36 pixels of the car's length, none below 12 (the game's own went by the PS2's pixels).
+static void draw_shadows(const NativeFrame &frame, int target, bool mirror, bool samples = false)
+{
+    float ox = 0, sx = 1, sy = 1;
+    if (!mirror) active_region(frame, ox, sx, sy);
+    vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, samples ? g.shadow_ms_pipeline : g.shadow_pipeline);
+    vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.shadow_layout, 0, 1, samples ? &g.ms_post_set : mirror ? &g.rvm_post_set : &g.post_set, 0,
+                            nullptr);
+    for (const NativeShadow &s : frame.shadows) {
+        if (s.target != target) continue;
+        VkViewport vp = {0, 0, (float)g.rvm_w, (float)g.rvm_h, 0, 1};
+        if (!mirror) vp = {ox + s.view[0] * sx, s.view[1] * sy, s.view[2] * sx, s.view[3] * sy, 0, 1};
+        if (!(vp.width >= 1 && vp.height >= 1)) continue;
+        // only where it can fall (NativeShadow::box, the view's -1..1): not over the whole view for every car
+        const float bx0 = std::max(vp.x + (s.box[0] * 0.5f + 0.5f) * vp.width - 2.0f, std::max(vp.x, 0.0f));
+        const float by0 = std::max(vp.y + (s.box[1] * 0.5f + 0.5f) * vp.height - 2.0f, std::max(vp.y, 0.0f));
+        const float bx1 = std::min(vp.x + (s.box[2] * 0.5f + 0.5f) * vp.width + 2.0f, vp.x + vp.width);
+        const float by1 = std::min(vp.y + (s.box[3] * 0.5f + 0.5f) * vp.height + 2.0f, vp.y + vp.height);
+        if (!(bx1 - bx0 >= 1 && by1 - by0 >= 1)) continue;     // off the picture
+        const int32_t x0 = (int32_t)bx0, y0 = (int32_t)by0;
+        const int32_t x1 = std::min((int32_t)(bx1 + 0.999f), (int32_t)(vp.x + vp.width)), y1 = std::min((int32_t)(by1 + 0.999f), (int32_t)(vp.y + vp.height));
+        if (x1 <= x0 || y1 <= y0) continue;
+        VkRect2D sc = {{x0, y0}, {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0)}};
+        ShadowPush p = {};
+        if (g_between && s.has_mid && g_pic_f == 0.5f) {
+            memcpy(p.to, s.to_mid, sizeof p.to);
+        } else if (g_between && s.has_mid) {
+            const float t = 2.0f * g_pic_f - 1.0f;
+            for (int i = 0; i < 16; i++) p.to[i] = s.to_mid[i] * (1.0f - t) + s.to[i] * t;
+        } else {
+            memcpy(p.to, s.to, sizeof p.to);
+        }
+        p.view[0] = vp.x, p.view[1] = vp.y, p.view[2] = vp.width, p.view[3] = vp.height;
+        VkDescriptorSet set;
+        if (s.kind == 1) {
+            if (!g.shadow_ready || s.cell >= kShadowAcross * kShadowDown) continue;
+            const float pixels = s.size * vp.width;
+            const float fade = std::min(std::max((pixels - 12.0f) / (36.0f - 12.0f), 0.0f), 1.0f);
+            if (!(fade > 0)) continue;
+            p.colour[3] = s.colour[3] * fade;
+            p.mode = 1;
+            p.texel = 1.0f / (float)g.shadow_cell;
+            // the soft edge: no narrower than a texel of the map (what smooths the texels' stairs), no wider than its widest
+            p.low = std::max(s.soft > 0 ? s.soft : 1.5f * p.texel, p.texel);
+            p.high = std::min(std::max(s.low, p.texel), p.low);
+            p.colour[0] = s.high;
+            p.rect[0] = (float)(s.cell % kShadowAcross) / kShadowAcross, p.rect[1] = (float)(s.cell / kShadowAcross) / kShadowRows;
+            p.rect[2] = 1.0f / kShadowAcross, p.rect[3] = 1.0f / kShadowRows;
+            set = g.shadow_set;
+        } else {
+            VkTex *t = s.tex ? (VkTex *)s.tex->vk : nullptr;
+            if (!t) continue;                   // not in the GPU yet
+            t->used = g.frame;
+            memcpy(p.colour, s.colour, sizeof p.colour);
+            p.low = s.low, p.high = s.high;
+            p.rect[0] = s.metres[0], p.rect[1] = s.metres[1];
+            set = t->set;
+        }
+        vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.shadow_layout, 1, 1, &set, 0, nullptr);
+        vkCmdSetViewport(g.cmd, 0, 1, &vp);
+        vkCmdSetScissor(g.cmd, 0, 1, &sc);
+        vkCmdPushConstants(g.cmd, g.shadow_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof p, &p);
+        vkCmdDraw(g.cmd, 3, 1, 0, 0);
+    }
+}
 
 // the targets 8..13 that have strips this frame
 static void draw_env_views(const NativeFrame &frame, VkDeviceSize &)
@@ -1812,10 +2905,35 @@ static void draw_env_views(const NativeFrame &frame, VkDeviceSize &)
         rb.renderArea.extent = {(uint32_t)g.rvm_w, (uint32_t)g.rvm_h};
         rb.clearValueCount = 2;
         rb.pClearValues = clear;
+        // Shadows: High: the mirror's go over what is drawn before NativeFrame::rvm_shadow_at, and the rest of the mirror (its
+        // smoke, sparks, flares) is drawn after them, over them
+        bool rvm_shadows = false;
+        for (const NativeShadow &s : frame.shadows) rvm_shadows |= s.target == 7;
+        const size_t rvm_cut = rvm_shadows ? std::min((size_t)frame.rvm_shadow_at, frame.draws.size()) : frame.draws.size();
         vkCmdBeginRenderPass(g.cmd, &rb, VK_SUBPASS_CONTENTS_INLINE);
-        draw_target(frame, 7, g.rvm_w, g.rvm_h);
+        draw_target(frame, 7, g.rvm_w, g.rvm_h, 0, rvm_cut);
         vkCmdEndRenderPass(g.cmd);
         g.rvm_ready = true;
+        if (rvm_shadows) {
+            all_barrier();
+            depth_image_barrier(g.rvm_depth, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            VkRenderPassBeginInfo sb = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+            sb.renderPass = g.rvm_post_pass;
+            sb.framebuffer = g.rvm_post_fb;
+            sb.renderArea.extent = {(uint32_t)g.rvm_w, (uint32_t)g.rvm_h};
+            vkCmdBeginRenderPass(g.cmd, &sb, VK_SUBPASS_CONTENTS_INLINE);
+            draw_shadows(frame, 7, true);
+            vkCmdEndRenderPass(g.cmd);
+            all_barrier();
+            depth_image_barrier(g.rvm_depth, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+            if (rvm_cut < frame.draws.size()) {
+                rb.renderPass = g.env_pass_load;
+                rb.clearValueCount = 0;
+                vkCmdBeginRenderPass(g.cmd, &rb, VK_SUBPASS_CONTENTS_INLINE);
+                draw_target(frame, 7, g.rvm_w, g.rvm_h, rvm_cut);
+                vkCmdEndRenderPass(g.cmd);
+            }
+        }
         static const bool shot_images = getenv("HP2_NATIVESHOT") != nullptr;
     if (shot_images) {
             image_barrier(g.rvm, 0, 1, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
@@ -2367,19 +3485,23 @@ static void blit_to_window(VkImage image, const NativeFrame &frame)
     // a TV picture whatever its size in pixels, 4:3 or the race's: the largest such box in the middle of the window
     float aspect = (4.0f / 3.0f) / (frame.wide ? native_narrow() : 1.0f);
     int bw = g.swap_w, bh = g.swap_h;
-    if ((float)bw > (float)bh * aspect) bw = (int)((float)bh * aspect);
-    else bh = (int)((float)bw / aspect);
-    int bx = (g.swap_w - bw) / 2, by = (g.swap_h - bh) / 2;
+    if ((float)bw > (float)bh * aspect) bw = (int)((float)bh * aspect + 0.5f);
+    else bh = (int)((float)bw / aspect + 0.5f);
     int from = frame.wide ? 0 : (W - W43) / 2, across = frame.wide ? W : W43;
+    // the picture was made for this box: pixel for pixel, where the rounding of the two would leave a pixel between them
+    const int rows = H * 444 / 448;
+    if (abs(bw - across) <= 2 && across <= g.swap_w) bw = across;
+    if (abs(bh - rows) <= 2 && rows <= g.swap_h) bh = rows;
+    int bx = (g.swap_w - bw) / 2, by = (g.swap_h - bh) / 2;
     VkImageBlit bl = {};
     bl.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     bl.srcOffsets[0] = {from, 0, 0};
-    bl.srcOffsets[1] = {from + across, H * 444 / 448, 1};
+    bl.srcOffsets[1] = {from + across, rows, 1};
     bl.dstSubresource = bl.srcSubresource;
     bl.dstOffsets[0] = {bx, by, 0};
     bl.dstOffsets[1] = {bx + bw, by + bh, 1};
     vkCmdBlitImage(g.cmd, g.color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl,
-                   g_cfg.smooth ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+                   VK_FILTER_LINEAR);          // the same size as a rule; another only while the window changes
     after_write();
     if (g_cfg.show_fps) draw_fps(image, bx + 8, by + 8);
     after_write();
@@ -2403,7 +3525,7 @@ static void copy_depth_rects(const NativeFrame &frame)
         int x0 = std::clamp((int)(ox + r.x * sx), 0, W - 1), y0 = std::clamp((int)(r.y * sy), 0, H - 1);
         int w = std::clamp((int)std::ceil(r.w * sx), 1, W - x0), h = std::clamp((int)std::ceil(r.h * sy), 1, H - y0);
         VkDeviceSize bytes = (VkDeviceSize)w * h * 4;
-        if (place + bytes > kDepthBytes) break;
+        if (place + bytes > g.depth_cap) break;
         VkBufferImageCopy c = {};
         c.bufferOffset = place;
         c.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
@@ -2468,10 +3590,92 @@ static void copy_scene()
     g.scene_ready = true;
 }
 
+// Dithering (Advanced), on the finished picture of every frame, a race's or a menu's or a film's: where the pixels around one are all
+// within a few steps of its colour it takes their average, and a step's worth of noise goes over the lot, so a smooth gradient has
+// no steps of 1 / 255 (native_extra.frag). The picture's last step: after the antialiasing and the
+// brightness, contrast and gamma, and after the copy the next frame may blend with, so the noise does not build up.
+static void dither_picture(const NativeFrame &frame)
+{
+    static const bool exact = getenv("HP2_NATIVEEXACT") != nullptr;
+    if (exact || !g_cfg.deband) return;
+    copy_scene();
+    float ox, sx, sy;
+    active_region(frame, ox, sx, sy);
+    ExtraPush p = {};
+    p.rect[0] = ox;
+    p.rect[1] = 0;
+    p.rect[2] = (float)W - ox;
+    p.rect[3] = (float)H;
+    p.size[0] = (float)W;
+    p.size[1] = (float)H;
+    p.frame = (float)(frame.number & 255);
+    p.lines = sy;
+    VkRenderPassBeginInfo rb = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    rb.renderPass = g.post_pass;
+    rb.framebuffer = g.post_fb;
+    rb.renderArea.extent = {(uint32_t)W, (uint32_t)H};
+    vkCmdBeginRenderPass(g.cmd, &rb, VK_SUBPASS_CONTENTS_INLINE);
+    VkViewport vp = {0, 0, (float)W, (float)H, 0, 1};
+    VkRect2D sc = {{(int32_t)ox, 0}, {(uint32_t)(W - 2 * (int)ox), (uint32_t)H}};
+    vkCmdSetViewport(g.cmd, 0, 1, &vp);
+    vkCmdSetScissor(g.cmd, 0, 1, &sc);
+    vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.extra_pipeline);
+    vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.extra_layout, 0, 1, &g.extra_set, 0, nullptr);
+    vkCmdPushConstants(g.cmd, g.extra_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof p, &p);
+    vkCmdDraw(g.cmd, 3, 1, 0, 0);
+    vkCmdEndRenderPass(g.cmd);
+    all_barrier();
+}
+
+// Particles: High, the soft sprites: the picture's depth as it is now, for the sprites to read (between two of the picture's passes)
+static void copy_depth_soft()
+{
+    // the copy's own changes of layout, each waiting for what wrote it last and holding back what reads or writes it next
+    const auto copy_layout = [](VkImageLayout from, VkImageLayout to, VkAccessFlags src, VkAccessFlags dst) {
+        VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b.srcAccessMask = src;
+        b.dstAccessMask = dst;
+        b.oldLayout = from;
+        b.newLayout = to;
+        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = g.depth_copy;
+        b.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(g.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    };
+    all_barrier();
+    depth_barrier(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    // (the last picture's sprites read the copy: this waits for them, and the old contents go)
+    copy_layout(VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    VkImageCopy c = {};
+    c.srcSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+    c.dstSubresource = c.srcSubresource;
+    c.extent = {(uint32_t)W, (uint32_t)H, 1};
+    vkCmdCopyImage(g.cmd, g.depth, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.depth_copy, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+    copy_layout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+    depth_barrier(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+    all_barrier();
+}
+
+// Shadows with multisampling: a view's shadows over the picture's samples, between two of the picture's passes
+static void draw_shadows_samples(const NativeFrame &frame, const NativeFx &f)
+{
+    all_barrier();
+    depth_image_barrier(g.depth_ms, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
+    VkRenderPassBeginInfo rb = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+    rb.renderPass = g.ms_read_pass;
+    rb.framebuffer = g.ms_read_fb;
+    rb.renderArea.extent = {(uint32_t)W, (uint32_t)H};
+    vkCmdBeginRenderPass(g.cmd, &rb, VK_SUBPASS_CONTENTS_INLINE);
+    draw_shadows(frame, f.target, false, true);
+    vkCmdEndRenderPass(g.cmd);
+    all_barrier();
+    depth_image_barrier(g.depth_ms, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+}
+
 // the render pass of the picture is over: lay this on it
 static void draw_fx(const NativeFrame &frame, const NativeFx &f, int row)
 {
-    if (f.kind != FX_FOG) {
+    if (f.kind != FX_FOG && f.kind != FX_SHADOW && f.kind != FX_AO) {
         copy_scene();
     } else {
         all_barrier();
@@ -2488,11 +3692,72 @@ static void draw_fx(const NativeFrame &frame, const NativeFx &f, int row)
         }
     }
     depth_barrier(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    // Ambient Occlusion: first into its own image, at every second pixel of the view
+    ShadowPush ao = {};
+    VkViewport ao_vp = {};
+    if (f.kind == FX_AO) {
+        float ox, sx, sy;
+        active_region(frame, ox, sx, sy);
+        ao_vp = {ox + f.rect[0] * sx, f.rect[1] * sy, f.rect[2] * sx, f.rect[3] * sy, 0, 1};
+        memcpy(ao.to, f.m, sizeof ao.to);
+        ao.view[0] = ao_vp.x, ao.view[1] = ao_vp.y, ao.view[2] = ao_vp.width, ao.view[3] = ao_vp.height;
+        // (the user, 2026-11-17: it works, and far too faint. It was 0.8 m and 0.75; hp2.ini has both now)
+        ao.rect[0] = (float)g_cfg.ao_reach * 0.01f;         // the reach in metres
+        ao.rect[1] = (float)g_cfg.ao_strength * 0.01f;      // the strength
+        ao.rect[2] = 2.0f;                  // the image is half the picture each way
+        VkClearValue none = {};
+        VkRenderPassBeginInfo ab = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+        ab.renderPass = g.ao_pass;
+        ab.framebuffer = g.ao_fb;
+        ab.renderArea.extent = {(uint32_t)g.ao_w, (uint32_t)g.ao_h};
+        ab.clearValueCount = 1;
+        ab.pClearValues = &none;
+        vkCmdBeginRenderPass(g.cmd, &ab, VK_SUBPASS_CONTENTS_INLINE);
+        const VkViewport hv = {ao_vp.x * 0.5f, ao_vp.y * 0.5f, ao_vp.width * 0.5f, ao_vp.height * 0.5f, 0, 1};
+        const int32_t hx0 = std::max((int32_t)hv.x, 0), hy0 = std::max((int32_t)hv.y, 0);
+        const int32_t hx1 = std::min((int32_t)(hv.x + hv.width + 0.999f), g.ao_w), hy1 = std::min((int32_t)(hv.y + hv.height + 0.999f), g.ao_h);
+        if (hv.width >= 1 && hv.height >= 1 && hx1 > hx0 && hy1 > hy0) {
+            const VkRect2D hs = {{hx0, hy0}, {(uint32_t)(hx1 - hx0), (uint32_t)(hy1 - hy0)}};
+            vkCmdSetViewport(g.cmd, 0, 1, &hv);
+            vkCmdSetScissor(g.cmd, 0, 1, &hs);
+            vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.ao_pipeline);
+            vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.shadow_layout, 0, 1, &g.post_set, 0, nullptr);
+            vkCmdPushConstants(g.cmd, g.shadow_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof ao, &ao);
+            vkCmdDraw(g.cmd, 3, 1, 0, 0);
+        }
+        vkCmdEndRenderPass(g.cmd);
+        all_barrier();
+    }
     VkRenderPassBeginInfo rb = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     rb.renderPass = g.post_pass;
     rb.framebuffer = g.post_fb;
     rb.renderArea.extent = {(uint32_t)W, (uint32_t)H};
     vkCmdBeginRenderPass(g.cmd, &rb, VK_SUBPASS_CONTENTS_INLINE);
+    if (f.kind == FX_AO) {                  // and from that image over the view
+        const int32_t x0 = std::max((int32_t)ao_vp.x, 0), y0 = std::max((int32_t)ao_vp.y, 0);
+        const int32_t x1 = std::min((int32_t)(ao_vp.x + ao_vp.width), W), y1 = std::min((int32_t)(ao_vp.y + ao_vp.height), H);
+        if (ao_vp.width >= 1 && ao_vp.height >= 1 && x1 > x0 && y1 > y0) {
+            const VkRect2D as = {{x0, y0}, {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0)}};
+            const VkDescriptorSet both[2] = {g.post_set, g.ao_set};
+            vkCmdSetViewport(g.cmd, 0, 1, &ao_vp);
+            vkCmdSetScissor(g.cmd, 0, 1, &as);
+            vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.ao_apply_pipeline);
+            vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.shadow_layout, 0, 2, both, 0, nullptr);
+            vkCmdPushConstants(g.cmd, g.shadow_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof ao, &ao);
+            vkCmdDraw(g.cmd, 3, 1, 0, 0);
+        }
+        vkCmdEndRenderPass(g.cmd);
+        all_barrier();
+        depth_barrier(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+        return;
+    }
+    if (f.kind == FX_SHADOW) {              // Shadows: High: the view's shadows, by the depth just read
+        draw_shadows(frame, f.target, false);
+        vkCmdEndRenderPass(g.cmd);
+        all_barrier();
+        depth_barrier(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+        return;
+    }
     float ox, sx, sy;
     active_region(frame, ox, sx, sy);
     VkViewport vp = {ox + f.rect[0] * sx, f.rect[1] * sy, f.rect[2] * sx, f.rect[3] * sy, 0, 1};
@@ -2527,16 +3792,23 @@ static void draw_fx(const NativeFrame &frame, const NativeFx &f, int row)
 // this frame's palettes, a row each
 static void upload_palettes(const NativeFrame &frame, VkDeviceSize &at)
 {
+    g.palette_rows = 0;
     if (frame.fx.empty()) return;
+    {
+        uint64_t wanted = 0;
+        for (const NativeFx &f : frame.fx) wanted += fx_palette(f.kind);
+        native_limit(NL_PALETTES, wanted, kPaletteRows);
+    }
     image_barrier(g.palette, 0, 1, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
                   VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-    for (size_t i = 0; i < frame.fx.size() && i < 8; i++) {
-        if (at + sizeof frame.fx[i].palette > kStaging) break;
+    for (size_t i = 0; i < frame.fx.size(); i++) {
+        if (!fx_palette(frame.fx[i].kind)) continue;        // it reads no palette
+        if (g.palette_rows >= kPaletteRows || at + sizeof frame.fx[i].palette > g.staging_cap) break;
         memcpy((char *)g.staging_map + at, frame.fx[i].palette, sizeof frame.fx[i].palette);
         VkBufferImageCopy c = {};
         c.bufferOffset = at;
         c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        c.imageOffset = {0, (int32_t)i, 0};
+        c.imageOffset = {0, g.palette_rows++, 0};
         c.imageExtent = {256, 1, 1};
         vkCmdCopyBufferToImage(g.cmd, g.staging, g.palette, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
         at += sizeof frame.fx[i].palette;
@@ -2564,6 +3836,52 @@ static bool draw_frame(const NativeFrame &frame, bool &uploaded);
 std::atomic<uint32_t> g_native_epoch{0};
 static std::vector<NativeTexUpload> g_tex_pending;      // decoded and not yet on the GPU, in order
 
+void native_vk_gpus(std::vector<std::string> &names, std::string &now)
+{
+    std::lock_guard<std::mutex> hold(g_gpu_mutex);
+    names = g_gpu_names;
+    now = g_gpu_now;
+}
+
+// the screen the window is on: its refresh rate, 0: not known
+int native_vk_screen_hz()
+{
+    static ULONGLONG looked;
+    static int hz;
+    const ULONGLONG now = GetTickCount64();
+    if (now - looked < 1000 && looked) return hz;
+    looked = now ? now : 1;
+    MONITORINFOEXA mi = {};
+    mi.cbSize = sizeof mi;
+    DEVMODEA dm = {};
+    dm.dmSize = sizeof dm;
+    hz = 0;
+    if (window_handle() && GetMonitorInfoA(MonitorFromWindow((HWND)window_handle(), MONITOR_DEFAULTTONEAREST), &mi) &&
+        EnumDisplaySettingsA(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm))
+        hz = (int)dm.dmDisplayFrequency;
+    if (hz <= 1) hz = 0;                    // 0 or 1: the screen's default
+    return hz;
+}
+
+// The pictures a second to draw for a frame that asks for `asked` of them (above the game's 60), 0: the frame alone. With VSync a
+// picture waits for the screen, so more pictures than the screen has refreshes would hold the game back: no more than those.
+// Without VSync every picture is shown at once, torn or not, whatever the screen.
+static int picture_rate(int asked)
+{
+    int rate = asked;
+    const int hz = native_vk_screen_hz();
+    if (rate >= 1000) return rate;          // Unlimited: no rate of its own (native_vk_draw)
+    if (g_cfg.vsync && hz && rate > hz) rate = hz;
+    if (rate <= 60) rate = 0;
+    static int told = -1;
+    if (told != rate) {
+        told = rate;
+        fprintf(g_hle_log, "native: frame rate %d asked: the screen has %d Hz, VSync is %s: %d pictures a second%s\n", asked, hz, g_cfg.vsync ? "on" : "off",
+                rate ? rate : 60, rate ? ", the game's 60 frames with pictures between them" : " (the game's frames alone)");
+    }
+    return rate;
+}
+
 bool native_vk_draw(NativeFrame &frame)
 {
     // the textures first, whatever comes of the frame: the game's thread counts them as loaded
@@ -2571,9 +3889,94 @@ bool native_vk_draw(NativeFrame &frame)
     frame.uploads.clear();
     g_frame_dumping = frame.dumping;
     bool uploaded = false, ok = false;
+    static double next_f;                   // where the next picture is, in frames from the frame before the one it is drawn from
     // a frame made before the game's thread heard of the cache's loss draws from places that hold something else
     if (frame.epoch == g_native_epoch.load()) {
-        ok = draw_frame(frame, uploaded);
+        const int rate = frame.doubled ? picture_rate(frame.pictures) : 0;
+        if (frame.doubled && frame.pictures >= 1000) {
+            // Unlimited (the user, 2026-11-17): as many pictures as the card makes in the sixtieth of a second a frame is shown for,
+            // each at the point between the two frames that the clock says it will be shown at; the frame itself is the last. With
+            // VSync a picture waits for the screen, and the screen's rate is what comes of it. The game's frames are not held.
+            static LONGLONG begin;          // this frame's pictures are shown from here on, for a sixtieth
+            static double took = 0.004;     // a picture's time in seconds, smoothed
+            LARGE_INTEGER t, f;
+            QueryPerformanceFrequency(&f);
+            QueryPerformanceCounter(&t);
+            const LONGLONG span = f.QuadPart / 60;
+            if (!begin || t.QuadPart - begin > 2 * span || begin - t.QuadPart > span) begin = t.QuadPart;     // lost step: from now
+            double was = 0;
+            for (int made = 0;; made++) {
+                QueryPerformanceCounter(&t);
+                double at = (double)(t.QuadPart - begin) / (double)span + took * 60.0;
+                if (at < was + 0.01) at = was + 0.01;
+                const bool last = at >= 1.0 - took * 30.0 || made >= 64;
+                if (last) at = 1.0;
+                was = at;
+                g_pic_f = (float)at;
+                g_between = !last;
+                g_pic_last = last;
+                bool first = false;
+                const bool drawn = draw_frame(frame, last ? uploaded : first);
+                LARGE_INTEGER after;
+                QueryPerformanceCounter(&after);
+                took = took * 0.9 + 0.1 * (double)(after.QuadPart - t.QuadPart) / (double)f.QuadPart;
+                if (took < 0.0002) took = 0.0002;
+                if (last) {
+                    ok = drawn;
+                    break;
+                }
+                if (!drawn) made = 64;      // nothing came of it (the window is being made anew): the frame alone, and on
+            }
+            begin += span;
+            next_f = 0;
+            g_pic_f = 1.0f, g_between = false, g_pic_last = true;
+        } else if (rate) {
+            // The pictures are 60 / rate of a frame apart, whatever the frame they fall in: this frame has those at next_f, next_f +
+            // that, ... up to 1, the frame itself (at 120: the half and 1; at 144 two or three, 1 only now and then). They are
+            // shown 1 / rate s apart: the screen's refresh spaces them with VSync, the clock without.
+            static LONGLONG due;
+            static int rate_was;
+            LARGE_INTEGER t, f;
+            QueryPerformanceFrequency(&f);
+            const double step = 60.0 / (double)rate;
+            if (rate != rate_was || next_f <= 0 || next_f > step + 1e-6) next_f = step, rate_was = rate, due = 0;
+            int n = 0;
+            while (next_f + n * step <= 1.0 + 1e-6) n++;
+            for (int i = 0; i < n; i++) {
+                double at = next_f + i * step;
+                if (at > 1.0 - 1e-6) at = 1.0;
+                QueryPerformanceCounter(&t);
+                // A picture between two frames that is already more than a picture late is left out (2026-11-17, with the rates up
+                // to 500): a card that cannot make so many would otherwise take longer over a frame than the game does, and hold
+                // the game back. The frame itself, the last, is always drawn.
+                if (i < n - 1 && due && t.QuadPart > due + f.QuadPart / rate) {
+                    due += f.QuadPart / rate;
+                    continue;
+                }
+                if (due > t.QuadPart && due - t.QuadPart < f.QuadPart / 20) {
+                    for (;;) {
+                        QueryPerformanceCounter(&t);
+                        const LONGLONG left = due - t.QuadPart;
+                        if (left <= 0) break;
+                        if (left > f.QuadPart * 3 / 2000) Sleep(1);     // more than 1.5 ms: a sleep (the timer's resolution is 1 ms, iop_kernel.cpp)
+                    }
+                } else {
+                    due = t.QuadPart;       // late, or the first: from now
+                }
+                due += f.QuadPart / rate;
+                g_pic_f = (float)at;
+                g_between = at < 1.0;
+                g_pic_last = i == n - 1;
+                bool first = false;
+                const bool drawn = draw_frame(frame, g_pic_last ? uploaded : first);
+                if (g_pic_last) ok = drawn;
+            }
+            next_f += n * step - 1.0;
+            g_pic_f = 1.0f, g_between = false, g_pic_last = true;
+        } else {
+            next_f = 0;
+            ok = draw_frame(frame, uploaded);
+        }
         if (!uploaded) g_native_epoch++;
     }
     g_cache_cap_pub.store(cache_verts_now());
@@ -2597,8 +4000,9 @@ static bool draw_frame(const NativeFrame &frame, bool &uploaded)
         }
         g.ready = true;
     }
-    // the settings changed: this frame's textures are gone with the rest, so it is not drawn
-    if (g.key != settings_key()) {
+    // the settings or the window's size changed: this frame's textures are gone with the rest, so it is not drawn
+    track_lines();
+    if (g.key != settings_key() || g.lines != g_lines) {
         if (!rebuild()) {
             g.failed = true;
             fprintf(g_hle_log, "native: the renderer could not be made again\n");
@@ -2609,22 +4013,33 @@ static bool draw_frame(const NativeFrame &frame, bool &uploaded)
     device_vertices();
     const size_t bytes = frame.vertices.size() * sizeof(NativeVertex), fresh_bytes = frame.fresh.size() * sizeof(NativeVertex),
                  index_bytes = frame.indices.size() * sizeof(uint32_t);
-    {
-        // not drawn: the window keeps the last picture while the game goes on (and native.cpp empties its cache)
-        const char *why = frame.dyn_base != cache_verts_now() ? nullptr
-                          : g.vb_in_vram ? (bytes > kSide || index_bytes > kSide ? "more than the GPU's buffer takes" : "")
-                          : bytes + index_bytes > kMaxBytes ? "more than a frame can take" : "";
-        if (!why) return false;             // made for a cache of another size: the first frame
-        if (*why) {
-            static int told;
-            if (told++ < 5) fprintf(g_hle_log, "native: %zu vertices, %zu indices are %s; not drawn\n", frame.vertices.size(), frame.indices.size(), why);
-            return false;
-        }
-    }
+    // made for a cache of another size (the first frame, or the GPU's buffer has grown since): not drawn, the window keeps the
+    // last picture while the game goes on (and native.cpp empties its cache)
+    if (frame.dyn_base != cache_verts_now()) return false;
     cpu_lap();
     vkWaitForFences(g.dev, 1, &g.fence, VK_TRUE, UINT64_MAX);
     free_dead_textures();
     const double wait_ms = cpu_lap();
+    // The buffers that grow, now that the GPU is done with the last frame. The vertices first: if their buffer is another now,
+    // this frame was made for the old one and is not drawn.
+    native_limit(NL_OWN_VERTS, bytes + index_bytes, g.vb_in_vram ? g.vb_side : kMaxBytes);
+    if (g.vb_in_vram && vertices_grow(frame, bytes + index_bytes)) return false;
+    if (!g.vb_in_vram && bytes + index_bytes > kMaxBytes) {
+        static int told;
+        if (told++ < 5) fprintf(g_hle_log, "native: %zu vertices, %zu indices are more than a frame can take; not drawn\n", frame.vertices.size(), frame.indices.size());
+        return false;
+    }
+    if (g.staging_want > g.staging_cap && !staging_room(g.staging_want)) {
+        if (!g.staging_refused || g.staging_want < g.staging_refused) g.staging_refused = g.staging_want;
+        fprintf(g_hle_log, "native: no memory to upload a texture of %llu KB through: it stays as it is\n", (unsigned long long)(g.staging_want >> 10));
+    }
+    g.staging_want = 0;
+    if (g.can_merge) merge_room((uint32_t)frame.draws.size(), (uint32_t)(frame.ranges.size() + frame.draws.size()));
+    if (g_pic_last) {
+        const VkDeviceSize depth_bytes = depth_rects_bytes(frame);
+        native_limit(NL_DEPTH, depth_bytes, g.depth_cap);
+        depth_room(depth_bytes);
+    }
     vkResetFences(g.dev, 1, &g.fence);
     gpu_times_read();
     copy_times_read();
@@ -2647,10 +4062,16 @@ static bool draw_frame(const NativeFrame &frame, bool &uploaded)
     g_fresh_bytes += fresh_bytes;
     uploaded = true;
     g.vb = g.vb_in_vram ? g.vb_dev : g.vb_stage;
-    g.draw_idx_off = g.vb_in_vram ? g.idx_off : bytes + fresh_bytes;
+    // in the GPU's buffer: right after the frame's own vertices (with no indices, anywhere inside the buffer will do)
+    g.draw_idx_off = g.vb_in_vram ? g.dyn_off + (index_bytes ? bytes : 0) : bytes + fresh_bytes;
     g.draw_dyn_first = g.vb_in_vram ? g.cache_verts : 0;
     size_t light_bytes = frame.lights.size() * sizeof(NativeLight);
-    if (light_bytes > kLightBytes) light_bytes = 0;
+    native_limit(NL_LIGHTS, frame.lights.size(), g.light_cap / sizeof(NativeLight));
+    if (!lights_room(light_bytes)) {
+        static int told;
+        if (told++ < 5) fprintf(g_hle_log, "native: %zu lights are more than a frame can have: none of them this frame\n", frame.lights.size());
+        light_bytes = 0;
+    }
     if (light_bytes) memcpy(g.lights_map, frame.lights.data(), light_bytes);
     const double copy_ms = cpu_lap();
     vkResetCommandBuffer(g.cmd, 0);
@@ -2678,7 +4099,7 @@ static bool draw_frame(const NativeFrame &frame, bool &uploaded)
                 if (r.count)
                     regions.push_back({bytes + (VkDeviceSize)r.src * sizeof(NativeVertex), (VkDeviceSize)r.dst * sizeof(NativeVertex),
                                        (VkDeviceSize)r.count * sizeof(NativeVertex)});
-            if (index_bytes) regions.push_back({bytes + fresh_bytes, g.idx_off, index_bytes});
+            if (index_bytes) regions.push_back({bytes + fresh_bytes, g.dyn_off + bytes, index_bytes});
             if (!regions.empty()) {
                 vkCmdCopyBuffer(g.cmd, g.vb_stage, g.vb_dev, (uint32_t)regions.size(), regions.data());
                 copied = true;
@@ -2703,6 +4124,9 @@ static bool draw_frame(const NativeFrame &frame, bool &uploaded)
         }
     }
     g.frame++;
+    native_limit(NL_MERGE_DRAWS, g.merge_draws, g.draws_cap);       // the picture before's
+    native_limit(NL_MERGE_CMDS, g.merge_cmds, g.cmds_cap);
+    g.merge_draws = g.merge_cmds = 0;
     g_ab = g_ab_on ? (int)(g.frame & 1) : 0;
     g_dp_now = false;
     if (g_dp_on && g.frame % 600 == 0) {
@@ -2765,11 +4189,18 @@ static bool draw_frame(const NativeFrame &frame, bool &uploaded)
     if (frame.road_specular && frame.road_specular->vk) ((VkTex *)frame.road_specular->vk)->used = g.frame;
     if (frame.env_override && frame.env_override->vk) ((VkTex *)frame.env_override->vk)->used = g.frame;
     upload_palettes(frame, staged);
+    native_limit(NL_STAGING, staged, g.staging_cap);
+    native_limit(NL_TEXTURES, g.textures.size(), (uint64_t)kTexSets * (1 + g.tex_pools.size()));
     VkDeviceSize zero_vb = 0;
-    draw_env_views(frame, zero_vb);
-    all_barrier();
-    fold_sphere_map(frame);
-    all_barrier();
+    // the picture between two frames (120) has the mirror and the reflections as the frame before left them: once a frame, not twice.
+    // With Reflections at High they are drawn for it too, each draw halfway as the picture's own are (NativeFrame::mid_views).
+    draw_shadow_map(frame);                 // Shadows: High
+    if (g_pic_last || frame.mid_views) {
+        draw_env_views(frame, zero_vb);
+        all_barrier();
+        fold_sphere_map(frame);
+        all_barrier();
+    }
     gpu_mark(1);
     static const bool pixab = getenv("HP2_PIXAB") != nullptr;
     const bool compare_now = pixab && g.clip_far && g.frame % 120 == 0;
@@ -2785,17 +4216,47 @@ static bool draw_frame(const NativeFrame &frame, bool &uploaded)
     rb.clearValueCount = 2;
     rb.pClearValues = clear;
     vkCmdBeginRenderPass(g.cmd, &rb, VK_SUBPASS_CONTENTS_INLINE);
-    // the view, cut at what is laid over it
+    // The view, cut at what is laid over it: the frame's effects, each at its draw, and before the first of the port's own
+    // particles the copy of the depth they read (fx -1). An effect and the copy at one draw: the effect first.
+    struct Cut {
+        size_t at;
+        int fx;
+    };
+    static std::vector<Cut> cuts;
+    cuts.clear();
+    for (size_t i = 0; i < frame.fx.size(); i++) cuts.push_back({frame.fx[i].at, (int)i});
+    g_soft_now = false;
+    if (g.soft_ok)
+        for (size_t i = 0; i < frame.draws.size(); i++) {
+            const NativeDraw &d = frame.draws[i];
+            if (!d.count || !(d.flags & kSoftKinds) || d.target > 4 || d.depth_write || d.blend == NB_OPAQUE) continue;
+            size_t where = 0;
+            while (where < cuts.size() && cuts[where].at <= i) where++;
+            cuts.insert(cuts.begin() + where, Cut{i, -1});
+            break;
+        }
     size_t at = 0;
-    for (size_t i = 0; i < frame.fx.size() && i < 8; i++) {
-        draw_target(frame, 1, W, H, at, frame.fx[i].at);
-        at = frame.fx[i].at;
+    for (const Cut &cut : cuts) {
+        const NativeFx *f = cut.fx >= 0 ? &frame.fx[cut.fx] : nullptr;
+        const int row = f ? fx_row(frame, (size_t)cut.fx) : -1;
+        if (f && fx_palette(f->kind) && row >= g.palette_rows) continue;        // no row of the palette image for it
+        if (cut.at < at) continue;          // out of order: not this way
+        draw_target(frame, 1, W, H, at, cut.at);
+        at = cut.at;
         vkCmdEndRenderPass(g.cmd);
-        draw_fx(frame, frame.fx[i], (int)i);
-        if (g.samples != VK_SAMPLE_COUNT_1_BIT) copy_scene();
+        bool resolved = false;              // the effect went over the resolved picture: it has to go back into the samples
+        if (!f) {
+            copy_depth_soft();
+            g_soft_now = true;
+        } else if (f->kind == FX_SHADOW && g.samples != VK_SAMPLE_COUNT_1_BIT && g.shadow_ms_pipeline) {
+            draw_shadows_samples(frame, *f);
+        } else {
+            draw_fx(frame, *f, row);
+            if (g.samples != VK_SAMPLE_COUNT_1_BIT) copy_scene(), resolved = true;
+        }
         rb.renderPass = g.pass_load;
         vkCmdBeginRenderPass(g.cmd, &rb, VK_SUBPASS_CONTENTS_INLINE);
-        if (g.samples != VK_SAMPLE_COUNT_1_BIT) {
+        if (resolved) {
             // the effect went on the resolved picture: back into every sample. The edges drawn so far stay as they were resolved
             VkViewport whole = {0, 0, (float)W, (float)H, 0, 1};
             VkRect2D all = {{0, 0}, {(uint32_t)W, (uint32_t)H}};
@@ -2807,6 +4268,14 @@ static bool draw_frame(const NativeFrame &frame, bool &uploaded)
         }
     }
     draw_target(frame, 1, W, H, at);
+    g_soft_now = false;
+    if (g_merge_stat && ++g_ms.frames >= 600) {
+        const double n = (double)g_ms.frames;
+        fprintf(g_hle_log, "mergestat: a frame's main picture: %.0f draws (%.0f of one pass, %.0f opaque), %.0f passes with %.0f changes of pipeline and %.0f of "
+                           "texture, %.0f draw calls; in runs alike but for the matrix and the light: %.0f\n",
+                g_ms.draws / n, g_ms.singles / n, g_ms.opaque / n, g_ms.passes / n, g_ms.pipelines / n, g_ms.sets / n, g_ms.calls / n, g_ms.runs / n);
+        memset(&g_ms, 0, sizeof g_ms);
+    }
     dp_mark((uint32_t)frame.draws.size());
     vkCmdEndRenderPass(g.cmd);
     all_barrier();
@@ -2814,13 +4283,13 @@ static bool draw_frame(const NativeFrame &frame, bool &uploaded)
     }
     if (compare_now) g_cmp_pending = true;
     gpu_mark(2);
-    g_fx_count += frame.fx.size() < 8 ? frame.fx.size() : 8;
+    g_fx_count += frame.fx.size();
     // what the next frame's DisplayBlendPrevious reads, if this one asked for it
     bool wants_prev = false;
     for (const NativeDraw &d : frame.draws)
         if (d.rt == NATIVE_RT_PREVIOUS) wants_prev = true;
-    g.prev_ready = wants_prev;
-    if (wants_prev) {
+    if (g_pic_last) g.prev_ready = wants_prev;
+    if (wants_prev && g_pic_last) {
         image_barrier(g.prev, 0, 1, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
                       VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
         VkImageBlit bl = {};
@@ -2832,11 +4301,14 @@ static bool draw_frame(const NativeFrame &frame, bool &uploaded)
         image_barrier(g.prev, 0, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
                       VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
     }
-    copy_depth_rects(frame);
+    if (g_pic_last) copy_depth_rects(frame);
     smaa_picture();
     grade_picture(frame);
+    dither_picture(frame);
     gpu_mark(3);
-    static const bool shots = getenv("HP2_NATIVESHOT") != nullptr;
+    // HP2_MIDSHOTS=1: the pictures taken are those drawn between (for looking at them), not the frames' own
+    static const bool shots_asked = getenv("HP2_NATIVESHOT") != nullptr, mid_shots = getenv("HP2_MIDSHOTS") != nullptr;
+    const bool shots = shots_asked && (!frame.doubled || g_pic_last != mid_shots);
     if (shots) {
         VkBufferImageCopy copy = {};
         copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -2954,8 +4426,26 @@ static bool draw_frame(const NativeFrame &frame, bool &uploaded)
         pi.pSwapchains = &g.swapchain;
         pi.pImageIndices = &image;
         VkResult r = vkQueuePresentKHR(g.queue, &pi);
-        if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) g.presented++;
+        if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) g.presented++, stall_frame();
         swap_said(r, "the frame was not shown");
+    }
+    // The picture standing while the game goes on: a frame that found no image of the window's free is not shown (the acquire above does
+    // not wait), and a run of such frames is a still picture that nothing else here knows of. Said when it ends, with what the last
+    // acquire answered, for a run of a tenth of a second or more (the stall catcher's third part, stall.h).
+    {
+        static LARGE_INTEGER freq, shown_at;
+        static unsigned missed;
+        static int told;
+        LARGE_INTEGER now;
+        if (!freq.QuadPart) QueryPerformanceFrequency(&freq), QueryPerformanceCounter(&shown_at);
+        QueryPerformanceCounter(&now);
+        if (on_screen) {
+            const double ms = (now.QuadPart - shown_at.QuadPart) * 1000.0 / freq.QuadPart;
+            if (missed >= 3 && ms >= 100.0 && g.frame > 300 && told++ < 300)
+                fprintf(g_hle_log, "native: the picture stood for %.0f ms at frame %u: %u frames in a row found no image of the window's free (%d images)\n",
+                        ms, g.frame, missed, (int)g.swap_images.size());
+            missed = 0, shown_at = now;
+        } else if (g.swapchain) missed++;
     }
     g.waiting = true;
     const double submit_ms = cpu_lap();
@@ -2964,12 +4454,14 @@ static bool draw_frame(const NativeFrame &frame, bool &uploaded)
         static const bool log = getenv("HP2_NATIVELOG") != nullptr || getenv("HP2_LONGFRAMES") != nullptr;
         const double total = game_ms + wait_ms + copy_ms + record_ms + submit_ms;
         static int told;
-        if (log && total > 21.0 && g.frame > 300 && told < 2000) {
+        // (always for a frame of more than a tenth of a second, the stall catcher's other half: stall.h)
+        const int cd_us = g_stall_cd_us.exchange(0), rpc_us = g_stall_rpc_us.exchange(0);
+        if (((log && total > 21.0) || total > 100.0) && g.frame > 300 && told < 2000) {
             told++;
-            fprintf(g_hle_log, "native: long frame %u: %.1f ms = game %.1f (lists %.1f, textures %.1f for %u), wait for the gpu %.1f, copy %.1f, recording %.1f, "
-                               "submit and present %.1f; %.2f MB new vertices, %.2f MB of textures, %zu vertices\n",
-                    g.frame, total, game_ms, frame.list_ms, frame.tex_ms, frame.tex_decoded, wait_ms, copy_ms, record_ms, submit_ms,
-                    fresh_bytes / 1048576.0, staged / 1048576.0, frame.indices.size() + frame.vertices.size());
+            fprintf(g_hle_log, "native: long frame %u: %.1f ms = game %.1f (lists %.1f, textures %.1f for %u, the disc %.1f, the IOP %.1f), wait for the gpu %.1f, "
+                               "copy %.1f, recording %.1f, submit and present %.1f; %.2f MB new vertices, %.2f MB of textures, %zu vertices\n",
+                    g.frame, total, game_ms, frame.list_ms, frame.tex_ms, frame.tex_decoded, cd_us / 1000.0, rpc_us / 1000.0, wait_ms, copy_ms, record_ms,
+                    submit_ms, fresh_bytes / 1048576.0, staged / 1048576.0, frame.strip_vertices + frame.vertices.size());
         }
     }
     g_cpu_sum[0] += game_ms;
@@ -3002,7 +4494,7 @@ static bool draw_frame(const NativeFrame &frame, bool &uploaded)
             if (g_gpu_frames)
                 fprintf(g_hle_log, " | gpu %.2f ms (max %.2f): env %.2f scene %.2f post %.2f window %.2f, fx %.1f a frame, %zu vertices, %zu draws",
                         g_gpu_sum[4] / g_gpu_frames, g_gpu_max_total, g_gpu_sum[0] / g_gpu_frames, g_gpu_sum[1] / g_gpu_frames, g_gpu_sum[2] / g_gpu_frames,
-                        g_gpu_sum[3] / g_gpu_frames, (double)g_fx_count / g_gpu_frames, frame.indices.size() + frame.vertices.size(), frame.draws.size());
+                        g_gpu_sum[3] / g_gpu_frames, (double)g_fx_count / g_gpu_frames, frame.strip_vertices + frame.vertices.size(), frame.draws.size());
             fprintf(g_hle_log, "\n");
             if (g_cpu_n)
                 fprintf(g_hle_log, "native: cpu a frame: game %.2f ms (lists %.2f), wait for the gpu %.2f, vertices %.2f, recording %.2f, submit and present %.2f\n",
