@@ -31,8 +31,9 @@ int pc_aspect()
 }
 
 int g_pad_playstation;
+int g_pad_nintendo;
 int g_layout_playstation = 1;
-int g_pad_steering_now = 100;
+int g_pad_driving_now = 0;
 
 // XInput masks (xinput.h); the triggers are made-up bits above the real ones
 enum {
@@ -45,57 +46,64 @@ PcConfig::PcConfig()
     default_keys();
     default_keys2();
     default_pad();
+    default_custom(0);
+    default_custom(1);
 }
 
-// the left side of the keyboard: nothing here is in default_keys, so that the two can share it
+// The keys as they come (the user's table of 2026-11-25: "so that the two players' keys do not cross, and player 2's are nearer
+// to their own"). No key is both players'. Player 2: W A S D and what lies around them.
 void PcConfig::default_keys2()
 {
     auto set = [&](int b, int k1, int k2) {
         key2[b][0] = k1;
         key2[b][1] = k2;
     };
-    set(PCB_UP, 'T', 0);
+    set(PCB_UP, '7', 0);                    // Cycle HUD
     set(PCB_DOWN, 0, 0);
     set(PCB_LEFT, 'A', 0);
     set(PCB_RIGHT, 'D', 0);
-    set(PCB_CROSS, 'W', 0);
-    set(PCB_SQUARE, 'S', 0);
-    set(PCB_CIRCLE, 'G', 0);
-    set(PCB_TRIANGLE, 'V', 0);
-    set(PCB_L1, 'E', 0);
-    set(PCB_R1, 'F', 0);
-    set(PCB_L2, '1', 0);
-    set(PCB_R2, '2', 0);
-    set(PCB_R3, 0xA2, 0);                   // VK_LCONTROL
+    set(PCB_CROSS, 'W', 0);                 // Accelerate
+    set(PCB_SQUARE, 'S', 0);                // Brake / Reverse
+    set(PCB_CIRCLE, 'G', 0);                // Horn / Siren
+    set(PCB_TRIANGLE, 'Y', 0);              // Change View
+    set(PCB_L1, 'T', 0);                    // Look Back
+    set(PCB_R1, 'Q', 0);                    // Handbrake
+    set(PCB_L2, '4', 0);                    // Shift Down
+    set(PCB_R2, '5', 0);                    // Shift Up
+    set(PCB_R3, 'F', 0);                    // Speed Boost
     set(PCB_START, 0, 0);
-    set(PCB_SELECT, 'B', 0);
+    set(PCB_SELECT, '6', 0);                // Reset Car
     memset(key2_zone, 0, sizeof key2_zone);
+    key2_zone[0][0] = '8';                  // Zone Freeze; a cop's call for the helicopter
+    key2_zone[1][0] = '9';                  // Zone Zoom; a cop's call for a road block
+    // (no Zone Slow Motion: the slow motion is the first player's alone, and has no key here nor a row on the Keyboard page)
 }
 
-// driving, in the game's controller layout A: the buttons' jobs are in kActions
+// Player 1: the arrows, and the left hand's keys. Driving, in the game's controller layout A: the buttons' jobs are in kActions
 void PcConfig::default_keys()
 {
     auto set = [&](int b, int k1, int k2) {
         key[b][0] = k1;
         key[b][1] = k2;
     };
-    set(PCB_UP, 0x09, 0);                   // VK_TAB
+    set(PCB_UP, 0x09, 0);                   // VK_TAB: Cycle HUD
     set(PCB_DOWN, 0, 0);
     set(PCB_LEFT, 0x25, 0);                 // VK_LEFT
     set(PCB_RIGHT, 0x27, 0);                // VK_RIGHT
-    set(PCB_CROSS, 0x26, 0);                // VK_UP
-    set(PCB_SQUARE, 0x28, 0);               // VK_DOWN
-    set(PCB_CIRCLE, 'H', 0);
-    set(PCB_TRIANGLE, 'C', 0);
-    set(PCB_L1, 'Q', 0);
-    set(PCB_R1, 0x20, 0);                   // VK_SPACE
-    set(PCB_L2, 'Z', 0);
-    set(PCB_R2, 'X', 0);
-    set(PCB_R3, 0xA0, 0);                   // VK_LSHIFT
+    set(PCB_CROSS, 0x26, 0);                // VK_UP: Accelerate
+    set(PCB_SQUARE, 0x28, 0);               // VK_DOWN: Brake / Reverse
+    set(PCB_CIRCLE, 'H', 0);                // Horn / Siren
+    set(PCB_TRIANGLE, 'C', 0);              // Change View
+    set(PCB_L1, 'B', 0);                    // Look Back
+    set(PCB_R1, 0x20, 0);                   // VK_SPACE: Handbrake
+    set(PCB_L2, 'Z', 0);                    // Shift Down
+    set(PCB_R2, 'X', 0);                    // Shift Up
+    set(PCB_R3, 0xA0, 0);                   // VK_LSHIFT: Speed Boost
     set(PCB_START, 0, 0);                   // Esc pauses, always
-    set(PCB_SELECT, 'R', 0);
-    key_zone[0][0] = 'F', key_zone[0][1] = 0;
-    key_zone[1][0] = 'G', key_zone[1][1] = 0;
+    set(PCB_SELECT, 'R', 0);                // Reset Car
+    key_zone[0][0] = '1', key_zone[0][1] = 0;       // Zone Freeze
+    key_zone[1][0] = '2', key_zone[1][1] = 0;       // Zone Zoom
+    key_zone[2][0] = '3', key_zone[2][1] = 0;       // Zone Slow Motion
 }
 
 // The DualShock 2's buttons where any pad has them: Cross is A, Square X, Circle B, Triangle Y, L1/R1 the bumpers, L2/R2 the triggers, R3 the right
@@ -108,8 +116,50 @@ static bool g_pad_layout_old;
 void PcConfig::default_pad()
 {
     memcpy(pad, kPadDefault, sizeof pad);
-    pad_deadzone = 24;
-    pad_steering = 100;
+    for (int p = 0; p < 2; p++) pad_dead[p] = 24, pad_steer[p] = 100, pad_vibration[p] = 100, pad_trigger_dead[p] = 0, pad_adaptive[p] = 1, pad_vibration_mode[p] = 1, pad_radio[p] = 1, pad_radio_volume[p] = 100;
+}
+
+// A player's own layout as it comes: the port's modern layout, I (the user, 2026-11-25: "take layout I as the default of
+// layout J, so that people change the controls starting from its like"; it was the game's layout A until then). And layout I
+// itself is made from this very function (pcplatform.cpp, custom::setup), so the two cannot come apart. What it is (the
+// user's choice of the two offered: "as in Forza", the D-pad for the zones and the HUD): the left stick steers and nothing
+// else does, the triggers are the pedals by how far they are pressed, the right stick is the camera, Cross the handbrake,
+// Square and Circle the gears down and up, Triangle the view, L1 looks back, R1 the horn, the right stick's press the boost,
+// Select puts the car back, the D-pad's Up the HUD and its Left and Right the zone cameras (a cop's helicopter and road
+// block). By PcButton, so by the buttons the player's pad has for them.
+void PcConfig::default_custom(int player)
+{
+    int *b = custom[player & 1];
+    for (int a = 0; a < PCC_COUNT; a++) b[a] = -1;
+    b[PCC_ACCEL] = PCB_R2, b[PCC_BRAKE] = PCB_L2, b[PCC_HANDBRAKE] = PCB_CROSS, b[PCC_BOOST] = PCB_R3;
+    b[PCC_SHIFT_DOWN] = PCB_SQUARE, b[PCC_SHIFT_UP] = PCB_CIRCLE, b[PCC_VIEW] = PCB_TRIANGLE, b[PCC_LOOK_BACK] = PCB_L1;
+    b[PCC_HORN] = PCB_R1, b[PCC_RESET] = PCB_SELECT, b[PCC_HUD] = PCB_UP;
+    b[PCC_ZONE_FREEZE] = PCB_LEFT, b[PCC_ZONE_ZOOM] = PCB_RIGHT;
+    custom_steer[player & 1] = 0;
+    custom_pedals_digital[player & 1] = 0;
+    custom_zone_buttons[player & 1] = 1;
+    custom_right_stick[player & 1] = 2;
+}
+
+static int clampi(int v, int lo, int hi);
+// hp2.ini's names of what a player's own layout gives buttons to
+static const char *const kCustomKeys[PCC_COUNT] = {"steer_left", "steer_right", "accelerate", "brake", "handbrake", "boost", "shift_up",
+                                                   "shift_down", "look_back", "view", "horn", "reset", "hud", "zone_freeze", "zone_zoom"};
+
+// custom1_accelerate=4 and the like: the PcButton's number (-1 none; 15 the left stick's press; Start, 13, is Pause and is not taken)
+static bool custom_key(const char *key, int n)
+{
+    if (strncmp(key, "custom", 6) || (key[6] != '1' && key[6] != '2') || key[7] != '_') return false;
+    const int p = key[6] - '1';
+    const char *what = key + 8;
+    if (!strcmp(what, "steering")) return g_cfg.custom_steer[p] = clampi(n, 0, 2), true;
+    if (!strcmp(what, "pedals")) return g_cfg.custom_pedals_digital[p] = n != 0, true;
+    if (!strcmp(what, "right_stick")) return g_cfg.custom_right_stick[p] = clampi(n, 0, 2), true;
+    if (!strcmp(what, "stick_pedals")) return true;     // (an older file's On / Off of the pedals on the right stick: right_stick now)
+    if (!strcmp(what, "zones")) return g_cfg.custom_zone_buttons[p] = n != 0, true;
+    for (int a = 0; a < PCC_COUNT; a++)
+        if (!strcmp(what, kCustomKeys[a])) return g_cfg.custom[p][a] = n >= 0 && n <= PC_CUSTOM_L3 && n != PCB_START ? n : -1, true;
+    return false;
 }
 
 // the menus: the arrows, Enter and Esc (window_pad), a key for each of the game's other menu buttons
@@ -183,6 +233,16 @@ const char *pc_pad_name(int mask)
     if (g_pad_playstation)
         for (auto &n : ps)
             if (mask & n.m) return n.n;
+    // A Nintendo pad (the user, 2026-11-25: "add Nintendo's buttons to the gamepad's detection; it must work as perfectly as
+    // Xbox and PS do", and, of an exchange of confirm and back that a build had for it: "by no means, the logic of the
+    // controls stays the same, only the matching buttons of the gamepad are to be shown"). So nothing but the letters: a
+    // mask's bits are places (P_A the bottom button, P_B the right one, P_X the left, P_Y the top), every pad does the same
+    // with the same place, and on a Nintendo pad those places are lettered B, A, Y and X.
+    static const struct { int m; const char *n; } nin[] = {
+        {P_A, "B"}, {P_B, "A"}, {P_X, "Y"}, {P_Y, "X"}, {P_LB, "L"}, {P_RB, "R"}, {P_LT, "ZL"}, {P_RT, "ZR"}, {P_BACK, "Minus"}, {P_START, "Plus"}};
+    if (g_pad_nintendo && !g_pad_playstation)
+        for (auto &n : nin)
+            if (mask & n.m) return n.n;
     for (auto &n : names)
         if (mask & n.m) return n.n;
     return "-";
@@ -211,6 +271,32 @@ static std::string ini_path()
 }
 
 static int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+// A wheel's own settings, each player's: wheel_force1, wheel_force2 and so on. The same name with no number is the file of
+// before 2026-11-25, when both wheels had one: it sets both.
+static bool wheel_key(const char *key, int n)
+{
+    const struct { const char *name; int *v; int lo, hi; } k[] = {
+        {"wheel_lock", g_cfg.wheel_lock, 40, 2520},     {"wheel_set_range", g_cfg.wheel_set_range, 0, 1},
+        {"wheel_force", g_cfg.wheel_force, 0, 200},     {"wheel_spring", g_cfg.wheel_spring, 0, 100},
+        {"wheel_damper", g_cfg.wheel_damper, 0, 100},   {"wheel_road", g_cfg.wheel_road, 0, 100},
+        {"wheel_crash", g_cfg.wheel_crash, 0, 100},     {"wheel_shake", g_cfg.wheel_shake, 0, 100},
+        {"wheel_invert", g_cfg.wheel_invert, 0, 1}};
+    for (const auto &e : k) {
+        const size_t len = strlen(e.name);
+        if (strncmp(key, e.name, len)) continue;
+        const char *tail = key + len;
+        if (!*tail) {
+            e.v[0] = e.v[1] = clampi(n, e.lo, e.hi);
+            return true;
+        }
+        if ((tail[0] == '1' || tail[0] == '2') && !tail[1]) {
+            e.v[tail[0] - '1'] = clampi(n, e.lo, e.hi);
+            return true;
+        }
+    }
+    return false;
+}
 
 // log=on, off (or 1, 0, yes, no); anything else is on
 static int log_value(const char *val)
@@ -246,15 +332,18 @@ static void write_controls(FILE *f)
 {
     fprintf(f, "[keyboard]       ; while driving: the virtual-key code of each action's key (0 = none)\n");
     fprintf(f, "controls=2\n");
+    fprintf(f, "actions=%d          ; 1 = a key is the game's action itself; 0 = the old way, a key presses a PS2 pad's button\n", g_cfg.key_actions);
     for (int b = 0; b < PCB_COUNT; b++) {
         std::string n = pc_button_name(b);
         for (char &ch : n) ch = (char)tolower((unsigned char)ch);
         fprintf(f, "key_%s=%d      ; %s | %s\n", n.c_str(), g_cfg.key[b][0], pc_button_action(b), pc_key_name(g_cfg.key[b][0]).c_str());
     }
+    fprintf(f, "mouse_direct=%d     ; menus: 1 = the pointer takes the row under it at once; 0 = the old way, a press at a time\n", g_cfg.mouse_direct);
     fprintf(f, "key_zone_freeze=%d      ; Zone Freeze; a cop's call for the helicopter\n", g_cfg.key_zone[0][0]);
     fprintf(f, "key_zone_zoom=%d      ; Zone Zoom; a cop's call for a road block\n", g_cfg.key_zone[1][0]);
+    fprintf(f, "key_zone_slomo=%d      ; Zone Slow Motion (with actions=1 only: no pad has a button for it)\n", g_cfg.key_zone[2][0]);
     fprintf(f, "\n[player2]\n");
-    fprintf(f, "player2=%d          ; 0 = the second gamepad, or half of the keyboard; 1 = the first gamepad, player 1 has the keyboard\n", g_cfg.player2);
+    fprintf(f, "player2_keyboard=%d ; what player 2 drives with: 0 = a gamepad (the second; the only one if there is one), 1 = the keyboard (the key2_ keys)\n", g_cfg.player2_keyboard);
     for (int b = 0; b < PCB_COUNT; b++) {
         std::string n = pc_button_name(b);
         for (char &ch : n) ch = (char)tolower((unsigned char)ch);
@@ -262,10 +351,32 @@ static void write_controls(FILE *f)
     }
     fprintf(f, "key2_zone_freeze=%d\n", g_cfg.key2_zone[0][0]);
     fprintf(f, "key2_zone_zoom=%d\n", g_cfg.key2_zone[1][0]);
+    fprintf(f, "key2_zone_slomo=%d\n", g_cfg.key2_zone[2][0]);
     fprintf(f, "\n[gamepad]        ; its buttons are the DualShock 2's where the pad has them; what each does is the game's layout (A to D)\n");
-    fprintf(f, "deadzone=%d         ; the left stick, percent\n", g_cfg.pad_deadzone);
-    fprintf(f, "steering=%d        ; percent, above 100 sharper near the center\n", g_cfg.pad_steering);
-    fprintf(f, "icons=%d            ; 0 by the pad, 1 Xbox, 2 PlayStation\n", g_cfg.pad_icons);
+    for (int p = 0; p < 2; p++) {           // each player's gamepad (the Controller screen's Calibration)
+        fprintf(f, "deadzone%d=%d        ; player %d's gamepad: the left stick's dead zone, percent\n", p + 1, g_cfg.pad_dead[p], p + 1);
+        fprintf(f, "steering%d=%d       ; its steering, percent: above 100 sharper near the center\n", p + 1, g_cfg.pad_steer[p]);
+        fprintf(f, "vibration%d=%d      ; its vibration's strength, percent: 0 = none\n", p + 1, g_cfg.pad_vibration[p]);
+        fprintf(f, "vibration_mode%d=%d ; 0 = as the game plays it, 1 = it follows the car at once and does not linger\n", p + 1, g_cfg.pad_vibration_mode[p]);
+        fprintf(f, "trigger_deadzone%d=%d ; its triggers' dead zone, percent\n", p + 1, g_cfg.pad_trigger_dead[p]);
+        fprintf(f, "radio_speaker%d=%d  ; 1 = the police radio plays from the gamepad's speaker (a DualSense or a DualShock 4 on a cable), 0 = from the speakers\n", p + 1, g_cfg.pad_radio[p]);
+        fprintf(f, "radio_volume%d=%d   ; how loud that speaker is, percent\n", p + 1, g_cfg.pad_radio_volume[p]);
+        fprintf(f, "adaptive_triggers%d=%d ; a DualSense's adaptive triggers: 1 = resistance under the throttle and the brake, 0 = none\n", p + 1, g_cfg.pad_adaptive[p]);
+    }
+    fprintf(f, "custom_defaults=2   ; (the port's own mark: which layout the two below started from)\n");
+    for (int p = 0; p < 2; p++) {           // each player's own layout (the Configuration screen's last one, Custom)
+        fprintf(f, "custom%d_steering=%d   ; player %d's own layout: 0 = the left stick steers, 1 = two buttons do, 2 = both\n", p + 1, g_cfg.custom_steer[p], p + 1);
+        fprintf(f, "custom%d_pedals=%d     ; 0 = the throttle and the brake are the two triggers, by how far each is pressed; 1 = any button, all or nothing\n", p + 1, g_cfg.custom_pedals_digital[p]);
+        fprintf(f, "custom%d_right_stick=%d ; the right stick: 0 = nothing, 1 = the pedals (up the throttle, down the brake), 2 = the camera, turned around the car\n", p + 1, g_cfg.custom_right_stick[p]);
+        fprintf(f, "custom%d_zones=%d      ; the zone cameras: 0 = Change View held and a gear's button, as in the game's layouts; 1 = a button each\n", p + 1, g_cfg.custom_zone_buttons[p]);
+        for (int a = 0; a < PCC_COUNT; a++) {
+            const int b = g_cfg.custom[p][a];
+            fprintf(f, "custom%d_%s=%d      ; %s\n", p + 1, kCustomKeys[a], b, b == PC_CUSTOM_L3 ? "L3" : b >= 0 && b < PCB_COUNT ? pc_button_name(b) : "-");
+        }
+    }
+    fprintf(f, "gamepad1=%s          ; player 1's gamepad: nothing = automatic (the first one plugged in), none, or a gamepad's name\n", g_cfg.pad_device[0]);
+    fprintf(f, "gamepad2=%s          ; player 2's: automatic is the next one plugged in\n", g_cfg.pad_device[1]);
+    fprintf(f, "icons=%d            ; 0 by the pad, 1 Xbox, 2 PlayStation, 3 Nintendo\n", g_cfg.pad_icons);
 }
 
 // the keys of the file, in the order they are written
@@ -292,8 +403,11 @@ void pc_config_save()
     fprintf(f, "aniso=%d            ; anisotropic filtering: 0 = off, 2, 4, 8, 16\n", g_cfg.aniso);
     fprintf(f, "dithering=%d        ; dithering against colour banding: 0 = off, 1 = on\n", g_cfg.deband);
     fprintf(f, "ambient_occlusion=%d ; soft shading where surfaces meet, in a race: 0 = off, 1 = on\n", g_cfg.ao);
-    fprintf(f, "ambient_occlusion_reach=%d    ; how far it reaches, centimetres (20 to 400)\n", g_cfg.ao_reach);
     fprintf(f, "ambient_occlusion_strength=%d ; how dark it is, percent (10 to 300)\n", g_cfg.ao_strength);
+    fprintf(f, "side_mirrors=%d     ; 1 = with Reflections at Advanced or High the mirrors of your own car show the rear-view mirror's picture (one player, with the HUD's mirror on); 0 = never\n", g_cfg.side_mirrors);
+    fprintf(f, "hud_smooth=%d       ; above 60 FPS: 1 = the HUD moves between the game's frames too, 0 = as the game draws it, 60 times a second\n", g_cfg.hud_smooth);
+    fprintf(f, "hud_steady=%d       ; on a wide picture: 1 = a part of the HUD that stands still keeps its place whatever passes by it, 0 = every part placed anew in each frame, as it was\n", g_cfg.hud_steady);
+    fprintf(f, "hud_anchors=%d      ; on a wide picture: 1 = each part of the HUD is put by the edge or the middle its place in the game's layout says, 0 = by what is drawn near it in each frame, as it was\n", g_cfg.hud_anchors);
     fprintf(f, "shadow_softness=%d  ; the shadows' soft edge at High and up, percent (25 to 200)\n", g_cfg.shadow_softness);
     fprintf(f, "monitor=%d          ; the screen the game is shown on: 0 = where the window is, 1 and up = that screen\n", g_cfg.monitor);
     fprintf(f, "; the graphics card that draws the game, by its name as Options, Graphics, Resolution, Select GPU lists it; empty: the game chooses\n");
@@ -310,12 +424,40 @@ void pc_config_save()
     fprintf(f, "show_fps=%d\n", g_cfg.show_fps);
     fprintf(f, "max_detail=%d       ; 1 = every object at its most detailed model, 0 = the PS2's levels of detail\n", g_cfg.max_detail);
     fprintf(f, "particles=%d        ; smoke, sparks, dust: 0 = original (drawn as the game draws them), 1 = advanced (the same particles with soft edges)\n", g_cfg.particles);
-    fprintf(f, "shadows=%d          ; the cars' shadows: 0 = the PS2's, 1 = high (the body's outline, lying on what is under it, in the mirror and far off too), 2 = maximum (finer), 3 = ultra (a test: finer again, 256 MB of the card's memory)\n", g_cfg.shadows);
+    fprintf(f, "shadows=%d          ; the cars' shadows: 0 = the PS2's, 1 = high (the body's outline, lying on what is under it, in the mirror and far off too), 2 = very high (finer, and the cars cast shadows from the tunnels' lamps; 80 MB of the card's memory), 3 = ultra (finer again; 320 MB)\n", g_cfg.shadows);
     fprintf(f, "reflections=%d      ; the cars' reflections: 0 = the PS2's, 1 = advanced (new every frame), 2 = high (new every frame, twice the resolution)\n", g_cfg.reflections);
     fprintf(f, "\n");
     fprintf(f, "log=%s             ; on = the game writes speed.log (4 MB at most: its first and its last 2 MB), off = it writes no log at all\n", g_cfg.log ? "on" : "off");
     fprintf(f, "[audio]\nvolume=%d           ; percent\n\n", g_cfg.volume);
     fprintf(f, "[extras]\ndebug_menu=%d       ; 1 = the developers' Debug item in the pause menu (Options > Extras > DEBUG.not.pretty)\n", g_cfg.debug_menu);
+    fprintf(f, "traffic_cars=%d     ; 1 = the mod \"Playable traffic cars\" by 379Felipe (Options > Extras > Playable Traffic Cars; the game restarts when it is switched there)\n", g_cfg.traffic_cars);
+    fprintf(f, "no_catchup=%d       ; 1 = no catch-up for the opponents in Quick Race and the career (Options > Extras > Disable Catchup)\n", g_cfg.no_catchup);
+    fprintf(f, "cinematic_replays=%d ; 1 = a replay with its controls hidden has no black bars either (Options > Extras > Cinematic Replays)\n", g_cfg.cinematic_replays);
+    fprintf(f, "slow_motion=%d      ; 1 = the Zone Slow Motion key works, and both sticks of a gamepad pressed together (Options > Extras > Slow Motion)\n", g_cfg.slow_motion);
+    fprintf(f, "wheel=%d            ; 1 = a steering wheel Windows has is the game's wheel (its own layout, calibration and force feedback), 0 = wheels are left alone\n", g_cfg.wheel);
+    fprintf(f, "wheel1=%s            ; player 1's wheel: nothing = automatic (the first one connected), none, or a wheel's name\n", g_cfg.wheel_device[0]);
+    fprintf(f, "wheel2=%s            ; player 2's: automatic is the next one connected\n", g_cfg.wheel_device[1]);
+    fprintf(f, "wheel_ffb1=%d       ; 1 = player 1's wheel takes the forces, 0 = it is left loose\n", g_cfg.wheel_ffb[0] ? 1 : 0);
+    fprintf(f, "wheel_ffb2=%d       ; the same for player 2's\n", g_cfg.wheel_ffb[1] ? 1 : 0);
+    fprintf(f, "wheel_range=%d    ; how far the wheel turns lock to lock, in degrees, as its software has it; a Logitech wheel with G HUB running says so itself, and this is for the others\n", g_cfg.wheel_range);
+    for (int p = 0; p < 2; p++) {           // each player's wheel (the wheels' screen, Advanced)
+        fprintf(f, "wheel_lock%d=%d    ; player %d's wheel: how many of the degrees it turns are the game's full lock: smaller steers quicker\n", p + 1, g_cfg.wheel_lock[p], p + 1);
+        fprintf(f, "wheel_set_range%d=%d ; 1 = a Logitech wheel is set to turn that many degrees in all while the game runs (G HUB must allow games to do so), 0 = it is left as G HUB has it\n", p + 1, g_cfg.wheel_set_range[p]);
+        fprintf(f, "wheel_force%d=%d   ; its force feedback, percent: 0 = none\n", p + 1, g_cfg.wheel_force[p]);
+        fprintf(f, "wheel_spring%d=%d  ; the centring spring, percent of what the game asks for (0 to 100)\n", p + 1, g_cfg.wheel_spring[p]);
+        fprintf(f, "wheel_damper%d=%d  ; the damper\n", p + 1, g_cfg.wheel_damper[p]);
+        fprintf(f, "wheel_road%d=%d    ; the road's surface\n", p + 1, g_cfg.wheel_road[p]);
+        fprintf(f, "wheel_crash%d=%d   ; a hit\n", p + 1, g_cfg.wheel_crash[p]);
+        fprintf(f, "wheel_shake%d=%d   ; the shake\n", p + 1, g_cfg.wheel_shake[p]);
+        fprintf(f, "wheel_invert%d=%d    ; 1 = it steers the other way\n", p + 1, g_cfg.wheel_invert[p]);
+    }
+    fprintf(f, "wheel_emulate=%d    ; 1 = with no wheel connected, a pretend one, to look at the game's wheel screens: Home and End turn it, Page Up is the throttle, Page Down the brake; 2 = a second one as well: 4 and 6 of the number pad, 8 and 5\n", g_cfg.wheel_emulate);
+    fprintf(f, "wheel_shared=%d     ; 1 = a player's wheel and gamepad both drive, whichever is in use; 0 = a connected wheel has its player to itself\n", g_cfg.wheel_shared ? 1 : 0);
+    fprintf(f, "wheel_gas=%d        ; the throttle's axis: 0 X, 1 Y, 2 Z, 3 Rx, 4 Ry, 5 Rz, 6 and 7 the sliders\n", g_cfg.wheel_gas);
+    fprintf(f, "wheel_brake=%d      ; the brake's axis\n", g_cfg.wheel_brake);
+    fprintf(f, "wheel_pedals_inverted=%d ; 1 = a pedal at rest is at the top of its axis (Logitech's pedals)\n", g_cfg.wheel_pedals_inverted);
+    fprintf(f, "speed_boost=%d      ; 1 = the speed boost in every car and every mode (Options > Extras > Speed Boost for All Cars)\n", g_cfg.boost_all);
+    fprintf(f, "no_intro=%d         ; 1 = the game starts without its opening films (Options > Extras > No Intro Movies)\n", g_cfg.no_intro);
     fprintf(f, "cheat_menu=%d       ; 1 = F8 in the menus opens the game's cheats (Options > Extras > Cheat Menu)\n", g_cfg.cheat_menu);
     fprintf(f, "cheats=");          // the entries of the game's table of codes that are on (recomp/docs/cheats.md has their numbers)
     for (int i = 0, n = 0; i < (int)sizeof g_cfg.cheats; i++)
@@ -333,6 +475,7 @@ static bool read_settings(const std::string &path, bool &old_controls)
     char line[256];
     old_controls = true;
     g_pad_layout_old = true;
+    int custom_defaults = 1;                // which layout the players' own started from, by the file (below, after the lines)
     while (fgets(line, sizeof line, f)) {
         if (char *c = strchr(line, ';')) *c = 0;
         char *eq = strchr(line, '=');
@@ -364,9 +507,12 @@ static bool read_settings(const std::string &path, bool &old_controls)
         else if (!strcmp(key, "aa_mode")) g_cfg.aa_mode = clampi(n, 0, 2);
         else if (!strcmp(key, "aa_level")) g_cfg.aa_level = n >= 4 ? 4 : 2;
         else if (!strcmp(key, "dithering")) g_cfg.deband = n != 0;
-        else if (!strcmp(key, "ambient_occlusion")) g_cfg.ao = n != 0;
-        else if (!strcmp(key, "ambient_occlusion_reach")) g_cfg.ao_reach = clampi(n, 20, 400);
+        else if (!strcmp(key, "ambient_occlusion")) g_cfg.ao = n != 0;     // (2 was High for a day)
         else if (!strcmp(key, "ambient_occlusion_strength")) g_cfg.ao_strength = clampi(n, 10, 300);
+        else if (!strcmp(key, "hud_smooth")) g_cfg.hud_smooth = n != 0;
+        else if (!strcmp(key, "hud_steady")) g_cfg.hud_steady = n != 0;
+        else if (!strcmp(key, "hud_anchors")) g_cfg.hud_anchors = n != 0;
+        else if (!strcmp(key, "side_mirrors")) g_cfg.side_mirrors = n != 0;
         else if (!strcmp(key, "shadow_softness")) g_cfg.shadow_softness = clampi(n, 25, 200);
         else if (!strcmp(key, "monitor")) g_cfg.monitor = clampi(n, 0, 16);
         else if (!strcmp(key, "gpu")) {
@@ -389,6 +535,28 @@ static bool read_settings(const std::string &path, bool &old_controls)
         else if (!strcmp(key, "volume")) g_cfg.volume = clampi(n, 0, 100);
         else if (!strcmp(key, "debug_menu")) g_cfg.debug_menu = n != 0;
         else if (!strcmp(key, "cheat_menu")) g_cfg.cheat_menu = n != 0;
+        else if (!strcmp(key, "no_intro")) g_cfg.no_intro = n != 0;
+        else if (!strcmp(key, "speed_boost")) g_cfg.boost_all = n != 0;
+        else if (!strcmp(key, "slow_motion")) g_cfg.slow_motion = n != 0;
+        else if (!strcmp(key, "wheel")) g_cfg.wheel = n != 0;
+        else if (!strcmp(key, "wheel1") || !strcmp(key, "wheel2")) {
+            char *to = g_cfg.wheel_device[key[5] - '1'];
+            snprintf(to, sizeof g_cfg.wheel_device[0], "%s", val);
+            for (char *e = to + strlen(to); e > to && (unsigned char)e[-1] <= ' '; *--e = 0) {}
+        }
+        else if (!strcmp(key, "wheel_ffb1") || !strcmp(key, "wheel_ffb2")) g_cfg.wheel_ffb[key[9] - '1'] = n != 0;
+        else if (!strcmp(key, "wheel_range")) g_cfg.wheel_range = clampi(n, 40, 2520);
+        else if (wheel_key(key, n)) {}
+        else if (!strcmp(key, "custom_defaults")) custom_defaults = n;
+        else if (custom_key(key, n)) {}
+        else if (!strcmp(key, "wheel_emulate")) g_cfg.wheel_emulate = clampi(n, 0, 2);
+        else if (!strcmp(key, "wheel_shared")) g_cfg.wheel_shared = n != 0;
+        else if (!strcmp(key, "wheel_gas")) g_cfg.wheel_gas = clampi(n, 0, 7);
+        else if (!strcmp(key, "wheel_brake")) g_cfg.wheel_brake = clampi(n, 0, 7);
+        else if (!strcmp(key, "wheel_pedals_inverted")) g_cfg.wheel_pedals_inverted = n != 0;
+        else if (!strcmp(key, "no_catchup")) g_cfg.no_catchup = n != 0;
+        else if (!strcmp(key, "cinematic_replays")) g_cfg.cinematic_replays = n != 0;
+        else if (!strcmp(key, "traffic_cars")) g_cfg.traffic_cars = n != 0;
         else if (!strcmp(key, "cheats")) {
             memset(g_cfg.cheats, 0, sizeof g_cfg.cheats);
             for (const char *at = val; at && *at;) {
@@ -398,10 +566,24 @@ static bool read_settings(const std::string &path, bool &old_controls)
                 if (at) at++;
             }
         }
-        else if (!strcmp(key, "deadzone")) g_cfg.pad_deadzone = clampi(n, 0, 50);
-        else if (!strcmp(key, "steering")) g_cfg.pad_steering = clampi(n, 50, 200);
-        else if (!strcmp(key, "icons")) g_cfg.pad_icons = clampi(n, 0, 2);
-        else if (!strcmp(key, "player2")) g_cfg.player2 = clampi(n, 0, 1);
+        // (deadzone and steering with no number are the files of before 2026-11-24: one for both players)
+        else if (!strcmp(key, "deadzone")) g_cfg.pad_dead[0] = g_cfg.pad_dead[1] = clampi(n, 0, 50);
+        else if (!strcmp(key, "steering")) g_cfg.pad_steer[0] = g_cfg.pad_steer[1] = clampi(n, 50, 200);
+        else if (!strcmp(key, "deadzone1") || !strcmp(key, "deadzone2")) g_cfg.pad_dead[key[8] - '1'] = clampi(n, 0, 50);
+        else if (!strcmp(key, "steering1") || !strcmp(key, "steering2")) g_cfg.pad_steer[key[8] - '1'] = clampi(n, 50, 200);
+        else if (!strcmp(key, "vibration1") || !strcmp(key, "vibration2")) g_cfg.pad_vibration[key[9] - '1'] = clampi(n, 0, 200);
+        else if (!strcmp(key, "vibration_mode1") || !strcmp(key, "vibration_mode2")) g_cfg.pad_vibration_mode[key[14] - '1'] = n != 0;
+        else if (!strcmp(key, "radio_speaker1") || !strcmp(key, "radio_speaker2")) g_cfg.pad_radio[key[13] - '1'] = n != 0;
+        else if (!strcmp(key, "radio_volume1") || !strcmp(key, "radio_volume2")) g_cfg.pad_radio_volume[key[12] - '1'] = clampi(n, 0, 100);
+        else if (!strcmp(key, "adaptive_triggers1") || !strcmp(key, "adaptive_triggers2")) g_cfg.pad_adaptive[key[17] - '1'] = n != 0;
+        else if (!strcmp(key, "trigger_deadzone1") || !strcmp(key, "trigger_deadzone2")) g_cfg.pad_trigger_dead[key[16] - '1'] = clampi(n, 0, 50);
+        else if (!strcmp(key, "icons")) g_cfg.pad_icons = clampi(n, 0, 3);
+        else if (!strcmp(key, "player2_keyboard")) g_cfg.player2_keyboard = clampi(n, 0, 1);
+        else if (!strcmp(key, "gamepad1") || !strcmp(key, "gamepad2")) {
+            char *to = g_cfg.pad_device[key[7] - '1'];
+            snprintf(to, sizeof g_cfg.pad_device[0], "%s", val);
+            for (char *e = to + strlen(to); e > to && (unsigned char)e[-1] <= ' '; *--e = 0) {}
+        }
         else if (!strcmp(key, "window")) sscanf(val, "%d,%d", &g_cfg.win_w, &g_cfg.win_h);
         else if (!strcmp(key, "fullscreen_size")) sscanf(val, "%d,%d", &g_cfg.fs_w, &g_cfg.fs_h);
         else if (!strcmp(key, "render_scale")) g_cfg.render_scale = clampi((n + 10) / 20 * 20, 20, 200);
@@ -409,6 +591,10 @@ static bool read_settings(const std::string &path, bool &old_controls)
         else if (!strcmp(key, "key_zone_zoom")) sscanf(val, "%d,%d", &g_cfg.key_zone[1][0], &g_cfg.key_zone[1][1]);
         else if (!strcmp(key, "key2_zone_freeze")) sscanf(val, "%d,%d", &g_cfg.key2_zone[0][0], &g_cfg.key2_zone[0][1]);
         else if (!strcmp(key, "key2_zone_zoom")) sscanf(val, "%d,%d", &g_cfg.key2_zone[1][0], &g_cfg.key2_zone[1][1]);
+        else if (!strcmp(key, "key_zone_slomo")) g_cfg.key_zone[2][0] = n;
+        else if (!strcmp(key, "key2_zone_slomo")) g_cfg.key2_zone[2][0] = 0;       // (a file of before: player 2 has no slow motion)
+        else if (!strcmp(key, "actions")) g_cfg.key_actions = n != 0;
+        else if (!strcmp(key, "mouse_direct")) g_cfg.mouse_direct = n != 0;
         else
             for (int b = 0; b < PCB_COUNT; b++) {
                 std::string name = pc_button_name(b);
@@ -431,6 +617,24 @@ static bool read_settings(const std::string &path, bool &old_controls)
         }
     // the gamepad's buttons are not the port's to move any more: the game's layouts say what each does
     memcpy(g_cfg.pad, kPadDefault, sizeof g_cfg.pad);
+    // A player's own layout as it came until 2026-11-25 was the game's layout A, and the file has it written out like any
+    // other. One that still is exactly that was never the player's doing: it becomes the layout as it comes now, the modern
+    // one (the user: "why is J not the same mapping as I? I wanted them the same by default"). Once: the file written after
+    // this says custom_defaults=2, and a layout A the player then makes by hand stays.
+    if (custom_defaults < 2)
+        for (int p = 0; p < 2; p++) {
+            static const int kWas[PCC_COUNT] = {PCB_LEFT, PCB_RIGHT, PCB_CROSS, PCB_SQUARE, PCB_R1, PCB_R3, PCB_R2, PCB_L2,
+                                                PCB_L1, PCB_TRIANGLE, PCB_CIRCLE, PCB_SELECT, PCB_UP, -1, -1};
+            if (!memcmp(g_cfg.custom[p], kWas, sizeof kWas) && g_cfg.custom_steer[p] == 2 && g_cfg.custom_pedals_digital[p] == 1 &&
+                g_cfg.custom_zone_buttons[p] == 0)
+                g_cfg.default_custom(p);
+        }
+    // A layout's analog pedals are the two triggers, one each (2026-11-25). A file of before that, or one written by hand, with
+    // other buttons for them: all or nothing, which is what those buttons gave.
+    for (int p = 0; p < 2; p++) {
+        const int gas = g_cfg.custom[p][PCC_ACCEL], brake = g_cfg.custom[p][PCC_BRAKE];
+        if (!((gas == PCB_R2 && brake == PCB_L2) || (gas == PCB_L2 && brake == PCB_R2))) g_cfg.custom_pedals_digital[p] = 1;
+    }
     return true;
 }
 

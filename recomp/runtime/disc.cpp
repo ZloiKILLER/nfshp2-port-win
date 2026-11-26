@@ -32,6 +32,7 @@ static const u32 FIRST_LSN = 1000;      // not the retail disc's places: nothing
 // a file of data/, in the built ZZDATA
 struct Part {
     std::string rel, host;
+    std::string own;                    // the disc's own file where a rebuilt disc has another: data/original/<rel>, of the same size
     u64 pos;
     u32 size;
     std::unique_ptr<std::atomic<bool>> seen;
@@ -47,6 +48,8 @@ struct Entry {
 static std::vector<Entry> g_entries;    // by lsn
 static std::vector<Part> g_parts;       // by pos
 static std::vector<u8> g_zdir;
+static std::atomic<bool> g_own;         // read those
+static bool g_has_own;
 static FILE *g_file_log;
 static std::chrono::steady_clock::time_point g_start;
 
@@ -118,6 +121,14 @@ static bool build_archive(const std::filesystem::path &data)
         Part p;
         p.rel = rel;
         p.host = host.string();
+        // The installer keeps the disc's own file beside a rebuilt disc's (install.cpp: the Russian disc's fonts). Only one of the
+        // same size takes its place, so the archive built here is the same either way and which one is read can be said later.
+        const fs::path own = data / "original" / fs::path(rel);
+        std::error_code none;
+        if (fs::is_regular_file(own, none)) {
+            if (fs::file_size(own, none) == size) p.own = own.string(), g_has_own = true;
+            else fprintf(stderr, "disc: data/original/%s is not the size of data/%s, left out\n", rel.c_str(), rel.c_str());
+        }
         p.pos = sector * SECTOR;
         p.size = (u32)size;
         p.seen = std::make_unique<std::atomic<bool>>(false);
@@ -145,7 +156,7 @@ static void read_parts(u64 pos, u32 bytes, u8 *dst)
     for (; it != g_parts.end() && it->pos < end; ++it) {
         const u64 from = std::max(pos, it->pos), to = std::min(end, it->pos + it->size);
         if (from >= to) continue;
-        read_host(it->host, from - it->pos, (u32)(to - from), dst + (from - pos));
+        read_host(g_own && !it->own.empty() ? it->own : it->host, from - it->pos, (u32)(to - from), dst + (from - pos));
         if (g_file_log && !it->seen->exchange(true)) {
             fprintf(g_file_log, "%7.1f %s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - g_start).count(), it->rel.c_str());
             fflush(g_file_log);
@@ -227,6 +238,9 @@ bool disc_open()
     return disc_find("\\NFSHP2\\ZDIR.BIN", f) && disc_find("\\NFSHP2\\ZZDATA.BIN", f) &&
            disc_find("\\NFSHP2\\IRX253\\STREAM.IRX", f);
 }
+
+bool disc_has_originals() { return g_has_own; }
+void disc_use_originals(bool on) { g_own = on; }
 
 bool disc_find(const std::string &path, DiscFile &out)
 {

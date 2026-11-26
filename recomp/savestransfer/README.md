@@ -1,168 +1,172 @@
-# savestransfer.exe — импорт сейвов PS2 в профили порта
+# savestransfer.exe — PS2 saves into the port's profiles
 
-PS2 Memcard Saves manager, версия 0.1 (своя, не версия игры; ресурс `savestransfer.rc`). Иконка: карта памяти PS2
-(чёрная 8 MB, рифление внизу) в `savestransfer.ico`, её рисует `make_icon.py` (Pillow, шрифт Arial) во всех размерах от 16 до 256,
-мелкие размеры упрощены. Надписи набраны обычным шрифтом, логотипы Sony и PlayStation не копируются.
+PS2 Memcard Saves manager, version 0.1 (its own, not the game's version; the resource `savestransfer.rc`). The icon: a PS2 memory card
+(a black 8 MB one, ridged at the bottom) in `savestransfer.ico`, drawn by `make_icon.py` (Pillow, the Arial font) in every size from 16 to
+256, the small sizes simplified. The lettering is set in an ordinary font; the Sony and PlayStation logos are not copied.
 
-Отдельная необязательная консольная программа. Кладётся рядом со `speed.exe`, игре она не нужна.
-Находит сейвы Hot Pursuit 2, показывает их и делает каждый выбранный сейв **новым** профилем:
-`saves/<имя>/save.dat` в папке игры. Это те же байты, что игра пишет на карту (`/BASLUS-20362HP2/BASLUS-20362HP2`,
-см. `work/memcard/README.md`).
+A separate, optional console program. It goes beside `speed.exe`; the game does not need it.
+It finds Hot Pursuit 2 saves, shows them and makes each save chosen a **new** profile:
+`saves/<name>/save.dat` in the game's folder. These are the same bytes the game writes to the card (`/BASLUS-20362HP2/BASLUS-20362HP2`,
+see `work/memcard/README.md`).
 
-## Что читает
+## What it reads
 
-| Источник | Как опознаётся |
+| Source | How it is recognised |
 |---|---|
-| Образ карты `.ps2` / `.mcd` (PCSX2, AetherSX2, NetherSX2…), с ECC и без | суперблок `Sony PS2 Memory Card Format` |
-| Папочная карта PCSX2 и папка самого сейва (`BASLUS-20362HP2\...`) | имя папки |
-| EMS / uLaunchELF `.psu` | три первые записи: каталог, `.`, `..` |
+| A card image `.ps2` / `.mcd` (PCSX2, AetherSX2, NetherSX2...), with ECC or without | the superblock `Sony PS2 Memory Card Format` |
+| A PCSX2 folder card, and the save's own folder (`BASLUS-20362HP2\...`) | the folder's name |
+| EMS / uLaunchELF `.psu` | the first three entries: the directory, `.`, `..` |
 | Max Drive `.max` (LZARI) | `Ps2PowerSave` |
 | CodeBreaker `.cbs` (RC4 + zlib) | `CFU\0` |
 
-Форматы взяты в том виде, как их читает mymc+ (github.com/thestr4ng3r/mymcplus). LZARI — это LZARI.C Окумуры, inflate —
-по puff.c, всё внутри одного `.cpp`.
+The formats are taken as mymc+ reads them (github.com/thestr4ng3r/mymcplus). LZARI is Okumura's LZARI.C, inflate follows puff.c, all of it
+inside one `.cpp`.
 
-Поддерживаемые диски те же, с которых ставится порт, и окно перечисляет их строкой под заголовком:
-- USA (SLUS-20362), каталог `BASLUS-20362HP2`;
-- Europe v1.00 и v2.00 (SLES-50731), каталог `BESLES-50731HP2` (у USA и Europe одна программа);
-- Asia (SLPM-65181), каталог `BISLPM-65181HP2`;
-- Korea (SLPM-67527), каталог `BKSLPM-67527HP2`.
+The discs supported are the ones the port installs from, and the window lists them in a line under its title:
+- USA (SLUS-20362), the directory `BASLUS-20362HP2`;
+- Europe v1.00 and v2.00 (SLES-50731), the directory `BESLES-50731HP2` (USA and Europe have one program);
+- Asia (SLPM-65181), the directory `BISLPM-65181HP2`;
+- Korea (SLPM-67527), the directory `BKSLPM-67527HP2`.
 
-У Asia и Korea другая компоновка той же программы (handoff.md, 2026-11-11), и коды карты у них свои: `BI` у Asia и `BK` у Korea.
-Это видно по конструктору `cDBFileSys` (`0x12dee0`), который собирает каталог из `.sdata` по адресу `0x32fdb0`, номера диска и `HP2`.
-До 2026-11-14 экспорт для Korea писал в `BISLPM-67527HP2`, и корейская игра такого сейва не видела. Сейвы Asia и Korea принимаются по
-тем же проверкам. Сейв должен весить 70880 байт (0x114e0, образ FrontendDatabase), и его первое слово должно равняться этой длине.
-Сейв прототипа (`...NFS6`, 70876 байт) и сейвы другой длины показываются с причиной и не импортируются.
+Asia and Korea have another link of the same program (handoff.md, 2026-11-11), and card codes of their own: `BI` for Asia and `BK` for
+Korea. This shows in the constructor of `cDBFileSys` (`0x12dee0`), which builds the directory from `.sdata` at `0x32fdb0`, the disc's
+number and `HP2`. Until 2026-11-14 the export for Korea wrote to `BISLPM-67527HP2`, and the Korean game did not see such a save. Asia and
+Korea saves are accepted by the same checks. A save must be 70880 bytes long (0x114e0, the FrontendDatabase image), and its first word
+must equal that length. The prototype's save (`...NFS6`, 70876 bytes) and saves of other lengths are shown with the reason and are not
+imported.
 
-Без аргументов программа смотрит `Documents\PCSX2\memcards`, папку карт из `inis\PCSX2.ini` / `PCSX2_ui.ini`
-(`[Folders] MemoryCards`) и свою собственную папку. Файлы можно перетащить на exe или в окно программы.
+With no arguments the program looks in `Documents\PCSX2\memcards`, in the cards' folder from `inis\PCSX2.ini` / `PCSX2_ui.ini`
+(`[Folders] MemoryCards`) and in its own folder. Files can be dropped on the exe or on the program's window.
 
-## Что она никогда не делает
+## What it never does
 
-- Не пишет в существующий профиль. Имя проверяется без учёта регистра, сама папка создаётся `create_directory`,
-  которая не трогает уже существующую папку, а `save.dat` открывается через `CREATE_NEW`. Если запись не удалась, удаляются
-  только файл и папка, созданные в этом же запуске.
-- Не трогает ничего другого в папке игры и не меняет файлы, из которых читает.
-- Имя `Player1` считается занятым, если лежит старый `saves/save.dat`: порт сделает из него Player1 при следующем запуске.
+- It does not write into an existing profile. The name is checked without regard to case, the folder itself is made by
+  `create_directory`, which does not touch a folder that exists already, and `save.dat` is opened with `CREATE_NEW`. If writing fails,
+  only the file and the folder made in that same run are removed.
+- It touches nothing else in the game's folder and does not change the files it reads from.
+- The name `Player1` counts as taken if an old `saves/save.dat` is there: the port makes Player1 of it on its next start.
 
-Правила имени совпадают с New Profile в игре (`pcsettings.cpp`): до 15 печатных ASCII-символов, пробелы и точки на конце
-отбрасываются. Дополнительно запрещено всё, чем не может называться папка Windows (`<>:"/\|?*`, CON, NUL, COM1…).
-Время сейва на карте (JST) становится временем изменения `save.dat`.
+The rules for the name are those of New Profile in the game (`pcsettings.cpp`): up to 15 printable ASCII characters, spaces and dots at
+the end are dropped. On top of that, everything a Windows folder cannot be called is refused (`<>:"/\|?*`, CON, NUL, COM1...).
+The save's time on the card (JST) becomes the modification time of `save.dat`.
 
-## Запуск
+## Running it
 
-Двойной щелчок открывает окно «Saves Manager»:
-- шапка в две строки: «NFS Hot Pursuit 2» и «PS2 Memory card game saves manager»; справа кнопки Help (описание, поддерживаемые
-  диски и форматы, пошаговое руководство) и About (название, версия, автор ZloiKILLER, 2026) с системными иконками;
-- ниже папка игры (кнопка Browse...);
-- слева таблица найденных сейвов: регион, время сейва, состояние и источник. Неподходящие показаны серым, причина и полный путь
-  видны в подсказке и в строке состояния;
-- справа профили игры;
-- внизу имя нового профиля и кнопка Import (её же нажимают Enter и двойной щелчок по строке).
+A double click opens the "Saves Manager" window:
+- a header of two lines, "NFS Hot Pursuit 2" and "PS2 Memory card game saves manager"; on the right the buttons Help (a description,
+  the discs and formats supported, a step-by-step guide) and About (the name, the version, the author ZloiKILLER, 2026) with the system's
+  icons;
+- below it the game's folder (the Browse... button);
+- on the left a table of the saves found: the region, the save's time, its state and its source. Those that do not fit are grey; the
+  reason and the full path show in the tooltip and in the status line;
+- on the right the game's profiles;
+- at the bottom the new profile's name and the Import button (Enter and a double click on a row press it too).
 
-Карты и файлы добавляются кнопками Add cards or files... и Add a folder..., а также перетаскиванием на окно или на exe.
-Refresh просматривает всё заново.
+Cards and files are added with the buttons Add cards or files... and Add a folder..., and by dropping them on the window or the exe.
+Refresh looks at everything again.
 
-Из командной строки окно не открывается, вывод идёт в консоль или в канал (для скриптов и теста):
-
-```
-savestransfer [файлы карт или сейвов, папки...] --list [--game <папка игры>]
-savestransfer [файлы...] --import <n> --name <профиль> [--game <папка игры>]
-```
-
-Папка игры по умолчанию: своя папка, затем `HKCU\Software\NFSHP2Port\InstallDir` (setup.cpp); если не нашлась, окно просит
-выбрать её.
-
-Для проверки:
-- `SAVESTRANSFER_SHOT=<файл.bmp>` рисует окно в картинку и закрывает его;
-- `SAVESTRANSFER_SHOT_OF=help|about` снимает вместо главного окна Help или About;
-- `SAVESTRANSFER_SHOT_SIZE=<w>x<h>` перед снимком меняет размер окна (так видно, что после сужения не остаётся мусора);
-- `SAVESTRANSFER_NAME` заранее вписывает имя.
-
-## Экспорт обратно на карту
-
-В окне выбираешь профиль в правом списке и нажимаешь Export to a card or file... (или двойной щелчок по профилю). Дальше
-выбираешь диск, для которого карта, и куда писать:
-- в образ карты `.ps2` / `.mcd`;
-- в папочную карту PCSX2 или любую папку;
-- в файл `.psu`, `.max` или `.cbs`.
-
-На карту попадает то же, что пишет сама игра: каталог диска (`BASLUS-20362HP2`, `BESLES-50731HP2`, `BISLPM-65181HP2`,
-`BKSLPM-67527HP2`), а в нём сейв (`save.dat` профиля), `icon.sys` и `nfs6.ico`.
-- `icon.sys` собирается кодом с теми же значениями, что ставит игра (заголовок «ＮＦＳ：ＨＰ２», фон, три источника света). Он
-  совпадает побайтно с тем, что игра записала на карту PCSX2.
-- Иконка `nfs6.ico` берётся из `data/NFS6.ICO` папки игры (это тот же файл, что игра пишет на карту), поэтому данных игры в exe нет.
-- Имя профиля остаётся только в порте.
-
-Запись в образ карты:
-- в памяти выделяются кластеры по FAT;
-- каталог сейва встаёт в первую удалённую запись корня или в конец корня, при необходимости корень удлиняется на кластер;
-- записи `.` и `..` заполняются как у игры (у `.` кластер корня и номер записи в корне, у `..` время корня), режимы 0x8427 и 0x8497;
-- ECC пересчитывается для каждой записанной страницы, по 3 байта на каждые 128 байт, как в mymc+. Алгоритм сверен с 655 страницами
-  настоящей карты PCSX2;
-- новый образ читается заново, и только если сейв в нём цел, рядом кладётся копия старой карты `.bak` (`.bak2`…), а новый образ
-  встаёт на место.
-
-Отказы, при которых ничего не пишется:
-- места не хватает;
-- выбранный файл не карта;
-- у профиля ещё нет сейва.
-
-**Перезапись.** Если в каталоге этого диска на карте уже есть сейв, окно спрашивает, писать ли поверх, и показывает время старого
-сейва. Из командной строки перезапись идёт только с `--overwrite`. В образе карты старый сейв удаляется, а новый пишется одной
-записью: копия `.bak` одна, кластеры не теряются. В папочной карте старая папка уходит в Корзину.
-
-Если запущен PCSX2, окно предупреждает и спрашивает, писать ли всё равно. Файлы `.psu`, `.max` и `.cbs` из окна перезаписываются
-только после вопроса Windows, из командной строки не перезаписываются никогда. `.max` сжимается LZARI-кодером по LZARI.C Окумуры,
-`.cbs` — это zlib из несжатых блоков под RC4; заголовок `.cbs` длиной 0x128 устроен так, как его читает mymc+.
-
-## Удаление сейва с карты
-
-Выбираешь сейв в таблице, нажимаешь Delete from card... и подтверждаешь. В вопросе видно, что это за сейв, его время, карта и точное
-имя копии.
-- **Образ карты:** удаление идёт так же, как у драйвера карты PS2 (mcman). Кластеры файлов и каталога освобождаются в FAT, а запись
-  в корне остаётся с выключенным битом «существует», и следующий сейв займёт её. Корень не укорачивается. Потом ECC, повторное чтение
-  и копия `.bak`, как при экспорте.
-- **Папочная карта или папка сейва:** папка уходит в Корзину, из неё её можно вернуть.
-- **Сейвы из файлов `.psu`, `.max`, `.cbs`** здесь не удаляются: такой файл и есть сейв.
-
-Удалять можно и неподходящие сейвы, например прототипный `NFS6`.
+From the command line no window opens; the output goes to the console or to a pipe (for scripts and the test):
 
 ```
-savestransfer --export <профиль> --to <образ карты | папка | файл.psu/.max/.cbs> [--disc usa|europe|asia|korea] [--overwrite] [--game <папка игры>]
-savestransfer --delete <каталог сейва, например BASLUS-20362HP2> --from <образ карты | папочная карта>
+savestransfer [card or save files, folders...] --list [--game <game folder>]
+savestransfer [files...] --import <n> --name <profile> [--game <game folder>]
 ```
 
-## Проверка
+The game's folder by default: the program's own folder, then `HKCU\Software\NFSHP2Port\InstallDir` (setup.cpp); if none is found, the
+window asks for it.
+
+For checks:
+- `SAVESTRANSFER_SHOT=<file.bmp>` draws the window into a picture and closes it;
+- `SAVESTRANSFER_SHOT_OF=help|about` takes Help or About in place of the main window;
+- `SAVESTRANSFER_SHOT_SIZE=<w>x<h>` resizes the window before the shot (so it shows that nothing is left behind after it narrows);
+- `SAVESTRANSFER_NAME` fills in the name beforehand.
+
+## Export back to a card
+
+In the window, choose a profile in the list on the right and press Export to a card or file... (or double-click the profile). Then
+choose the disc the card is for, and where to write:
+- into a card image `.ps2` / `.mcd`;
+- into a PCSX2 folder card or any folder;
+- into a file `.psu`, `.max` or `.cbs`.
+
+The card gets what the game itself writes: the disc's directory (`BASLUS-20362HP2`, `BESLES-50731HP2`, `BISLPM-65181HP2`,
+`BKSLPM-67527HP2`), and in it the save (the profile's `save.dat`), `icon.sys` and `nfs6.ico`.
+- `icon.sys` is built by code with the same values the game sets (the title "ＮＦＳ：ＨＰ２", the background, three light sources).
+  It matches, byte for byte, what the game wrote to a PCSX2 card.
+- The icon `nfs6.ico` is taken from `data/NFS6.ICO` of the game's folder (the same file the game writes to the card), so the exe holds
+  none of the game's data.
+- The profile's name stays in the port only.
+
+Writing into a card image:
+- clusters are allocated in memory by the FAT;
+- the save's directory takes the root's first deleted entry or goes at the root's end; if need be the root grows by a cluster;
+- the entries `.` and `..` are filled in as the game does (`.` has the root's cluster and the entry's number in the root, `..` the root's
+  time), modes 0x8427 and 0x8497;
+- the ECC is computed again for each page written, 3 bytes for every 128 bytes, as in mymc+. The algorithm was checked against 655 pages
+  of a real PCSX2 card;
+- the new image is read back, and only if the save in it is whole is a copy of the old card put beside it as `.bak` (`.bak2`...), and
+  the new image takes its place.
+
+Refusals, with nothing written:
+- there is not enough room;
+- the file chosen is not a card;
+- the profile has no save yet.
+
+**Overwriting.** If the card already has a save in this disc's directory, the window asks whether to write over it and shows the old
+save's time. From the command line it is overwritten only with `--overwrite`. In a card image the old save is deleted and the new one is
+written in one go: one `.bak` copy, no clusters lost. In a folder card the old folder goes to the Recycle Bin.
+
+If PCSX2 is running, the window warns and asks whether to write all the same. The files `.psu`, `.max` and `.cbs` are overwritten from the
+window only after Windows' question, and never from the command line. `.max` is compressed by an LZARI coder after Okumura's LZARI.C,
+`.cbs` is zlib of stored blocks under RC4; the `.cbs` header, 0x128 long, is laid out as mymc+ reads it.
+
+## Deleting a save from a card
+
+Choose the save in the table, press Delete from card... and confirm. The question shows which save it is, its time, the card and the exact
+name of the copy.
+- **A card image:** the deletion goes as with the PS2's card driver (mcman). The clusters of the files and the directory are freed in the
+  FAT, and the entry in the root stays with its "exists" bit off; the next save takes it. The root is not shortened. Then the ECC, the
+  read back and the `.bak` copy, as for an export.
+- **A folder card or a save's folder:** the folder goes to the Recycle Bin, and can be brought back from there.
+- **Saves from `.psu`, `.max`, `.cbs` files** are not deleted here: such a file is the save.
+
+Saves that do not fit can be deleted too, the prototype's `NFS6`, for example.
 
 ```
-python recomp/savestransfer/test_savestransfer.py recompwin/saves/Player1/save.dat [--card <настоящий .ps2>]
-python recomp/savestransfer/test_export.py recompwin/saves/Player1/save.dat recompwin/data/NFS6.ICO [--card <настоящий .ps2>] [--icon-sys <icon.sys игры>]
+savestransfer --export <profile> --to <card image | folder | file.psu/.max/.cbs> [--disc usa|europe|asia|korea] [--overwrite] [--game <game folder>]
+savestransfer --delete <the save's directory, BASLUS-20362HP2 for example> --from <card image | folder card>
 ```
 
-`test_export.py` проверяет каждый экспорт собственными читателями, а не кодом программы:
-- карту: разбор файловой системы, ECC каждой изменённой страницы и целостность FAT (каждый занятый кластер ровно в одной цепочке,
-  ничего не потеряно);
-- `.max`: свой декодер LZARI и CRC;
+## Checks
+
+```
+python recomp/savestransfer/test_savestransfer.py recompwin/saves/Player1/save.dat [--card <a real .ps2>]
+python recomp/savestransfer/test_export.py recompwin/saves/Player1/save.dat recompwin/data/NFS6.ICO [--card <a real .ps2>] [--icon-sys <the game's icon.sys>]
+```
+
+`test_export.py` checks every export with readers of its own, not with the program's code:
+- a card: the file system taken apart, the ECC of every changed page and the FAT's integrity (every cluster in use in exactly one chain,
+  nothing lost);
+- `.max`: its own LZARI decoder and the CRC;
 - `.cbs`: zlib.
 
-Затем каждый экспорт импортируется обратно и должен дать тот же сейв. Тест проверяет и отказы: повторный экспорт, полная карта,
-профиль без сейва, файл, который не карта. Настоящая карта, переданная через `--card`, сначала копируется, и запись идёт в копию.
+Then every export is imported back and must give the same save. The test checks the refusals as well: a second export, a full card, a
+profile with no save, a file that is not a card. A real card given with `--card` is copied first, and the writing goes into the copy.
 
-`make_test_saves.py` независимо собирает из настоящего `save.dat` все форматы: карту с ECC и без, цепочки кластеров в
-обратном порядке, папочную карту, `.psu`, `.max` своим LZARI-кодером, `.cbs` с перестановкой RC4 из mymc+ (`cbs_rc4.txt`,
-тест сверяет её с таблицей в `.cpp`), а также сейвы, которые должны быть отвергнуты. Тест импортирует каждый формат, сравнивает байты
-и время и проверяет, что занятые и плохие имена ничего не меняют в `saves/`.
+`make_test_saves.py` builds every format from a real `save.dat` on its own: a card with ECC and without, cluster chains in reverse order,
+a folder card, `.psu`, `.max` with its own LZARI coder, `.cbs` with the RC4 permutation from mymc+ (`cbs_rc4.txt`; the test checks it
+against the table in the `.cpp`), and saves that must be refused. The test imports each format, compares the bytes and the time, and
+checks that taken and bad names change nothing in `saves/`.
 
-На 2026-11-14 проверено: все форматы и отказы, реальные карты PCSX2 этой машины (прототипный сейв отвергнут, пустая карта названа
-пустой), окно (импорт кнопкой; то же имя в другом регистре отклонено, сейв не тронут), 360 испорченных файлов без падений и зависаний. **Не проверено:** настоящие `.max` и `.cbs`, сделанные
-Max Drive / CodeBreaker (под рукой нет ни одного; кодировщики теста написаны по тем же описаниям). Импорт с карты PCSX2
-проверен в игре.
+Checked as of 2026-11-14: all the formats and refusals, the real PCSX2 cards of this machine (the prototype's save refused, an empty card
+called empty), the window (import by the button; the same name in another case refused, the save untouched), 360 damaged files with no
+crash or hang. **Not checked:** real `.max` and `.cbs` files made by Max Drive / CodeBreaker (there is none at hand; the test's coders are
+written from the same descriptions). Import from a PCSX2 card has been checked in the game.
 
-Экспорт проверен на 2026-11-14 так:
-- `test_export.py` пройден целиком, в том числе на копии настоящей карты PCSX2: USA-сейв на ней есть, поэтому USA отказано, а
-  Europe записан рядом; ECC и FAT целы, прежние сейвы на месте;
-- `icon.sys` совпадает побайтно с игровым.
+Export was checked as of 2026-11-14 like this:
+- `test_export.py` passed in full, on a copy of a real PCSX2 card too: it has a USA save, so USA was refused and Europe written beside it;
+  the ECC and the FAT are whole, the saves that were there are in place;
+- `icon.sys` matches the game's byte for byte.
 
-**Не проверено:** загрузка экспортированной карты в PCSX2 и в самой игре на PS2, а также чтение `.max` и `.cbs` настоящими Max Drive и
-CodeBreaker.
+**Not checked:** loading the exported card in PCSX2 and in the game itself on a PS2, and reading `.max` and `.cbs` with a real Max Drive
+and CodeBreaker.

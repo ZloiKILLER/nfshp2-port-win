@@ -686,6 +686,55 @@ std::string cp1252_utf8(const std::string &s)
     return o;
 }
 
+// The Russian disc's table (FE_ENGLISH of the user's NFS-HP2rus.iso): its font has the Cyrillic letters at their Windows-1251
+// codes, 0xC0..0xFF, and the texts take a Latin letter wherever one looks the same ("Bы пoлицeйcкий": B, o, e, c are Latin).
+// Told by its letters: most of them are from 0xC0 up; in the other languages the accented ones are a few in a hundred.
+bool cyrillic_table(const std::vector<uint8_t> &pool)
+{
+    size_t high = 0, letters = 0;
+    for (uint8_t c : pool) {
+        if (c >= 0xC0) high++, letters++;
+        else if ((c | 0x20) >= 'a' && (c | 0x20) <= 'z') letters++;
+    }
+    return letters > 1000 && high * 4 > letters;
+}
+
+// Such a text as Russian reads: the Cyrillic codes as their letters, and in a word that has no Latin letter but the look-alike
+// ones, those as the Cyrillic they stand for. (The port's own way back, pclang.cpp, writes the same bytes again.) The bytes
+// under 0xC0 as in the other languages' tables: the button icons are there.
+std::string cyrillic_utf8(const std::string &s)
+{
+    static const char *const kLatin = "ABEKMHOPCTXaeopcx";
+    static const uint16_t kCyr[17] = {0x410, 0x412, 0x415, 0x41A, 0x41C, 0x41D, 0x41E, 0x420, 0x421,
+                                      0x422, 0x425, 0x430, 0x435, 0x43E, 0x440, 0x441, 0x445};
+    auto put = [](std::string &o, uint32_t cp) { o += (char)(0xC0 | cp >> 6), o += (char)(0x80 | (cp & 0x3F)); };
+    auto letter = [](unsigned char c) { return c >= 0xC0 || ((c | 0x20) >= 'a' && (c | 0x20) <= 'z'); };
+    bool any = false;
+    for (unsigned char c : s) any |= c >= 0xC0;
+    std::string o;
+    for (size_t i = 0; i < s.size();) {
+        size_t e = i;
+        bool alike = any;
+        while (e < s.size() && letter((unsigned char)s[e])) {
+            if ((unsigned char)s[e] < 0xC0 && !strchr(kLatin, s[e])) alike = false;
+            e++;
+        }
+        if (e == i) {
+            o += cp1252_utf8(s.substr(i, 1));
+            i++;
+            continue;
+        }
+        for (; i < e; i++) {
+            const unsigned char c = (unsigned char)s[i];
+            const char *at = c < 0xC0 && alike ? strchr(kLatin, (char)c) : nullptr;
+            if (c >= 0xC0) put(o, 0x410 + (c - 0xC0));
+            else if (at) put(o, kCyr[at - kLatin]);
+            else o += (char)c;
+        }
+    }
+    return o;
+}
+
 std::string escape_text(const std::string &u)
 {
     std::string o;
@@ -706,6 +755,7 @@ bool read_table(const fs::path &path, std::map<int32_t, std::string> &out)
     const uint32_t num_hash = rd32(b, 84), num_id = rd32(b, 88), text_size = rd32(b, 92);
     const size_t ids = 108 + 8 * (size_t)num_hash, pool = ids + 8 * (size_t)num_id;
     std::vector<uint8_t> text = slice(b, pool, text_size);
+    const bool cyrillic = cyrillic_table(text);
     for (uint32_t i = 0; i < num_id; i++) {
         if (ids + i * 8 + 8 > b.size()) return false;
         int32_t key = (int32_t)rd32(b, ids + i * 8);
@@ -716,7 +766,7 @@ bool read_table(const fs::path &path, std::map<int32_t, std::string> &out)
             while (e < text.size() && text[e]) e++;
             s.assign((const char *)&text[off], e - off);
         }
-        out[key] = escape_text(cp1252_utf8(s));
+        out[key] = escape_text(cyrillic ? cyrillic_utf8(s) : cp1252_utf8(s));
     }
     return true;
 }
@@ -771,6 +821,7 @@ bool write_port_files(const fs::path &root)
     } kFiles[] = {
         {L"LANG_ENGLISH", L"data\\lang\\ENGLISH.txt"}, {L"LANG_FRENCH", L"data\\lang\\FRENCH.txt"},   {L"LANG_GERMAN", L"data\\lang\\GERMAN.txt"},
         {L"LANG_ITALIAN", L"data\\lang\\ITALIAN.txt"}, {L"LANG_SPANISH", L"data\\lang\\SPANISH.txt"}, {L"LANG_SWEDISH", L"data\\lang\\SWEDISH.txt"},
+        {L"LANG_RUSSIAN_DISC", L"data\\lang\\RUSSIAN_DISC.txt"},
         {L"UI_CURSOR", L"data\\ui\\cursor.cur"},       {L"README", L"README.txt"},
     };
     for (auto &f : kFiles) {
@@ -883,12 +934,16 @@ bool install_game(Iso &iso, const std::wstring &root_dir, InstallSteps &steps)
     struct Entry {
         uint32_t hash, at, size;
     };
+    // Each file is read from the place its own entry gives. The discs as pressed have them one after another in ZDIR's order, and
+    // that used to be asked of every image; a disc built anew does not keep it. The Russian one (the USA disc with its texts,
+    // fonts and English speech replaced: the user's NFS-HP2rus.iso, 2026-11-24; the same program to the bit) has GLOBALB and
+    // FRONTB put in again unpacked, somewhere else, and the entry of each one's .LZC name and of its .BUN name at the same
+    // place. Plain bytes under an .LZC name are written as they are (below), as the game itself takes them.
     std::vector<Entry> entries;
-    uint64_t lba = 0, total = 0;
+    uint64_t total = 0;
     for (size_t i = 0; i + 12 <= zdir.size(); i += 12) {
         Entry e = {rd32(zdir, i), rd32(zdir, i + 4), rd32(zdir, i + 8)};
-        if (e.at != lba) return steps.why = "The archive on the disc is not laid out as the port expects.", false;
-        lba += (e.size + SECTOR - 1) / SECTOR;
+        if ((uint64_t)e.at * SECTOR + e.size > (uint64_t)zz->size) return steps.why = "The archive on the disc is not laid out as the port expects.", false;
         total += e.size;
         entries.push_back(e);
     }
@@ -902,6 +957,11 @@ bool install_game(Iso &iso, const std::wstring &root_dir, InstallSteps &steps)
     std::vector<std::string> paths;
     std::vector<uint8_t> buf;
     uint64_t written = 0;
+    struct Kept {
+        std::string rel;
+        bool rebuilt = false, twin = false;     // rebuilt: plain bytes under an .LZC name
+    };
+    std::vector<Kept> kept(entries.size());
     for (const Entry &e : entries) {
         if (stopped(steps)) return steps.why = "Cancelled.", false;
         // PAL.TAG, the European discs' one file more (empty): InitDisplaySystem 0x1007b8 sets the PAL video mode when it exists, the
@@ -911,6 +971,10 @@ bool install_game(Iso &iso, const std::wstring &root_dir, InstallSteps &steps)
         if (!head.empty() && !iso.read_file(*zz, (uint64_t)e.at * SECTOR, head.data(), head.size())) return steps.why = "The disc image cannot be read.", false;
         bool packed, twin;
         const std::string rel = place(e.hash, names, all_names, head, &packed, &twin);
+        Kept &k = kept[(size_t)(&e - entries.data())];
+        k.rel = rel;
+        k.twin = twin;
+        k.rebuilt = packed && !(head.size() >= 4 && !memcmp(head.data(), "COMP", 4));
         steps.progress((int)(990 * written / std::max<uint64_t>(total, 1)), L"Unpacking " + latin1_w(rel));
         if (!twin) {
             buf.resize(e.size);
@@ -925,6 +989,45 @@ bool install_game(Iso &iso, const std::wstring &root_dir, InstallSteps &steps)
         written += e.size;
         index += hex8(e.hash) + " " + rel + "\n";
         paths.push_back(rel);
+    }
+    // A disc built anew with files of its own in place of the disc's (the Russian one: GLOBALB and FRONTB, the fonts and the menus'
+    // textures with Cyrillic where the accented letters were). Where the image still has the disc's own file, it is kept as well, in
+    // data\original\: with it the other languages get their letters back (disc.cpp reads it in place of the new one, pclang.cpp
+    // says when). Two places it is found in, both seen on that image: the plain twin of the .LZC name, left where it was (GLOBALB);
+    // and the packed file itself, no entry pointing at it any more, lying where the files before it in ZDIR's order end (FRONTB).
+    {
+        auto sectors = [](uint64_t bytes) { return (bytes + SECTOR - 1) / SECTOR; };
+        const uint64_t zz_size = (uint64_t)zz->size;
+        uint64_t lba = 0;
+        for (size_t k = 0; k < entries.size(); k++) {
+            const Entry &e = entries[k];
+            if (!kept[k].rebuilt) {
+                if (e.at >= lba) lba = e.at + sectors(e.size);
+                continue;
+            }
+            std::vector<uint8_t> own, packed;
+            uint8_t head[16];
+            if (e.at != lba && lba * SECTOR + 16 <= zz_size && iso.read_file(*zz, lba * SECTOR, head, 16) && !memcmp(head, "COMP", 4)) {
+                const uint64_t total = (uint32_t)head[12] | (uint32_t)head[13] << 8 | (uint32_t)head[14] << 16 | (uint32_t)head[15] << 24;
+                if (total >= 16 && total <= (256u << 20) && lba * SECTOR + total <= zz_size) {
+                    packed.resize((size_t)total);
+                    if (iso.read_file(*zz, lba * SECTOR, packed.data(), packed.size()) && lz_decompress(packed, own)) lba += sectors(total);
+                    else own.clear();
+                }
+            } else if (e.at == lba) {
+                lba = e.at + sectors(e.size);
+            }
+            for (size_t j = 0; own.empty() && j < entries.size(); j++)
+                if (kept[j].twin && kept[j].rel == kept[k].rel && entries[j].at != e.at && entries[j].size) {
+                    own.resize(entries[j].size);
+                    if (!iso.read_file(*zz, (uint64_t)entries[j].at * SECTOR, own.data(), own.size())) own.clear();
+                }
+            if (own.empty()) continue;
+            buf.resize(e.size);
+            if (e.size && !iso.read_file(*zz, (uint64_t)e.at * SECTOR, buf.data(), buf.size())) return steps.why = "The disc image cannot be read.", false;
+            if (own == buf) continue;
+            if (!write_file(under(data / L"original", kept[k].rel), own.data(), own.size())) return steps.why = "The folder cannot be written (free space?).", false;
+        }
     }
     if (!write_file(data / L"index.txt", index.data(), index.size())) return steps.why = "The folder cannot be written.", false;
     if (!write_port_files(root)) return steps.why = "The port's own files could not be written.", false;

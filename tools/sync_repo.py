@@ -28,6 +28,8 @@ LIST = [
     ("tools/recomp/gen_iop.py", None),
     ("tools/recomp/r5900.py", None),
     ("tools/recomp/make_lang.py", None),
+    ("tools/recomp/lang_ru.py", None),             # the Russian disc's strings, which make_lang.py takes in
+    ("tools/recomp/make_traffic_patch.py", None),
     ("tools/recomp/check_lang.py", None),
     ("tools/recomp/make_cursor.py", None),
     ("tools/recomp/make_disc_patch.py", None),

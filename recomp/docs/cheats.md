@@ -2,12 +2,17 @@
 
 The game's own table, read from the program (`EasterEggs`, the table at 0x31d828: 78 entries of 56 bytes). An entry is eight buttons
 (the events 0x85 to 0x8c: L1, L2, R1, R2, Left, Right, Square, Triangle, read by `EasterEggs::JoyHandler`, 0x24f748, in the menus),
-its kind (+32), the number of what it opens (+36), a parameter of the speech played when it is entered (+40) and the text shown then
-(+44, a LanguageID). `IsCarUnlocked`, `IsTrackUnlocked` and `IsEasterEggUnlocked` ask the table.
+its kind (+32), the number of what it opens (+36), its group (+40) and the text shown when it is entered (+44, a LanguageID).
+Entering a code first turns off every entry of the same group that is not 0: the five effects of group 1 are one at a time. `IsCarUnlocked`, `IsTrackUnlocked` and `IsEasterEggUnlocked` ask the table.
 
 The port's Cheat Menu (Options > Extras > Cheat Menu, then F8 in the menus) switches these entries on and off, as typing the code does.
 
-| # | Kind | What | Code | +40 set |
+As a track is loaded the game takes one render mode, by the first of these that is on: Motion Blur, Black & White, Heavy Fog, R/C Car,
+Video Mode (the mode of Black & White, with an overlay of its own in the HUD), Chrome Cars. Chrome Cars is in no group, but it is the
+last of them: with any of the five on it does not show. So the Cheat Menu has these six as one choice. Pet Helicopter, the two bonus
+events, the cars and the tracks are each on their own.
+
+| # | Kind | What | Code | Group 1 |
 |---|---|---|---|---|
 | 0 | Easter egg | Motion Blur | L2, L1, R1, Square, R1, R1, R1, L1 | yes |
 | 1 | Easter egg | Black & White | R1, L1, Left, Triangle, Left, Left, Left, L1 | yes |

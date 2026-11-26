@@ -31,6 +31,20 @@ Tracks a code opens.	Banor som en kod låser upp.
 All	Alla
 Every one in this list, on or off.	Alla i den här listan, på eller av.
 Some	Några
+One of these effects at a time.	En av dessa effekter åt gången.
+Opens this car in the car lists.	Låser upp den här bilen i listorna.
+Opens this police car for You're The Cop.	Låser upp den här polisbilen för polisläget.
+Opens this track in the track lists.	Låser upp den här banan i listorna.
+Opens this track driven the other way.	Låser upp den här banan åt andra hållet.
+A blur of speed over the whole picture.	En fartoskärpa över hela bilden.
+The race in black and white.	Loppet i svartvitt.
+Thick fog on every track.	Tät dimma på alla banor.
+The cars at half their size, like radio-controlled models.	Bilarna i halv storlek, som radiostyrda modeller.
+Black and white, with a video camera's overlay in the HUD.	Svartvitt, med en videokameras överlägg i HUD:en.
+A helicopter of your own in every race.	En egen helikopter i varje lopp.
+Opens the bonus event of the Championship.	Låser upp mästerskapets bonustävling.
+Opens the bonus event of Ultimate Racer.	Låser upp bonustävlingen i Ultimate Racer.
+Every car's body in chrome.	Alla karosser i krom.
 As if its code had been entered.	Som om dess kod hade matats in.
 Credits	Medverkande
 See who made this game.	Se vem som gjorde spelet.
@@ -51,6 +65,7 @@ Selected	Vald
 Current	Aktuell
 Maximum	Maximal
 Ultra	Ultra
+Very High	Mycket hög
 Original	Original
 Fullscreen	Helskärm
 Windowed	Fönster
@@ -86,11 +101,11 @@ Level of Detail	Detaljnivå
 Maximum: scenery and cars always at their most detailed models. Original: as on the PS2.	Maximal: miljö och bilar alltid med sina mest detaljerade modeller. Original: som på PS2.
 Reflections	Reflektioner
 Shadows	Skuggor
-The cars' shadows. High: the body's own outline, lying on whatever is under it. Maximum: finer still.	Bilarnas skuggor. Hög: karossens egen kontur, lagd på det som finns under. Maximum: ännu finare.
+The cars' shadows. High: the body's own outline, lying on whatever is under it. Very High: finer, and the tunnels' lamps cast them too.	Bilarnas skuggor. Hög: karossens egen kontur, lagd på det som finns under. Mycket hög: finare, och tunnlarnas lampor kastar dem också.
 Particles	Partiklar
 Smoke, sparks and dust. Advanced: the same, with soft edges.	Rök, gnistor och damm. Avancerat: samma, med mjuka kanter.
 High	Hög
-The reflections on the cars. Advanced: new every frame. High: new every frame, at twice the resolution.	Reflektionerna på bilarna. Avancerat: nya i varje bild. Hög: nya i varje bild, i dubbel upplösning.
+The reflections on the cars. Advanced: new every frame, your mirrors show the road behind. High: the same at twice the resolution.	Reflektionerna på bilarna. Avancerat: nya i varje bild, speglarna visar vägen bakom. Hög: samma, i dubbel upplösning.
 Show FPS	Visa FPS
 Frames per second in the corner of the picture.	Bilder per sekund i bildens hörn.
 Advanced	Avancerat
@@ -120,6 +135,15 @@ Ambient Occlusion	Omgivningsocklusion
 Soft shading where surfaces meet: under cars, by walls and kerbs.	Mjuk skuggning där ytor möts: under bilar, vid murar och kantstenar.
 Unlimited	Obegränsat
 Monitor	Bildskärm
+Speed Boost for All Cars	Turbo för alla bilar
+The speed boost in every car and every mode.	Turbon i varje bil och varje läge.
+No Intro Movies	Inga introfilmer
+The game starts without its opening films.	Spelet startar utan sina öppningsfilmer.
+Playable Traffic Cars	Spelbara trafikbilar
+Traffic cars as racers, more skins, more traffic: the mod by 379Felipe. Switching it restarts the game.	Trafikbilar som racerbilar, fler lackeringar, mer trafik: modden av 379Felipe. Ett byte startar om spelet.
+The game will restart now to switch this mod. Continue?	Spelet startar om nu för att byta den här modden. Fortsätta?
+This disc's cars are not the ones the mod is made for.	Den här skivans bilar är inte de som modden är gjord för.
+This is the only screen.	Det här är den enda skärmen.
 The screen the game is shown on.	Skärmen som spelet visas på.
 Automatic	Automatiskt
 Select GPU	Välj grafikkort
@@ -136,10 +160,26 @@ Defaults	Standard
 Brightness, contrast and gamma as they were.	Ljusstyrka, kontrast och gamma som de var.
 The picture is back to the defaults.	Bilden är återställd.
 Keyboard	Tangentbord
-The keys for driving. In menus: arrows, Enter, Esc.	Tangenterna för körning. I menyer: pilar, Enter, Esc.
+The keys for driving, for both players.	Tangenterna för körning, för båda spelarna.
+Zone Slow Motion	Zon: slowmotion
+The game's slow motion, on and off. Works with Slow Motion on in Extras.	Spelets slowmotion, av och på. Fungerar med Slowmotion på i Extramaterial.
+Slow Motion	Slowmotion
+Disable Catchup	Ingen upphämtning
+No catch-up boost for the opponents in Quick Race and the career.	Ingen upphämtning för motståndarna i Snabblopp och i karriären.
+Cinematic Replays	Filmiska repriser
+Hiding the replay's controls hides the black bars too.	Döljer du reprisens kontroller döljs även de svarta fälten.
+The slow motion key works. On a gamepad: both sticks pressed together.	Slowmotion-tangenten fungerar. På handkontroll: båda spakarna intryckta samtidigt.
+Put player 2's keys back as they were.	Återställ spelare 2:s tangenter.
 Gamepad	Handkontroll
 The buttons for driving, the stick and vibration.	Knapparna för körning, spaken och vibrationen.
 Player 2	Spelare 2
+Select, then choose the gamepad of player 1.	Välj, och välj sedan handkontroll för spelare 1.
+Select, then choose the gamepad of player 2.	Välj, och välj sedan handkontroll för spelare 2.
+Select Device	Välj enhet
+None	Ingen
+Player 2 Controls	Spelare 2: kontroller
+Device	Enhet
+Gamepad: the one chosen in Gamepad > Layouts. Keyboard: player 2's keys.	Handkontroll: den som valts i Handkontroll > Layouter. Tangentbord: spelare 2:s tangenter.
 What the second player drives with in a two-player race.	Vad den andra spelaren kör med i ett lopp för två.
 Second: the second gamepad or half the keyboard. First: the first one.	Andra: den andra handkontrollen eller halva tangentbordet. Första: den första.
 Player 2's keys, when the keyboard is shared.	Spelare 2:s tangenter när tangentbordet delas.
@@ -277,3 +317,87 @@ The gamepad's layouts, A to D: what each button does in a race.	Handkontrollens 
 Leave the game?	Avsluta spelet?
 Pick the letters. The last key of the grid makes it.	Välj bokstäverna. Rutnätets sista tangent bekräftar.
 Type the new name. Enter sets it, Esc leaves it.	Skriv det nya namnet. Enter sätter det, Esc lämnar det.
+The game will restart to change the language. Continue?	Spelet startas om för att byta språk. Fortsätta?
+Steering Wheel	Ratt
+Force feedback and rotation of a steering wheel.	Force feedback och rattutslag.
+Pad/Wheel	Kontroll/Ratt
+Gamepad: Player 1	Handkontroll: spelare 1
+Gamepad: Player 2	Handkontroll: spelare 2
+Vibration Strength	Vibrationsstyrka
+How strongly the gamepad shakes. 0% is off.	Hur starkt handkontrollen vibrerar. 0 % är av.
+Trigger Dead Zone	Avtryckarnas dödzon
+How far a trigger moves before it counts.	Hur långt en avtryckare trycks innan den räknas.
+Put this gamepad's settings back as they were.	Återställ den här handkontrollens inställningar.
+The settings are back to the defaults.	Inställningarna är återställda.
+Force Feedback	Force feedback
+The strength of all the wheel's forces. 0% is off.	Styrkan i alla rattens krafter. 0 % är av.
+Centering Spring	Centreringsfjäder
+How strongly the wheel returns to its middle.	Hur starkt ratten går tillbaka till mitten.
+Damper	Dämpare
+How heavy the wheel is to turn.	Hur tung ratten är att vrida.
+Road Feel	Vägkänsla
+The road's surface in the wheel.	Vägbanan i ratten.
+Collisions	Kollisioner
+The jolt of a hit.	Stöten vid en krock.
+Shake	Skakning
+The wheel's shaking.	Rattens skakning.
+Rotation	Rattutslag
+The rotation is 40 to 900 degrees.	Utslaget är 40 till 900 grader.
+Set Rotation	Ställ in utslag
+On: a Logitech wheel is set to this rotation while the game runs.	På: en Logitech-ratt får detta utslag medan spelet körs.
+Invert Steering	Invertera styrning
+The wheel steers the other way.	Ratten styr åt andra hållet.
+Put the wheel's settings back as they were.	Återställ rattens inställningar.
+The dead zones, the steering and the vibration of player 1's gamepad.	Dödzoner, styrning och vibration för spelare 1:s handkontroll.
+The dead zones, the steering and the vibration of player 2's gamepad.	Dödzoner, styrning och vibration för spelare 2:s handkontroll.
+Degrees from lock to lock. Select, then set the number.	Grader från stopp till stopp. Välj, ställ sedan in talet.
+Left, Right: the digit. Up, Down: its value. Select takes it, Back cancels.	Vänster, höger: siffran. Upp, ner: dess värde. Välj tar den, Tillbaka avbryter.
+Calibration	Kalibrering
+The game's own calibration of the wheel and its pedals.	Spelets egen kalibrering av ratt och pedaler.
+Wheel	Ratt
+Steering Wheel: Player 1	Ratt: spelare 1
+Steering Wheel: Player 2	Ratt: spelare 2
+The forces and the rotation of this player's wheel.	Krafterna och rotationen för den här spelarens ratt.
+Select, then choose the steering wheel of player 1.	Välj, och välj sedan ratt för spelare 1.
+Select, then choose the steering wheel of player 2.	Välj, och välj sedan ratt för spelare 2.
+Force feedback of this player's wheel, on or off.	Force feedback för den här spelarens ratt, på eller av.
+Player 1 has no steering wheel.	Spelare 1 har ingen ratt.
+Player 2 has no steering wheel.	Spelare 2 har ingen ratt.
+Custom	Egen
+Custom Layout: Player 1	Egen layout: spelare 1
+Custom Layout: Player 2	Egen layout: spelare 2
+Accelerate/Brake	Gas/Broms
+Analog	Analog
+Digital	Digital
+Shift Up	Växla upp
+Shift Down	Växla ned
+Select, then press the button for it. Esc cancels.	Välj och tryck sedan på knappen. Esc avbryter.
+Press a button. Esc cancels.	Tryck på en knapp. Esc avbryter.
+Analog: the left stick. Digital: two buttons. Both: either.	Analog: vänster spak. Digital: två knappar. Båda: valfritt.
+Both	Båda
+Zone Cameras	Zonkameror
+View + Shift	Vy + växel
+Own Buttons	Egna knappar
+View + Shift: hold Change View, press Shift Down or Up. Own Buttons: a button each.	Vy + växel: håll Byt vy, tryck på en växel. Egna knappar: en knapp var.
+Now without a button:	Nu utan knapp:
+The right stick turns the camera.	Höger spak vrider kameran.
+Right Stick	Höger spak
+Camera	Kamera
+Camera: look around the car. Accelerate/Brake: up is the throttle, down the brake.	Kamera: se runt bilen. Gas/Broms: upp gasar, ned bromsar.
+Edit	Ändra
+Edit the buttons of this layout	Ändra knapparna i den här layouten
+Analog: a trigger, by how far it is pressed. Digital: any button, all at once.	Analog: en avtryckare, efter hur långt den trycks. Digital: valfri knapp, allt eller inget.
+Left, Right: which trigger it is.	Vänster, höger: välj avtryckare.
+The triggers are the pedals while Accelerate/Brake is Analog.	Avtryckarna är pedalerna så länge Gas/Broms är Analog.
+Adaptive Triggers	Adaptiva avtryckare
+Both triggers kick at a gear change and stiffen when a tyre is blown.	Båda avtryckarna ger en stöt vid växling och blir tyngre vid punktering.
+Vibration Mode	Vibrationsläge
+Responsive	Responsiv
+Original: as the game plays it. Responsive: it follows the car at once and does not linger.	Original: som spelet spelar den. Responsiv: den följer bilen direkt och dröjer inte kvar.
+Police Radio Speaker	Polisradio i handkontrollen
+The police radio plays from the gamepad's speaker.	Polisradion hörs ur handkontrollens högtalare.
+Speaker Volume	Högtalarvolym
+How loud the gamepad's speaker is.	Hur högt handkontrollens högtalare låter.
+Start is always Pause.	Start är alltid Paus.
+This button cannot be used.	Den här knappen kan inte användas.
+Put this layout back as it was.	Återställ den här layouten.

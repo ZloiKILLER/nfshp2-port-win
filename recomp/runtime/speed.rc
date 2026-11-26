@@ -3,8 +3,8 @@
 
 // The file's properties (Explorer, Details)
 1 VERSIONINFO
-FILEVERSION 0,14,0,0
-PRODUCTVERSION 0,14,0,0
+FILEVERSION 0,15,0,0
+PRODUCTVERSION 0,15,0,0
 FILEFLAGSMASK 0x3f
 FILEFLAGS 0
 FILEOS 0x40004
@@ -16,9 +16,9 @@ BEGIN
         BLOCK "040904b0"
         BEGIN
             VALUE "FileDescription", "Need for Speed: Hot Pursuit 2"
-            VALUE "FileVersion", "0.14"
+            VALUE "FileVersion", "0.15"
             VALUE "ProductName", "Ported by ZloiKILLER"
-            VALUE "ProductVersion", "0.14"
+            VALUE "ProductVersion", "0.15"
             VALUE "OriginalFilename", "speed.exe"
         END
     END
@@ -36,6 +36,7 @@ LANG_GERMAN RCDATA "../data/lang/GERMAN.txt"
 LANG_ITALIAN RCDATA "../data/lang/ITALIAN.txt"
 LANG_SPANISH RCDATA "../data/lang/SPANISH.txt"
 LANG_SWEDISH RCDATA "../data/lang/SWEDISH.txt"
+LANG_RUSSIAN_DISC RCDATA "../data/lang/RUSSIAN_DISC.txt"
 UI_CURSOR RCDATA "../data/ui/cursor.cur"
 README RCDATA "../data/README.txt"
 // the Saves Manager, built beside speed.exe first (CMakeLists.txt: target savestransfer)

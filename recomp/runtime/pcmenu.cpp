@@ -11,6 +11,8 @@
 #include "hw.h"
 #include "pcconfig.h"
 #include "pclang.h"
+#include "pcwheel.h"
+#include <algorithm>
 #include <map>
 #include <chrono>
 #include <cmath>
@@ -99,6 +101,8 @@ static u32 galloc(u32 size)
 }
 
 static std::map<u32, std::string> g_texts;     // the port's texts on screen objects, in English (set_text)
+static std::map<u32, u32> g_wheel_was;         // a text of the Controller screen with the wheels' word on it: the language id it had
+static std::map<u32, u32> g_pad_was;           // the same for the words the port puts on it as the gamepads' screen
 
 static void g_row_home_clear();
 static void free_pages()
@@ -106,16 +110,38 @@ static void free_pages()
     for (u32 p : g_page_mem) pc_call(fn::bFree, p);
     g_page_mem.clear();
     g_texts.clear();
+    g_wheel_was.clear();
+    g_pad_was.clear();
     g_row_home_clear();
+}
+
+// The ring of strings below, and after it some lasting room (pc_keep): one block, taken when the first string is made, early,
+// as the game's own lasting blocks are. What the port needs for good later on (a screen's name, a layout's table) comes out of
+// that room and not out of the game's heap, where a small block left behind in the middle of a session is in the way of the
+// race's big allocations (free_pages, above).
+static const u32 kKeepRoom = 6144;
+static u32 ring()
+{
+    static u32 at;
+    if (!at) at = galloc(16 * 256 + kKeepRoom);
+    return at;
+}
+
+u32 pc_keep(u32 size)
+{
+    static u32 used;
+    size = (size + 15) & ~15u;
+    if (used + size > kKeepRoom) return galloc(size);       // (more than was thought of: the heap after all)
+    const u32 p = ring() + 16 * 256 + used;
+    used += size;
+    return p;
 }
 
 // a guest copy of a string; the slot is reused after 16 more
 static u32 gstr(const std::string &s)
 {
-    static u32 ring;
     static int slot;
-    if (!ring) ring = galloc(16 * 256);
-    u32 p = ring + (slot++ & 15) * 256;
+    u32 p = ring() + (slot++ & 15) * 256;
     size_t n = s.size() < 255 ? s.size() : 255;
     memcpy(host(p), s.data(), n);
     SB(p + (u32)n, 0);
@@ -201,6 +227,27 @@ static std::string screen_name();
 // The pause menu is the screen that is up. The player's mode does not always say so: paused while the zone camera is on (mode 3), the
 // mode stays what it was.
 bool pc_pause_menu() { return pc_racing() && menu_on_screen() && screen_name() == "Pause Menu"; }
+bool pc_debug_menu() { return pc_racing() && screen_name() == "Debug Menu"; }
+// a question over the screen: FlailerScreenList (gp-21324) +392, two tPopupMenu, each active by its first byte
+bool pc_popup_up()
+{
+    if (!g_pc_ctx) return false;
+    const u32 lists = LW(gp() - 21324);
+    for (int k = 0; lists && k < 2; k++)
+        if (const u32 pop = LW(lists + 392 + 4 * k))
+            if (LB(pop)) return true;
+    return false;
+}
+// A page under the pause menu: the race is paused (RaceCoordinator, gp-22216: state 6) and the screen up is another than "Pause Menu":
+// "Pause Options", "Pause audio", "Pause display", "Race Objective", "Pause BAC controls", "Debug Menu", a page of the port's.
+bool pc_pause_subpage()
+{
+    if (!pc_racing() || !menu_on_screen()) return false;
+    const u32 rc = LW(gp() - 22216);
+    if (!rc || LW(rc) != 6) return false;
+    const std::string screen = screen_name();
+    return !screen.empty() && screen != "Pause Menu";
+}
 // the name of the screen that is up (FlailerScreenNode +16 its FlailerScreenConfig, +8 the config's ScreenName), "" with none
 static std::string screen_name()
 {
@@ -208,6 +255,9 @@ static std::string screen_name()
     const u32 list = LW(gp() - 21324), node = list ? LW(list + 412) : 0, config = node ? LW(node + 16) : 0, name = config ? LW(config + 8) : 0;
     return name ? pc_str(name) : "";
 }
+
+bool pc_on_title() { return g_pc_ctx && screen_name() == "Title Screen"; }
+std::string pc_screen() { return screen_name(); }
 
 // The pointer: in the front end, the pause menu, a replay and the screens after the finish; in a race and while one loads, none. And none
 // at the start. There the game is on "BootAutoload" for a second, and then on "Title Screen" all through the logos and the opening film:
@@ -253,7 +303,7 @@ bool pc_hud_up()
     return false;
 }
 bool pc_car_input() { return pc_racing() && g_player_mode != 0 && g_player_mode != 1 && g_player_mode != 6 && !menu_on_screen(); }
-// The same for one of two players. With two in a race each Player has its own mode (g_player_modes, by Player +88, its number): one
+// The same for one of two players. With two in a race each Player has its own mode (g_player_modes, by Player +8, its controller port): one
 // busted (mode 6 or none) while the other drives on. g_player_mode, what the rest goes by, is then the mode of a player who drives
 // if there is one. One mode for both took the second player's car away when the first was busted: his keys became a menu's.
 bool pc_car_input_port(int port)
@@ -261,6 +311,17 @@ bool pc_car_input_port(int port)
     if (!pc_two_player_race()) return pc_car_input();
     const u32 mode = g_player_modes[port & 1];
     return mode != 0 && mode != 1 && mode != 6 && !menu_on_screen();
+}
+
+// The keyboard's driving keys are the game's actions (pcactions.cpp) for a player who drives, in the modes whose handlers a key
+// stands for: racing (2), the frozen zone (3: pause alone), before the start (5: skip and pause). Not in a replay, whose keys are
+// the bar's buttons, nor after the finish or in the AI's demo (any button there is the old way's business), nor with hp2.ini's
+// [keyboard] actions=0.
+bool pc_actions_port(int port)
+{
+    if (!g_cfg.key_actions || !pc_car_input_port(port) || pc_replay_playing()) return false;
+    const u32 mode = pc_two_player_race() ? g_player_modes[port & 1] : g_player_mode;
+    return mode == 2 || mode == 3 || mode == 5;
 }
 
 // ---- Flailer: the chunk layouts of this (retail) build ---------------------------------
@@ -363,12 +424,19 @@ static u32 clone_object(u32 screen, u32 src, u32 max_chars = 0)
 }
 
 // The port's texts go through tr (pclang.h); each object's English is kept, so that a change of language can put them again.
+// (a text of player 2's on a page both players share, the Keyboard page's rows: "P2 " and then the text. The text is
+// translated, the mark stays as it is)
+static std::string tr_label(const std::string &s) { return s.rfind("P2 ", 0) == 0 ? "P2 " + tr(s.substr(3)) : tr(s); }
+
 static void set_text(u32 obj, const std::string &s)
 {
     g_texts[obj] = s;
-    pc_call(fn::SetString, obj, gstr(tr(s)));
+    pc_call(fn::SetString, obj, gstr(tr_label(s)));
 }
 static void blurb_text(u32 blurb, const std::string &s) { pc_call(fn::BlurbNewText, blurb, gstr(tr(s))); }
+// a row's help line and whether only Select works on it, as the row is now (PcRow::blurb_if, select_only_if)
+static std::string row_blurb(const PcRow &r) { return r.blurb_if ? r.blurb_if() : r.blurb; }
+static bool row_select_only(const PcRow &r) { return r.select_only || (r.select_only_if && r.select_only_if()); }
 
 // ---- pages ------------------------------------------------------------------------------
 static std::vector<PcPage *> &pages()
@@ -496,6 +564,7 @@ static float row_home(u32 obj);
 // the values and the arrows of the page on screen
 static void page_refresh(PcPage &pg)
 {
+    if (pc_asking()) return;                // a question stands over the page, whose objects are hidden: redrawn with the answer
     u32 project = find_project(FRONTB_PROJECT);
     u32 s = project ? find_screen(project, pg.hash) : 0;
     if (!s) return;
@@ -516,7 +585,7 @@ static void page_refresh(PcPage &pg)
     if (u32 a = find_object(s, SCROLL_DOWN_ARROW, 2)) pc_call(fn::SetVisibility, a, scrolls && pg.top + 7 < total ? 1 : 0);
     u32 la = find_object(s, 0xd1cda594, 2), ra = find_object(s, 0x9345e4a7, 2);
     const int at = pg.top + (int)pg.cur - 1;
-    bool arrows = pg.cur >= 1 && at < total && pg.rows[(size_t)at].value && !pg.rows[(size_t)at].select_only;
+    bool arrows = pg.cur >= 1 && at < total && pg.rows[(size_t)at].value && !row_select_only(pg.rows[(size_t)at]);
     u32 item = pg.cur ? find_object(s, menuitem_hash(pg.cur), 1) : 0;
     for (u32 a : {la, ra}) {
         if (!a) continue;
@@ -587,6 +656,11 @@ static void list_frame()
     const int alpha = 32 + (int)(96.0 * (1.0 + sin(now * 10.0)) * 0.5);
     for (u32 h : {SCROLL_UP_ARROW, SCROLL_DOWN_ARROW})
         if (u32 a = find_object(s, h, 2)) pc_call(fn::SetAlpha, a, (u32)alpha);
+    // and the two beside the highlighted row's value (the user, 2026-11-23: "arrows that blink, as on the game's screens")
+    if (pg)
+        for (u32 h : {0xd1cda594u, 0x9345e4a7u})           // LEFT_ARROW, RIGHT_ARROW
+            if (u32 a = find_object(s, h, 2))
+                if ((s8)LB(a + 41) == 1) pc_call(fn::SetAlpha, a, (u32)alpha);
     if (g_slide == 0) return;
     float t = (float)((now - g_slide_from) / kSlideSeconds);
     if (t >= 1) t = 1;
@@ -646,7 +720,36 @@ void pc_refresh_page()
     if (g_current_page && g_current_self && LW(gp() - 16888) == g_current_self) page_refresh(*g_current_page);
 }
 
-void pc_open_page(const char *name) { pc_call(fn::ChangeToScreen, gstr(name), 1); }
+// A screen's name as the game is given it, kept for good. ChangeToScreen (0x14cc78: FlailerScreenList's, 0x16c4c0) first takes
+// away the screen that is up and only then looks for the new one by the name, and the going screen's last messages come
+// through the port's hooks, which make strings of their own (gstr: sixteen slots, used round and round). From the wheels'
+// Controller screen, whose hook makes more than sixteen for a message, the name was something else by the time it was looked
+// for: no screen was found and none was up, the black screen of 2026-11-24 ("Settings", then "Calibration", four builds). The
+// game's own calls give names that lie in its data.
+static u32 screen_name_kept(const std::string &name)
+{
+    static std::map<std::string, u32> kept;
+    u32 &p = kept[name];
+    if (!p) {
+        p = pc_keep((u32)name.size() + 1);
+        memcpy(host(p), name.c_str(), name.size() + 1);
+    }
+    return p;
+}
+
+void pc_open_page(const char *name) { pc_call(fn::ChangeToScreen, screen_name_kept(name), 1); }
+
+// The game's own way of starting several screens deep (LaunchFrontendMenus, 0x16f950): the names of the screens on the way are
+// pushed onto the list's stack of screens to go back to (FlailerScreenList, gp-21324: 12 names of 32 bytes from +0, their count at
+// +384; PushScreenOntoStack, 0x16c760, copies a name in), and the last screen alone is shown, without a push of its own.
+void pc_open_page_under(const std::vector<std::string> &under, const char *name)
+{
+    const u32 list = LW(gp() - 21324);
+    if (!list) return;
+    for (const std::string &s : under)
+        if (LW(list + 384) < 12 && s.size() < 32) pc_call(0x16c760, list, gstr(s));
+    pc_call(fn::ChangeToScreen, screen_name_kept(name), 0);
+}
 
 int pc_page_row(const char *name)
 {
@@ -663,10 +766,25 @@ int pc_page_row(const char *name)
 // parameter at +8 of its data (tPopupMenu::Dismiss, 0x16b9c0): page_event hands it on.
 // The popup's screen is the memory card's, made to stand over an empty one: its panel is drawn before a page's own objects, which would
 // show through its text. So the page's objects that are visible (+41) are hidden while it is up, and shown again with the answer.
+//
+// A question asked from a row's own change (Extras' Playable Traffic Cars: the user's picture of 2026-11-24, the page's rows, its
+// arrows and the highlight's glow over the question) is put off to the next frame: the press that asked is still being handled
+// by the game's menu and by the page (the row's value and arrows drawn again, the item's own flash), all after the page's objects
+// were hidden. And while a question is up, whatever of the page's screen shows again is hidden again, every frame.
 static std::function<void(bool)> g_answer;
 static bool g_asking;
 static u32 g_ask_mem[2];
 static std::vector<u32> g_under_question;
+static u32 g_under_screen;                  // the screen whose objects they are
+static bool g_in_row_change;                // a row's change is being called (page_event)
+// A row being edited (pc_row_edit: the wheel's rotation, digit by digit; the user, 2026-11-24, "the field must take a gamepad's
+// input too"). While it lasts every button of the menu is the editing's, a gamepad's as the keyboard's: the function gets the
+// message (1 Select, 6 Left, 7 Right, 8 Up, 9 Down, 17 Back) and says whether the editing goes on.
+static std::function<bool(int)> g_row_edit;
+void pc_row_edit(std::function<bool(int msg)> fn) { g_row_edit = std::move(fn); }
+bool pc_row_editing() { return (bool)g_row_edit; }
+static std::function<void()> g_ask_later;   // the question it asked, for the next frame
+static int g_ask_later_wait;
 
 static void ask_free()
 {
@@ -681,6 +799,7 @@ static void page_under_question(bool hide)
     if (!hide) {
         for (u32 o : g_under_question) pc_call(fn::SetVisibility, o, 1);
         g_under_question.clear();
+        g_under_screen = 0;
         return;
     }
     PcPage *pg = g_current_page;
@@ -688,6 +807,7 @@ static void page_under_question(bool hide)
     // not a page of the port's: the main menu, whose Exit asks (its rows are drawn over the popup's panel as a page's are)
     if (!scr || !g_current_self || LW(gp() - 16888) != g_current_self) scr = project ? find_screen(project, MAIN_MENU_SCREEN) : 0;
     if (!scr) return;
+    g_under_screen = scr;
     for (u32 o = LW(scr + 32); o && o != scr + 32; o = LW(o))
         if (LB(o + 41)) {
             g_under_question.push_back(o);
@@ -695,7 +815,24 @@ static void page_under_question(bool hide)
         }
 }
 
-bool pc_asking() { return g_asking; }
+// every frame: a question put off is asked; under a question that is up, what shows again is hidden again
+static void ask_frame()
+{
+    if (g_ask_later && !g_asking && --g_ask_later_wait <= 0) {
+        auto ask = std::move(g_ask_later);
+        g_ask_later = nullptr;
+        ask();
+    }
+    if (!g_asking || !g_under_screen) return;
+    const u32 scr = g_under_screen;
+    for (u32 o = LW(scr + 32); o && o != scr + 32; o = LW(o))
+        if (LB(o + 41)) {
+            if (std::find(g_under_question.begin(), g_under_question.end(), o) == g_under_question.end()) g_under_question.push_back(o);
+            pc_call(fn::SetVisibility, o, 0);
+        }
+}
+
+bool pc_asking() { return g_asking || g_ask_later; }
 
 // the answer, from the screen the question stood over: message 21, the button's parameter at +8 of its data
 static void ask_answer(u32 data)
@@ -707,12 +844,19 @@ static void ask_answer(u32 data)
     auto answer = std::move(g_answer);
     g_answer = nullptr;
     if (answer) answer(LW(data + 8) == 1);
+    pc_refresh_page();                      // the page as it is now: nothing of it was drawn anew under the question
 }
 
 void pc_ask(const std::string &title, const std::string &question, std::function<void(bool yes)> answer, const char *yes, const char *no)
 {
     const u32 list = LW(gp() - 21324);
-    if (g_asking || !list) return;
+    if (g_asking || g_ask_later || !list) return;
+    if (g_in_row_change) {                  // asked by a row's change: once the press is done with (ask_frame)
+        const std::string y = yes ? yes : "", n = no ? no : "";
+        g_ask_later = [title, question, answer, y, n] { pc_ask(title, question, answer, y.empty() ? nullptr : y.c_str(), n.empty() ? nullptr : n.c_str()); };
+        g_ask_later_wait = 2;
+        return;
+    }
     // the game's heap, given back with the answer: a block left in it is in the way of the race's large ones
     const u32 cfg = pc_alloc(72), text = pc_alloc(256);
     if (!cfg || !text) return;
@@ -787,7 +931,8 @@ static void page_back_frame()
     static bool mine;
     PcPage *pg = g_current_page;
     const bool live = pg && g_current_self && LW(gp() - 16888) == g_current_self;
-    const bool want = live && pg->on_back && !g_grid_kb && !g_asking;
+    if (!live) g_row_edit = nullptr;        // the page with the row being edited is gone
+    const bool want = live && (pg->on_back || g_row_edit) && !g_grid_kb && !g_asking;
     const u32 kTakeBack = 0x31a6e8, now = LW(list + 0x190);
     if (want) {
         if (now != kTakeBack) pc_call(0x16d448, kTakeBack);
@@ -1111,6 +1256,15 @@ static void kb_typed_show(u32 kb)
 static bool page_event(PcPage &pg, u32 self, u32 msg, u32 data)
 {
     if (g_grid_kb && self == g_grid_self) return grid_event(msg, data);
+    if (g_row_edit && (msg == 1 || (msg >= 6 && msg <= 9) || msg == 17)) {
+        if (msg == 8 || msg == 9) SW(data + 8, 1);          // the highlight stays on the row
+        if (msg == 17) SW(data + 8, 0);                     // Back is the editing's: the screen stays
+        if (msg == 6 || msg == 7) SW(data + 12, msg == 6 ? 1 : 2);      // the sound of Left and Right
+        const std::function<bool(int)> fn = g_row_edit;
+        if (!fn((int)msg)) g_row_edit = nullptr;
+        page_refresh(pg);
+        return true;
+    }
     const int slot = (int)(LW(data) - menuitem_hash(1)) + 1, total = (int)pg.rows.size();
     bool known = slot >= 1 && slot <= total && slot <= 7;
     const int row = pg.top + slot;
@@ -1118,7 +1272,7 @@ static bool page_event(PcPage &pg, u32 self, u32 msg, u32 data)
     case 4:                                 // MENUITEM_HIGHLIGHT: the help line and the arrows
         if (!known) return true;
         pg.cur = (u32)slot;
-        blurb_text(self + 100, pg.rows[(size_t)row - 1].blurb);
+        blurb_text(self + 100, row_blurb(pg.rows[(size_t)row - 1]));
         pc_call(fn::BlurbAnimate, self + 100);
         page_refresh(pg);
         return true;
@@ -1127,8 +1281,12 @@ static bool page_event(PcPage &pg, u32 self, u32 msg, u32 data)
         const bool down = msg == 9;
         if (down ? slot == 7 && row < total : slot == 1 && pg.top > 0) {
             pg.top += down ? 1 : -1;
+            {   // a row that cannot be chosen (a divider) does not stop under the highlight: one more, if there is one
+                const PcRow &under = pg.rows[(size_t)(pg.top + slot) - 1];
+                if (under.disabled && under.disabled() && (down ? pg.top + 7 < total : pg.top > 0)) pg.top += down ? 1 : -1;
+            }
             SW(data + 8, 1);
-            blurb_text(self + 100, pg.rows[(size_t)(pg.top + slot) - 1].blurb);
+            blurb_text(self + 100, row_blurb(pg.rows[(size_t)(pg.top + slot) - 1]));
             pc_call(fn::BlurbAnimate, self + 100);
             page_refresh(pg);
             page_gray(pg, false);
@@ -1142,9 +1300,12 @@ static bool page_event(PcPage &pg, u32 self, u32 msg, u32 data)
         if (!known) return true;
         PcRow &r = pg.rows[(size_t)row - 1];
         int dir = msg == 6 ? -1 : msg == 7 ? 1 : (r.value ? 1 : 0);
-        if (msg != 1 && (!r.value || r.select_only)) return true;
+        if (msg != 1 && (!r.value || row_select_only(r))) return true;
         if (r.disabled && r.disabled()) return true;
+        g_in_row_change = true;
         if (r.change) r.change(dir);
+        g_in_row_change = false;
+        if (pc_asking()) return true;       // the row asks first: nothing has changed yet
         if (msg != 1) SW(data + 12, msg == 6 ? 1 : 2);      // the sound of Left and Right
         page_refresh(pg);
         if (g_current_page == &pg) page_gray(pg, false);
@@ -1302,7 +1463,7 @@ static void add_options_arrows(u32 project)
 // a change of language: the port's texts again, and the page on screen
 void pc_retranslate()
 {
-    for (auto &t : g_texts) pc_call(fn::SetString, t.first, gstr(tr(t.second)));
+    for (auto &t : g_texts) pc_call(fn::SetString, t.first, gstr(tr_label(t.second)));
     pc_refresh_page();
 }
 
@@ -1490,6 +1651,83 @@ static void add_delete_hint(u32 project, const std::string &page)
     set_text(t, "Delete");
 }
 
+// The layouts' screen with a layout of the player's own on it: the hint of the button that edits it, "<Delete> Edit", at the
+// bottom after Help and Back, as far from Back as Back is from Help (the user, 2026-11-25: "move it down by the Back button
+// and cut it to just DEL Edit, and for this layout only: on the other layouts this button must not appear"; it was "Press
+// <button> to edit" in the bar under the list until then). Two objects, made as FRONTB loads: copies of the screen's own Help
+// icon and word (the icon is a character of the buttons' font, here 'u', which pc_paint_buttons paints by the device: the
+// Delete key, X, Square). Shown with that layout only (config_edit_hint, from the screen's drawing).
+static const u32 CONFIG_SCREEN = 0xb6657464;
+static const int kHelpEdit = 801603;        // the port's own LanguageID of that screen's help line for the button (HOOK_GetTranslatedString)
+// The port's own hints of a key are the pointer's buttons, as the game's Back and Help are (mouse_frame; the user, 2026-11-25:
+// "why can the mouse not open it ... can the same Del be a widget that the mouse presses, as the replay's buttons were
+// made?"): "<Delete> Edit" with a layout of the player's own, and "Delete" on the profiles' pages. A click is
+// kept here until the one that asks for that key takes it: each has its own, since both ask every frame.
+static bool g_mouse_edit, g_mouse_delete;
+bool pc_delete_pressed()
+{
+    const bool key = window_delete_pressed(), mouse = g_mouse_delete;
+    g_mouse_delete = false;
+    return key || mouse;
+}
+static u32 g_help_icon;                     // the screen's own Help icon, as FRONTB was last loaded
+static void add_edit_hint(u32 lay, u32 icon, u32 word)
+{
+    if (!icon || !word || find_object(lay, pc_hash("PC_EDIT_ICON"), 1)) return;
+    // (the place after Back: Back's own icon, if the screen has it by this time, is one step from Help's)
+    const u32 back_icon = find_object(lay, pc_hash("PC_BACK_ICON"), 1);
+    float step = back_icon ? fl(back_icon + 48) - fl(icon + 48) : 88.0f;
+    if (!(step > 40.0f && step < 200.0f)) step = 88.0f;
+    const u32 i = clone_object(lay, icon);
+    SW(i + 8, pc_hash("PC_EDIT_ICON"));
+    set_fl(i + 48, fl(icon + 48) + 2.0f * step);
+    pc_call(fn::SetString, i, gstr("u"));
+    SB(i + 41, 0);
+    const u32 t = clone_object(lay, word, 40);
+    SW(t + 8, pc_hash("PC_EDIT_WORD"));
+    SW(t + 96, 0);
+    set_fl(t + 48, fl(word + 48) + 2.0f * step);
+    set_text(t, "Edit");
+    SB(t + 41, 0);
+}
+
+// The layouts' screen with the modern layout on it: a line in the same bar, "The right stick turns the camera." (the user,
+// 2026-11-25: "an info line at the bottom that the right stick is the camera, where the running line is, in its font": the
+// camera is no event of the game's, so the list above has no row for it). The bar is the place of the menus' help line, which
+// this screen does not use; the line is a copy of that help line's own text object (SCROLLING_TEXT: its font, its size, its
+// place in the bar), the screen's own if it has one, else the Options screen's, moved by what the two screens' bars differ
+// (SCROLL_TEXT_CLIP); with neither, a copy of the Help word where the "edit" hint stands. Shown from the screen's drawing.
+static void add_info_hint(u32 project, u32 lay, u32 help_word)
+{
+    if (find_object(lay, pc_hash("PC_INFO_TEXT"), 1)) return;
+    const u32 text_hash = pc_hash("SCROLLING_TEXT"), clip_hash = pc_hash("SCROLL_TEXT_CLIP");
+    u32 src = find_object(lay, text_hash, 1);
+    float x = src ? fl(src + 48) : 127.0f, y = src ? fl(src + 52) : 0.0f;
+    const char *from = "the screen's own help line";
+    if (!src) {
+        const u32 other = find_screen(project, OPTIONS_SCREEN);
+        src = other ? find_object(other, text_hash, 1) : 0;
+        if (src) {
+            const u32 here = find_object(lay, clip_hash), there = find_object(other, clip_hash);
+            x = fl(src + 48), y = fl(src + 52) + (here && there ? fl(here + 52) - fl(there + 52) : 0.0f);
+            from = "the Options screen's help line";
+        }
+    }
+    if (!src && help_word) src = help_word, x = 127.0f, y = fl(help_word + 52) - 84.0f, from = "the Help word";
+    if (!src) return;
+    const u32 t = clone_object(lay, src, 64);
+    SW(t + 8, pc_hash("PC_INFO_TEXT"));
+    SW(t + 96, 0);
+    // (its colour is the help line's own, the grey of the main menu's running line: the user, 2026-11-25, of the white it
+    // was first given, "the same grey as in the main menu". Only a line the file keeps unseen is made seen.)
+    if ((LW(t + 92) >> 24) == 0) SW(t + 92, LW(t + 92) | 0x80000000u);
+    set_fl(t + 48, x);
+    set_fl(t + 52, y);
+    set_text(t, "The right stick turns the camera.");
+    SB(t + 41, 0);
+    fprintf(stderr, "layouts: the modern layout's info line is a copy of %s, at %.0f, %.0f\n", from, x, y);
+}
+
 // Each frame the page is up: cheap when nothing changed. Back is shown or not by the page's shape (the first screen has none), and the
 // frontend's objects are made anew, at their first places and texts, each time it loads.
 
@@ -1530,14 +1768,786 @@ void pc_delete_hint(const char *page, bool pad, bool show, const char *text)
 // manager's Menu screens tab reads it to show the menus as the port draws them.
 static void port_edits(u32 tail);
 
+// The HUD's objects get the parts of a wide picture they are put by (native.cpp, native_hud_part) as their file loads: each
+// object of a screen the table has (hud_anchors.h, made from the file by tools/recomp/make_hud_anchors.py) is looked up by its
+// name's hash and the place the layout gives it, which it still has here, before the game moves anything. Gone with the file.
+#include "hud_anchors.h"
+static u32 g_hud_project;                   // the project (its hash) whose objects have parts now
+static void hud_anchors(u32 project)
+{
+    int given = 0, objects = 0;
+    for (u32 sl = project + 12, s = LW(sl); s && s != sl; s = LW(s)) {
+        const u32 screen = LW(s + 8);
+        bool known = false;
+        for (const HudAnchor &a : kHudAnchors) known = known || a.screen == screen;
+        if (!known) continue;
+        for (u32 ol = s + 32, o = LW(ol); o && o != ol; o = LW(o)) {
+            objects++;
+            const u32 name = LW(o + 8);
+            const float x = fl(o + 48), y = fl(o + 52);
+            for (const HudAnchor &a : kHudAnchors)
+                if (a.screen == screen && a.name == name && std::fabs(a.x - x) < 0.01f && std::fabs(a.y - y) < 0.01f) {
+                    const NativeHudPart part{a.k, a.x, a.mid, a.ax, a.ak, a.bx, a.bk, a.kind};
+                    native_hud_part(o, &part);
+                    given++;
+                    break;
+                }
+        }
+    }
+    if (!objects) return;
+    g_hud_project = LW(project + 8);
+    fprintf(stderr, "hud: %d of the %d objects of the HUD's screens have their parts of a wide picture (the rest go by the lines)\n", given, objects);
+}
+
 static void on_project_loaded(u32 tail)
 {
     port_edits(tail);
+    hud_anchors(tail);
     if (const char *path = getenv("HP2_FLDUMP"))
         if (FILE *f = fopen(path, "a")) {
             dump_project(f, tail);
             fclose(f);
         }
+}
+
+// ---- Controller (the game's "Joystick PreConfig" screen): Select Device ------------------------------------------------
+// The user, 2026-11-23: "add Select Device between Configuration and Calibration, a selector of which gamepad is player 1's
+// or 2's; change the distances between the rows so that all of it fits one screen". The screen (JOYSTICK_PRECONFIG, 0x8bd5060b)
+// has three rows a player in the bundle: MENUITEM_1..3 and 4..6, each with its MI_n_MASK (27 pixels) and a dark bar under it
+// (BOTTOM_MASK, seven of them: 10 pixels between rows, the whole fourth cell between the players, 20 at the end), 37 apart,
+// over the film's panel 73..341. The menu takes every MENUITEM_n the screen has, so the two new rows are just their objects,
+// made as FRONTB loads like the main menu's Exit: MENUITEM_7 and _8 with MI_7_MASK and MI_8_MASK, and a text for the gamepad's
+// name (a copy of the vibration's On / Off). Eight rows of 27 with 4 between them and 15 between the players fill the same
+// panel. The layout was drawn before it was built, by ModManager's renderer (work/nshots/controller).
+//
+// The menu goes through its rows by their numbers, and 7 and 8 belong second in each player's four: up and down are answered
+// here, in the order shown (JoystickPreConfig::HandleEvent, 0x2402c0, gets messages 8 and 9 and may refuse the menu's own step).
+static const u32 CONTROLLER_SCREEN = 0x8bd5060b;
+static const int kControllerOrder[8] = {1, 7, 2, 3, 4, 8, 5, 6};
+// (and as the wheels have them, top to bottom: Select Device, Calibration, Force Feedback, Advanced; see the wheels' screen below)
+static const int kWheelOrder[8] = {7, 2, 3, 1, 8, 5, 6, 4};
+static u32 device_text_hash(int player) { return pc_hash(player ? "CONTROLLER2_DEVICE" : "CONTROLLER1_DEVICE"); }
+// the two arrows beside a player's choice (copies of the vibration row's LEFT_ARROW_n and RIGHT_ARROW_n)
+static u32 device_arrow_hash(int player, int right)
+{
+    static const char *const kNames[2][2] = {{"LEFT_ARROW_D1", "RIGHT_ARROW_D1"}, {"LEFT_ARROW_D2", "RIGHT_ARROW_D2"}};
+    return pc_hash(kNames[player & 1][right & 1]);
+}
+
+static void add_device_rows(u32 project)
+{
+    const u32 s = find_screen(project, CONTROLLER_SCREEN);
+    if (!s || find_object(s, menuitem_hash(7), 1)) return;
+    u32 item[9] = {}, mask[9] = {};
+    float dy[9] = {}, was[9] = {}, row_y[9] = {};
+    for (int n = 1; n <= 6; n++) {
+        item[n] = find_object(s, menuitem_hash(n), 1);
+        mask[n] = find_object(s, pc_hash(("MI_" + std::to_string(n) + "_MASK").c_str()), 2);
+        if (!item[n] || !mask[n]) return;
+        was[n] = fl(mask[n] + 52);
+        dy[n] = fl(item[n] + 52) - was[n];
+    }
+    const u32 vib[2] = {find_object(s, 0x3fabc377, 1), find_object(s, 0xe2f33138, 1)};      // CONTROLLERn_VIBRATE_ONOFF
+    const u32 arrows[2][2] = {{find_object(s, 0x7bcd6704, 2), find_object(s, 0x7c51b6d7, 2)},  // LEFT_ARROW_1, RIGHT_ARROW_1
+                              {find_object(s, 0x7bcd6705, 2), find_object(s, 0x7c51b6d8, 2)}};
+    std::vector<u32> bars;
+    u32 label[2] = {};
+    const u32 bar_hash = pc_hash("BOTTOM_MASK");
+    for (u32 o = LW(s + 32); o && o != s + 32; o = LW(o)) {
+        if (LW(o + 8) == bar_hash && (s8)LB(o + 40) == 2) bars.push_back(o);
+        if ((s8)LB(o + 40) == 1 && LW(o + 96) == 160205) label[0] = o;      // "Player 1"
+        if ((s8)LB(o + 40) == 1 && LW(o + 96) == 160206) label[1] = o;      // "Player 2"
+    }
+    if (!vib[0] || !vib[1] || bars.empty()) return;
+    const float kRow = 27.0f, kBar = 4.0f, kGap = 15.0f, kTop = 72.0f, kEnd = 341.0f;
+    float y = kTop;
+    for (int i = 0; i < 8; i++) {
+        row_y[kControllerOrder[i]] = y;
+        y += kRow + (i == 3 ? kGap : kBar);
+    }
+    for (int p = 0; p < 2; p++) {
+        const int n = 7 + p, src = p ? 4 : 1;
+        item[n] = clone_object(s, item[src], 32);
+        SW(item[n] + 8, menuitem_hash(n));
+        SW(item[n] + 96, 0);
+        set_text(item[n], "Select Device");
+        mask[n] = clone_object(s, mask[src]);
+        SW(mask[n] + 8, pc_hash(("MI_" + std::to_string(n) + "_MASK").c_str()));
+        dy[n] = dy[src];
+    }
+    for (int n = 1; n <= 8; n++) {
+        set_fl(mask[n] + 52, row_y[n]);
+        set_fl(item[n] + 52, row_y[n] + dy[n]);
+        SB(mask[n] + 43, 5), SB(item[n] + 43, 5);
+    }
+    for (int p = 0; p < 2; p++) {
+        const int row = p ? 6 : 3, mine = 7 + p;
+        const float value_dy = fl(vib[p] + 52) - was[row];
+        set_fl(vib[p] + 52, row_y[row] + value_dy);
+        SB(vib[p] + 43, 5);
+        for (u32 a : arrows[p])
+            if (a) set_fl(a + 52, fl(a + 52) - was[row] + row_y[row]), SB(a + 43, 5);
+        const u32 v = clone_object(s, vib[p], 40);
+        SW(v + 8, device_text_hash(p));
+        SW(v + 96, 0);
+        set_fl(v + 52, row_y[mine] + value_dy);
+        set_text(v, "None");
+        for (int side = 0; side < 2; side++)
+            if (const u32 a = arrows[p][side]) {
+                const u32 mine_a = clone_object(s, a);
+                SW(mine_a + 8, device_arrow_hash(p, side));
+                set_fl(mine_a + 52, fl(a + 52) - row_y[row] + row_y[mine]);     // (the vibration's arrows are in their new row by now)
+                SB(mine_a + 41, 0);                     // shown with its row highlighted (the handler below)
+            }
+        if (label[p]) {
+            const int first = p ? 4 : 1;
+            set_fl(label[p] + 52, fl(label[p] + 52) - was[first] + row_y[first]);
+            SB(label[p] + 43, 5);
+        }
+    }
+    // a bar under every row, down to the next row (the players' gap under the fourth, the panel's end under the last)
+    std::sort(bars.begin(), bars.end(), [](u32 a, u32 b) { return fl(a + 52) < fl(b + 52); });
+    while (bars.size() < 8) bars.push_back(clone_object(s, bars[0]));
+    for (int i = 0; i < 8; i++) {
+        const float top = row_y[kControllerOrder[i]] + kRow, bottom = i == 7 ? kEnd : row_y[kControllerOrder[i + 1]];
+        set_fl(bars[(size_t)i] + 52, top);
+        set_fl(bars[(size_t)i] + 60, (bottom - top) / 16.0f);      // the bar's texture is 16 high
+        SB(bars[(size_t)i] + 43, 5);
+    }
+}
+
+static u32 find_menu_screen(u32 hash);
+// the menu of the screen that is up (FlailerScreenList, gp-21324: its node +412, the node's screens +8, a screen's menu +8)
+static u32 menu_now()
+{
+    const u32 list = LW(gp() - 21324), node = list ? LW(list + 412) : 0, screens = node ? node + 8 : 0;
+    const u32 screen = screens ? LW(screens) : 0;
+    return screen && screen != screens ? LW(screen + 8) : 0;
+}
+
+// Each player's choice in its row: Automatic, None or the gamepad's name, with an arrow on each side while the row is highlighted
+// (the user, 2026-11-23: "add arrows to the gamepad's choice too", pulsing as the game's are: alpha by a sine, 10 radians a
+// second). A short word stands where the vibration's On / Off does, between arrows where its arrows are (446 and 583, the word
+// centred on 524); a gamepad's name is longer than that room, so its right arrow goes to the panel's edge and the name and the
+// left arrow as far left as the name is long.
+//
+// The places are set every tick and from the vibration row's objects, never as plain numbers: the screen's rows slide in from
+// the right when it opens (OptionsScreenBase's slide moves an object with its group, and a copy keeps its original's group),
+// and a place written while they slid was left behind by the rest of the slide: the choice ended up at the screen's left edge
+// until it was changed (the user's picture, 2026-11-23). A copy is its original's distance from home away from its own.
+//
+// The choice is made in two steps (the user, 2026-11-23: "the choice is complete only when the player leaves the selector";
+// taken at every step, a gamepad that chose None for its own player went to the other player at once and its held button went
+// on choosing there). Select on the row opens the selector: its arrows start to pulse, Left and Right go through the choices,
+// which are only shown; Select again takes what is shown, Back leaves it as it was. Up and Down do nothing meanwhile. With the
+// selector closed the arrows stand still and Left and Right do nothing.
+static bool g_wheel_screen;                 // the screen is up as the steering wheels' (pc_open_controller, below)
+// A Controller screen object just made. Its address does not say so: the game makes the object anew every time the screen comes
+// up, and the heap gives it the place of the one before, so "another address" was true the first time only. The wheels' rows
+// were greyed once after the game's start and live again from the second visit on (the user, 2026-11-25: "on the inactive
+// rows the selector must be inactive too"). The screen list's tick counts the frames in which another screen is up; a count
+// that has moved since this screen's handler last ran means the screen went and came back.
+static unsigned g_controller_away;
+static bool g_rows_fresh, g_rows_look;      // the wheels' rows: their states to be told; the highlight to be looked at
+static bool g_device_fresh;                 // the devices' names to be written again (the screens may have been loaded anew)
+static u32 g_highlight_hidden[2];           // the highlight's two lines, hidden while no row of the wheels' screen is live
+static bool wheel_row_live(int n);
+static int g_wheel_back_row;                // the row of the wheels' screen a page or a screen was opened from: highlighted on the way back
+static int g_calibration_watch;             // frames until speed.log is told what screen came after the wheels' Calibration was chosen
+static int g_device_row;                    // the Select Device row that is highlighted: 7, 8, or 0
+static int g_device_edit;                   // the row whose selector is open: 7, 8, or 0
+static std::string g_device_shown;          // the choice shown in the open selector, not taken yet
+static void controller_device_layout(u32 self, bool now)
+{
+    static u32 last_self;
+    static std::string last[2];
+    static int width[2];
+    const u32 chunk = find_menu_screen(CONTROLLER_SCREEN);
+    if (!chunk) return;
+    const int alpha = 32 + (int)(96.0 * (1.0 + sin(menu_seconds() * 10.0)) * 0.5);
+    for (int p = 0; p < 2; p++) {
+        const u32 o = find_object(chunk, device_text_hash(p), 1);
+        const u32 vib = find_object(chunk, p ? 0xe2f33138u : 0x3fabc377u, 1);
+        if (!o || !vib) continue;
+        // "Automatic", "None" (texts of the menus) or the gamepad's name: the choice made, or the one shown in the open selector
+        std::string name = g_device_edit == 7 + p ? g_device_shown : g_wheel_screen ? pc_wheel_value(p) : window_pad_value(p);
+        name = name.empty() ? "Automatic" : name == "none" ? "None" : name;
+        if (name.size() > 26) name = name.substr(0, 25) + ".";
+        if (now || g_device_fresh || self != last_self || name != last[p]) {
+            last[p] = name;
+            set_text(o, name);
+            width[p] = (int)pc_call(fn::ObjectWidth, o);
+            if (width[p] <= 0 || width[p] > 600) width[p] = (int)name.size() * 10;
+        }
+        const float w = (float)width[p];
+        float centre = 524.0f, left = 446.0f, right = 583.0f;
+        if (w > 105.0f) right = 616.0f, centre = 608.0f - w / 2, left = centre - w / 2 - 24.0f;
+        const auto place = [](u32 obj, float x) {
+            if (fl(obj + 48) != x) set_fl(obj + 48, x), SB(obj + 43, 5);
+        };
+        place(o, centre + fl(vib + 48) - 524.0f);
+        for (int side = 0; side < 2; side++) {
+            const u32 mine = find_object(chunk, device_arrow_hash(p, side), 2);
+            const u32 src = find_object(chunk, (side ? 0x7c51b6d7u : 0x7bcd6704u) + (u32)p, 2);     // RIGHT_ARROW_n : LEFT_ARROW_n
+            if (!mine || !src) continue;
+            const bool show = g_device_row == 7 + p && !(g_wheel_screen && !wheel_row_live(7 + p));      // (none on a greyed row)
+            if (((s8)LB(mine + 41) == 1) != show) pc_call(fn::SetVisibility, mine, show ? 1 : 0);
+            if (!show) continue;
+            place(mine, (side ? right : left) + fl(src + 48) - (side ? 583.0f : 446.0f));
+            pc_call(fn::SetAlpha, mine, g_device_edit == 7 + p ? (u32)alpha : 128u);      // pulsing: the selector is open
+        }
+    }
+    last_self = self;
+    g_device_fresh = false;
+}
+
+// ---- the Controller screen as the steering wheels' ---------------------------------------------------------------------
+// The user, 2026-11-24: "the wheels as an item of their own in the controls, with the same layout as the gamepads have now",
+// and after the first build, a plain page of settings: "the wheel is still not made in the likeness of the gamepads". So the
+// wheels' screen is the game's Controller screen itself, opened as the wheels' (Controls > Steering Wheel): the same two
+// players' rows, with the wheels' words on them and the wheels' things behind them.
+//      the gamepads'       the wheels'
+//      Select Device       Select Device       whose wheel is whose (pcwheel.cpp: Automatic, None, a wheel by its name)
+//      Calibration         Calibration         the game's own calibration screen of that player's port
+//      Vibration           Force Feedback      On or Off, that player's wheel (hp2.ini's wheel_ffb1 / wheel_ffb2)
+//      Configuration       Advanced            that player's wheel's own settings, the forces and the rotation ("PC Wheel 1" and
+//                                              "PC Wheel 2", pcsettings.cpp). The wheels have one layout, so the row's place in
+//                                              the game's handler is free; it stands last here (the user, 2026-11-25: "in the
+//                                              row Advanced of each player, after the on / off switch")
+// The words are put on the screen's own texts (the title, the rows' labels, the vibration's On / Off) while the screen is the
+// wheels', and the game's are given back when it is the gamepads' again. A text set by its string loses its language id
+// (FlailerTextChunk::SetString, 0x140e20, clears +96), so the id is kept here and set again (SetLanguageID, 0x140ea8). The game
+// writes its own On / Off over the vibration's text when it likes: an id back on a text says so, and the word is put again.
+static void wheel_words_off();
+static void pad_words(bool on);
+static void controller_rows_place(bool wheels);
+void pc_open_controller(bool wheels)
+{
+    g_wheel_screen = wheels;
+    g_wheel_back_row = 0;
+    // (the words and the rows' places before the screen comes up: its first highlight is drawn where its row stands then)
+    if (!wheels && !g_wheel_was.empty()) wheel_words_off();
+    pad_words(!wheels);
+    controller_rows_place(wheels);
+    pc_open_page("Joystick PreConfig");
+}
+bool pc_controller_wheels() { return g_wheel_screen; }
+
+// Where the rows stand. The wheels have no Configuration (one layout for all), and their three rows stand one place up, Select
+// Device where the gamepads' Configuration is (the user, 2026-11-24: "raise the rows, so that Select Device is where
+// Configuration was"); the Configuration row itself goes to the fourth place, as the wheels' Advanced. A row is its mask, its label and what
+// it shows (the device's name and its arrows; On / Off and its arrows): all of them move by what the mask is away from its
+// place, so this can be asked any number of times, and after the screens are loaded anew as well.
+static float controller_row_y(int n)
+{
+    float y = 72.0f;                                    // add_device_rows: 27 a row, 4 between rows, 15 between the players
+    for (int i = 0; i < 8; i++) {
+        if (kControllerOrder[i] == n) return y;
+        y += 27.0f + (i == 3 ? 15.0f : 4.0f);
+    }
+    return y;
+}
+
+static void controller_rows_place(bool wheels)
+{
+    const u32 chunk = find_menu_screen(CONTROLLER_SCREEN);
+    if (!chunk) return;
+    for (int p = 0; p < 2; p++) {
+        const int rows[4] = {p ? 4 : 1, 7 + p, p ? 5 : 2, p ? 6 : 3};       // as the gamepads have them, top to bottom
+        for (int i = 0; i < 4; i++) {
+            const int n = rows[i], at = wheels ? rows[(i + 3) % 4] : n;
+            const u32 mask = find_object(chunk, pc_hash(("MI_" + std::to_string(n) + "_MASK").c_str()), 2);
+            if (!mask) continue;
+            const float by = controller_row_y(at) - fl(mask + 52);
+            if (by > -0.01f && by < 0.01f) continue;
+            u32 group[5] = {mask, find_object(chunk, menuitem_hash(n), 1), 0, 0, 0};
+            if (i == 1) {
+                group[2] = find_object(chunk, device_text_hash(p), 1);
+                group[3] = find_object(chunk, device_arrow_hash(p, 0), 2);
+                group[4] = find_object(chunk, device_arrow_hash(p, 1), 2);
+            } else if (i == 3) {
+                group[2] = find_object(chunk, p ? 0xe2f33138u : 0x3fabc377u, 1);
+                group[3] = find_object(chunk, 0x7bcd6704u + (u32)p, 2);         // LEFT_ARROW_n
+                group[4] = find_object(chunk, 0x7c51b6d7u + (u32)p, 2);         // RIGHT_ARROW_n
+            }
+            for (u32 o : group)
+                if (o) set_fl(o + 52, fl(o + 52) + by), SB(o + 43, 5);
+        }
+    }
+}
+
+// A player's rows as the wheels have them (the user, 2026-11-25: "in the wheel's settings every setting must be inactive
+// where the game detects no wheel in the system"). A player's Calibration, Force Feedback and Advanced are live while that
+// player has a wheel; Select Device, where a wheel is given to a player, while there is a wheel at all. With none connected
+// every row is greyed, and what a greyed row shows (the device's name, On / Off) is dimmed with it, as the port's pages do.
+// Told when the game sets the rows' states itself (its UpdateMenuItems), for a screen object just made, and when a wheel comes
+// or goes: never frame after frame (the game takes the rows away as a screen goes).
+static bool wheel_row_live(int n)
+{
+    if (n == 7 || n == 8) return pc_wheel_any();
+    return n >= 1 && n <= 6 && pc_wheel_of(n >= 4 ? 1 : 0) >= 0;
+}
+
+static void wheel_rows_live(int player, u32 screen)
+{
+    for (int n : {player ? 4 : 1, player ? 5 : 2, player ? 6 : 3, 7 + player})
+        pc_call(fn::GrayMenuItem, menuitem_hash(n), wheel_row_live(n) ? 1 : 0, screen);
+    const u32 chunk = find_menu_screen(CONTROLLER_SCREEN);
+    if (!chunk) return;
+    if (const u32 o = find_object(chunk, device_text_hash(player), 1)) pc_call(fn::SetAlpha, o, wheel_row_live(7 + player) ? 128 : 40);
+    if (const u32 o = find_object(chunk, player ? 0xe2f33138u : 0x3fabc377u, 1)) pc_call(fn::SetAlpha, o, wheel_row_live(player ? 6 : 3) ? 128 : 40);
+}
+
+// a word of the port's on a text of the screen, the text's own language id kept (was) for the day the game's word comes back
+static void screen_word(std::map<u32, u32> &kept, u32 obj, const std::string &s)
+{
+    if (!obj) return;
+    const u32 id = LW(obj + 96);
+    const auto was = kept.find(obj);
+    if (was == kept.end()) kept[obj] = id;
+    else if (id) was->second = id;
+    const auto shown = g_texts.find(obj);
+    if (id || shown == g_texts.end() || shown->second != s) set_text(obj, s);
+}
+
+static void screen_words_off(std::map<u32, u32> &kept)
+{
+    for (const auto &w : kept) {
+        g_texts.erase(w.first);
+        if (w.second) pc_call(0x140ea8, w.first, w.second);
+    }
+    kept.clear();
+}
+
+static void wheel_word(u32 obj, const std::string &s) { screen_word(g_wheel_was, obj, s); }
+
+static void wheel_words_off()
+{
+    screen_words_off(g_wheel_was);
+    for (u32 &o : g_highlight_hidden) {     // (the highlight's lines, if the wheels' screen hid them)
+        if (o) pc_call(fn::SetVisibility, o, 1);
+        o = 0;
+    }
+    // (and what the wheels' greyed rows dimmed)
+    if (const u32 chunk = find_menu_screen(CONTROLLER_SCREEN))
+        for (int p = 0; p < 2; p++)
+            for (u32 o : {find_object(chunk, device_text_hash(p), 1), find_object(chunk, p ? 0xe2f33138u : 0x3fabc377u, 1)})
+                if (o) pc_call(fn::SetAlpha, o, 128);
+}
+
+// The gamepads' screen: a player's Calibration row, which is that player's page of the gamepad's settings here, is named for
+// what it is (the user, 2026-11-25: "rename the gamepads' Calibration to Advanced as well", as the wheels' row of settings
+// is). The wheels' Calibration is the game's calibration and keeps the game's word.
+static void pad_words(bool on)
+{
+    if (!on) {
+        if (!g_pad_was.empty()) screen_words_off(g_pad_was);
+        return;
+    }
+    const u32 chunk = find_menu_screen(CONTROLLER_SCREEN);
+    if (!chunk) return;
+    for (int n : {2, 5}) screen_word(g_pad_was, find_object(chunk, menuitem_hash(n), 1), "Advanced");
+}
+
+// the screen's title: the text that says "Controller" (the language's 100002 or 100003), found once for a screen's data
+static u32 controller_title(u32 chunk)
+{
+    static u32 of, title;
+    if (of != chunk || (title && !g_wheel_was.count(title) && LW(title + 96) != 100002 && LW(title + 96) != 100003)) {
+        of = chunk, title = 0;
+        for (u32 o = LW(chunk + 32); o && o != chunk + 32; o = LW(o))
+            if ((s8)LB(o + 40) == 1 && (LW(o + 96) == 100002 || LW(o + 96) == 100003)) title = o;
+    }
+    return title;
+}
+
+static void wheel_rows(u32 self, bool tick)
+{
+    const u32 chunk = find_menu_screen(CONTROLLER_SCREEN);
+    if (!chunk) return;
+    wheel_word(controller_title(chunk), "Wheel");           // (one word: "Steering Wheel" did not fit the title, and "Steering" was left of it)
+    for (int p = 0; p < 2; p++) {
+        wheel_word(find_object(chunk, menuitem_hash(p ? 4 : 1), 1), "Advanced");
+        wheel_word(find_object(chunk, menuitem_hash(p ? 6 : 3), 1), "Force Feedback");
+        wheel_word(find_object(chunk, p ? 0xe2f33138u : 0x3fabc377u, 1), g_cfg.wheel_ffb[p] ? "On" : "Off");
+    }
+    // A screen object just made, or a wheel come or gone: the rows' states, and the highlight. The menu starts on its first row
+    // by number, which is the wheels' last (Advanced): the highlight goes to the row the player came back to (a page or the
+    // calibration was opened from it), else to player 1's Select Device, the first row shown; and off a row that is greyed, to
+    // the first one that is not (with no wheel there is none, and it stays).
+    static int last_state = -1;
+    static bool placed;
+    const int state = (pc_wheel_any() ? 1 : 0) | (pc_wheel_of(0) >= 0 ? 2 : 0) | (pc_wheel_of(1) >= 0 ? 4 : 0);
+    if (g_rows_fresh || state != last_state) {
+        if (g_rows_fresh) placed = false;
+        g_rows_fresh = false;
+        last_state = state;
+        g_rows_look = true;
+        for (int p = 0; p < 2; p++) wheel_rows_live(p, LW(self + 100));
+    }
+    // What a greyed row shows stays dim: the game sets the On / Off's colour itself, and the rows' slide in sets their alpha.
+    // (A text's alpha is the top byte of its colour, +92: FlailerTextChunk's SetAlpha, 0x140ed0.)
+    for (int p = 0; p < 2; p++) {
+        const u32 shown[2] = {find_object(chunk, device_text_hash(p), 1), find_object(chunk, p ? 0xe2f33138u : 0x3fabc377u, 1)};
+        const bool live[2] = {wheel_row_live(7 + p), wheel_row_live(p ? 6 : 3)};
+        for (int k = 0; k < 2; k++)
+            if (shown[k] && !live[k] && (LW(shown[k] + 92) >> 24) > 40) pc_call(fn::SetAlpha, shown[k], 40);
+    }
+    // With no row live there is nothing to highlight (the user, 2026-11-25, of the frame on a greyed Select Device: "this
+    // highlight must not be there either"). The highlight is OptionsScreenBase::HandleHighlight's (0x1f4e68): two lines, over
+    // and under the row (0xc671680c and 0x32c91dae, moved to the row's mask), and the row's mask as the current one of the
+    // screen's selection set (this +4; SelectionSet::SetCurrentItem, 0x16e270: the current object +132 is hidden and the others
+    // shown where its +144 is set, the other way round where not). Both are undone here and put back when a row comes alive.
+    {
+        const u32 set = LW(self + 4), current = set ? LW(set + 132) : 0;
+        const bool current_hidden = set && LW(set + 144) != 0;
+        if (!pc_wheel_any()) {
+            const u32 own = find_menu_screen(LW(self));
+            const u32 lines[2] = {own ? find_object(own, 0xc671680cu) : 0, own ? find_object(own, 0x32c91daeu) : 0};
+            for (int k = 0; k < 2; k++)
+                if (lines[k] && (s8)LB(lines[k] + 41) == 1) {
+                    pc_call(fn::SetVisibility, lines[k], 0);
+                    g_highlight_hidden[k] = lines[k];
+                }
+            if (current && ((s8)LB(current + 41) == 1) != current_hidden) pc_call(fn::SetVisibility, current, current_hidden ? 1 : 0);
+        } else if (g_highlight_hidden[0] || g_highlight_hidden[1]) {
+            for (u32 &o : g_highlight_hidden) {
+                if (o) pc_call(fn::SetVisibility, o, 1);
+                o = 0;
+            }
+            if (current) pc_call(fn::SetVisibility, current, current_hidden ? 0 : 1);
+        }
+    }
+    // a greyed Force Feedback row shows no arrows either (the game shows the vibration's two with the row highlighted)
+    for (int p = 0; p < 2; p++) {
+        if (wheel_row_live(p ? 6 : 3)) continue;
+        for (u32 h : {0x7bcd6704u + (u32)p, 0x7c51b6d7u + (u32)p})         // LEFT_ARROW_n, RIGHT_ARROW_n
+            if (const u32 a = find_object(chunk, h, 2))
+                if ((s8)LB(a + 41) == 1) pc_call(fn::SetVisibility, a, 0);
+    }
+    if (!tick || !g_rows_look) return;
+    const u32 menu = menu_now();
+    if (!menu) return;
+    g_rows_look = false;
+    const u32 active = LW(menu + 8);
+    int on = 0;
+    for (int n = 1; active && n <= 8; n++)
+        if (LW(active + 12) == menuitem_hash(n)) on = n;
+    int want = on;
+    if (!placed) {
+        placed = true;
+        want = g_wheel_back_row ? g_wheel_back_row : 7;
+        g_wheel_back_row = 0;
+    }
+    if (!want || !wheel_row_live(want)) {
+        want = 0;
+        for (int n : kWheelOrder)
+            if (!want && wheel_row_live(n)) want = n;
+    }
+    if (want && want != on) pc_call(0x16a3a8, menu, menuitem_hash(want));           // FlailerMenu::SetActiveMenuItem
+}
+
+// JoystickPreConfig::HandleEvent (0x2402c0: this, message, ScreenCallbackData: +0 the row's hash, +4 the port, +8 Param, +12 the
+// sound). The two Select Device rows are the port's (the selector above: window_pad_step through Automatic, None and each
+// gamepad plugged in; window_pad_set takes one, never the one the other player has by name: the two change places). They
+// answer either pad and the keys, as a player with no gamepad must be able to choose one. Up and Down are answered for every
+// row, in the order shown.
+void HOOK_JoystickPreConfigHandleEvent(Ctx &c, void (*orig)(Ctx &))
+{
+    g_pc_ctx = &c;
+    const u32 self = c.r[4].w[0], msg = c.r[5].w[0], data = c.r[6].w[0];
+    const int row = data ? (int)(LW(data) - menuitem_hash(1)) + 1 : 0;      // MENUITEM_n's n
+    if (!g_wheel_screen && !g_wheel_was.empty()) wheel_words_off();         // the gamepads' again: the game's own words
+    if (g_wheel_screen) pad_words(false);
+    bool fresh = false;
+    {   // a screen object just made (g_controller_away)
+        static unsigned seen;
+        static u32 last_self;
+        fresh = seen != g_controller_away || self != last_self;
+        seen = g_controller_away;
+        last_self = self;
+    }
+    if (fresh) {
+        // its rows where this mode has them (the screens may have been loaded anew since it was opened), and their states
+        controller_rows_place(g_wheel_screen);
+        g_rows_fresh = true;
+        g_device_fresh = true;
+    }
+    // another screen object, or the highlight on another row (the pointer put it there): an open selector is left as it was; and
+    // one whose row went grey under it (the wheel went) is closed
+    if (fresh || (msg == 4 && row != g_device_edit)) g_device_edit = 0;
+    if (g_wheel_screen && g_device_edit && !wheel_row_live(g_device_edit)) g_device_edit = 0;
+    if (g_device_edit) {
+        // the selector is open: Left and Right show the next choice, Select takes it, Back gives it up; nothing else is heard
+        const int player = g_device_edit - 7;
+        if (msg == 6 || msg == 7) {
+            g_device_shown = g_wheel_screen ? pc_wheel_step(g_device_shown, msg == 6 ? -1 : 1) : window_pad_step(g_device_shown, msg == 6 ? -1 : 1);
+            SW(data + 12, msg == 6 ? 1 : 2);
+        } else if (msg == 1) {
+            if (g_wheel_screen) pc_wheel_set(player, g_device_shown);
+            else window_pad_set(player, g_device_shown);
+            pc_config_save();
+            g_device_edit = 0;
+        } else if (msg == 17) {
+            SW(data + 8, 0);                            // Back is the selector's: the screen stays
+            g_device_edit = 0;
+        } else if (msg == 8 || msg == 9) {
+            SW(data + 8, 1);                            // no step to another row
+            SW(data + 12, 0);
+        } else if (msg == 18 || msg == 4) {
+            orig(c);
+        }
+        if (msg != 18) controller_device_layout(self, true);
+        else controller_device_layout(self, false);
+        if (g_wheel_screen) wheel_rows(self, msg == 18);
+        return;
+    }
+    if (g_wheel_screen && (row == 7 || row == 8) && (msg == 1 || msg == 6 || msg == 7) && !wheel_row_live(row)) {
+        // (no wheel connected: there is nothing to choose from, and the row is greyed)
+        blurb_text(self + 224, row == 8 ? "Player 2 has no steering wheel." : "Player 1 has no steering wheel.");
+        pc_call(fn::BlurbAnimate, self + 224);
+        SW(data + 12, 0);
+        return;
+    }
+    if (msg == 1 && (row == 7 || row == 8)) {
+        g_device_edit = row;
+        g_device_shown = g_wheel_screen ? pc_wheel_value(row - 7) : window_pad_value(row - 7);
+        controller_device_layout(self, true);
+        return;
+    }
+    if ((msg == 6 || msg == 7) && (row == 7 || row == 8)) {
+        SW(data + 12, 0);                               // the selector is closed: Select opens it
+        return;
+    }
+    if ((msg == 8 || msg == 9) && row >= 1 && row <= 8) {
+        const u32 menu = menu_now();
+        const int *const order = g_wheel_screen ? kWheelOrder : kControllerOrder;
+        // (the menu's own step is refused whatever comes of this one: it goes by the rows' numbers, and with every row of the
+        // wheels' screen greyed it was the menu's step that still moved the highlight)
+        SW(data + 8, 1);
+        bool stepped = false;
+        int at = 0;
+        for (int i = 0; i < 8; i++)
+            if (order[i] == row) at = i;
+        for (int k = 1; menu && k < 8; k++) {
+            const int next = order[(at + (msg == 9 ? k : 8 - k)) % 8];
+            bool usable = false;
+            for (u32 item = LW(menu); item && item != menu; item = LW(item))
+                if (LW(item + 12) == menuitem_hash(next)) usable = (LW(item + 8) & 1) != 0;
+            if (!usable || (g_wheel_screen && !wheel_row_live(next))) continue;       // greyed: stepped over, as the menu does
+            pc_call(0x16a3a8, menu, menuitem_hash(next));       // FlailerMenu::SetActiveMenuItem
+            pc_call(0x16e038, msg == 9 ? 4 : 3);        // MakeFrontendSound: up / down
+            stepped = true;
+            break;
+        }
+        if (!stepped) SW(data + 12, 0);                 // nowhere to go: no sound of a step either
+        return;
+    }
+    // The screen as the wheels' (above): a player's Advanced, Calibration and Force Feedback.
+    if (g_wheel_screen && row >= 1 && row <= 6 && (msg == 1 || msg == 6 || msg == 7)) {
+        const int player = row >= 4 ? 1 : 0, kind = (row - 1) % 3;      // 0 Advanced, 1 Calibration, 2 Force Feedback
+        if (pc_wheel_of(player) < 0) {
+            // (the rows of a player with no wheel are greyed; if one is pressed all the same, it says why nothing comes of it)
+            blurb_text(self + 224, player ? "Player 2 has no steering wheel." : "Player 1 has no steering wheel.");
+            pc_call(fn::BlurbAnimate, self + 224);
+            SW(data + 12, 0);
+        } else if (kind == 0) {
+            if (msg == 1) {
+                g_wheel_back_row = row;
+                pc_open_page(player ? "PC Wheel 2" : "PC Wheel 1");
+            } else {
+                SW(data + 12, 0);
+            }
+        } else if (kind == 1) {
+            if (msg == 1) {
+                // The game's own way to its calibration screen: its handler's Select of this row (0x240564) changes the screen
+                // from inside itself, for the row's own player, who is put in as the one who pressed. (Four builds opened the
+                // screen from here with the port's own call of the same ChangeToScreen, and nothing came up: the user,
+                // 2026-11-24, "still does not open". Why that call does not do what the game's does is not known; the game's
+                // own did open the screen in the build of 19:52. speed.log has what the port's device was, and what screen
+                // was up half a second later.)
+                const u32 type = pc_call(0x154308, (u32)player);
+                fprintf(stderr, "menus: the wheels' Calibration, player %d: wheel %d, the port's device type %u, plugged in %u, can be calibrated %u\n",
+                        player + 1, pc_wheel_of(player), type, pc_call(0x1542f0, (u32)player), pc_call(0x11d430, type));
+                const u32 pressed_by = LW(data + 4);
+                SW(data + 4, (u32)player);
+                g_wheel_back_row = row;
+                orig(c);
+                SW(data + 4, pressed_by);
+                g_calibration_watch = 30;
+            } else {
+                SW(data + 12, 0);
+            }
+        } else {
+            g_cfg.wheel_ffb[player] ^= 1;
+            pc_config_save();
+            if (msg != 1) SW(data + 12, msg == 6 ? 1 : 2);
+            wheel_rows(self, false);
+        }
+        return;
+    }
+    // Calibration (rows 2 and 5: the game's MakeCalibrationScreenAvailable names MENUITEM_2 and _5) with a device the game has
+    // nothing to calibrate in, a gamepad: that player's own page of the gamepad's settings (the user, 2026-11-24; pcsettings.cpp,
+    // "PC Pad 1" and "PC Pad 2"). A wheel, which the game does calibrate, goes the game's way.
+    // (Whatever the port's device is at the moment: this is the gamepads' screen, and a wheel's calibration is on the wheel's
+    // own page. The first build asked the game whether the device can be calibrated, and with a wheel there the row went on
+    // opening the wheel's screen: the user, 2026-11-24, "Calibration still has the wheel".)
+    const bool pad_setup_row = row == 2 || row == 5;
+    if (msg == 1 && pad_setup_row) {
+        pc_open_page(row == 5 ? "PC Pad 2" : "PC Pad 1");
+        return;
+    }
+    // A player's rows answer that player's own device in the game: the handler compares the port the press came from (the
+    // callback data's +4) with the row's player, and drops another's. With one keyboard or one gamepad nobody could open player
+    // 2's layouts or switch their vibration (the user, 2026-11-24: "player 2's layouts do not open"). Here a row is its
+    // player's whoever pressed; the layouts' own screen is made to listen the same way (HOOK_JoystickConfigHandleScreenCallback).
+    const bool own_row = data && row >= 1 && row <= 6 && (msg == 1 || msg == 6 || msg == 7);
+    const u32 pressed_by = own_row ? LW(data + 4) : 0;
+    if (own_row) SW(data + 4, row >= 4 ? 1 : 0);
+    orig(c);
+    if (own_row) SW(data + 4, pressed_by);
+    if (msg == 4 && pad_setup_row && !g_wheel_screen) {
+        blurb_text(self + 224, row == 5 ? "The dead zones, the steering and the vibration of player 2's gamepad."
+                                        : "The dead zones, the steering and the vibration of player 1's gamepad.");
+        pc_call(fn::BlurbAnimate, self + 224);
+    }
+    // The frame of the highlighted row (the lines over and under it, the row's mask in the selection set) is the base screen's,
+    // OptionsScreenBase::HandleHighlight (0x1f4e68: this, message, data, the row's mask), called before this handler with no
+    // mask: it then finds the mask by the row, and knows MENUITEM_1..7 only. For the eighth it took no object at all and put
+    // the lines at the top of the screen (the user's picture, 2026-11-23: a yellow line up there with player 2's Select Device
+    // chosen). So it is called again here for that row, with its mask named.
+    if (msg == 4 && row == 8) pc_call(0x1f4e68, self, 4, data, pc_hash("MI_8_MASK"));
+    if (msg == 4 && (row == 7 || row == 8) && !g_wheel_screen) {
+        blurb_text(self + 224, row == 7 ? "Select, then choose the gamepad of player 1." : "Select, then choose the gamepad of player 2.");
+        pc_call(fn::BlurbAnimate, self + 224);
+    }
+    if (msg == 4 && g_wheel_screen && row >= 1 && row <= 8) {
+        // the wheels' screen: what each row is
+        const char *text = !wheel_row_live(row) ? (row == 8 || (row >= 4 && row <= 6) ? "Player 2 has no steering wheel." : "Player 1 has no steering wheel.")
+                         : row == 7 ? "Select, then choose the steering wheel of player 1."
+                         : row == 8 ? "Select, then choose the steering wheel of player 2."
+                         : row % 3 == 1 ? "The forces and the rotation of this player's wheel."
+                         : row % 3 == 2 ? "The game's own calibration of the wheel and its pedals."
+                         : "Force feedback of this player's wheel, on or off.";
+        blurb_text(self + 224, text);
+        pc_call(fn::BlurbAnimate, self + 224);
+    }
+    if (msg == 4) g_device_row = row == 7 || row == 8 ? row : 0;
+    if (msg == 18 || msg == 4) controller_device_layout(self, false);
+    if (g_wheel_screen && msg == 4 && row >= 1 && row <= 8 && !wheel_row_live(row)) g_rows_look = true;     // (off a greyed row)
+    if (g_wheel_screen) wheel_rows(self, msg == 18);
+    else if (msg == 18 || msg == 4) pad_words(true);
+}
+
+// JoystickPreConfig::UpdateMenuItems (0x240870: this, the port, a bool): the rows a player's device allows. The game opens
+// Calibration to what it can calibrate (a wheel: CanJoystickBeCalibrated) and greys it for a gamepad. Here the row is every
+// device's: a gamepad's is the port's page of that player's settings (HOOK_JoystickPreConfigHandleEvent, rows 2 and 5).
+void HOOK_JoystickPreConfigUpdateMenuItems(Ctx &c, void (*orig)(Ctx &))
+{
+    g_pc_ctx = &c;
+    const u32 self = c.r[4].w[0], port = c.r[5].w[0];
+    orig(c);
+    pc_call(0x240988, self, port, 1);       // MakeCalibrationScreenAvailable(this, port, true)
+    if (g_wheel_screen && port < 2) wheel_rows_live((int)port, LW(self + 100));        // the screen as the wheels': its own rows
+}
+
+// The layouts' list is the pad type's, ten at most, and the same for both players: the eight of the game's, the modern one
+// and player 1's own (ps2.cpp). A player's screen must have that player's own as the tenth, so while a function of the
+// layouts' screen runs (JoystickConfigScreen +0 is its port) the list read for the DualShock 2 (GetJoystickConfigs,
+// 0x155040: the buffer, its room, the pad's type; the count back) has player 2's number in that place for player 2's screen.
+// Until 2026-11-25 the list had both players' and each screen stepped over the other's; with the modern layout there are
+// eleven, and the list has ten places. A layout's letter is its place in this list, so the modern one is I and a player's
+// own J, for both players (the user, the same day: "let the Custom layout be J").
+static int g_config_port = -1;
+struct ConfigPort {
+    int before;
+    explicit ConfigPort(u32 screen) : before(g_config_port) { g_config_port = screen ? (int)(LW(screen) & 1) : -1; }
+    ~ConfigPort() { g_config_port = before; }
+};
+
+void HOOK_GetJoystickConfigs(Ctx &c, void (*orig)(Ctx &))
+{
+    const u32 list = c.r[4].w[0], type = c.r[6].w[0];
+    orig(c);
+    if (type != 0x79 || g_config_port != 1) return;
+    const u32 n = c.r[2].w[0];
+    for (u32 i = 0; i < n && i < 10; i++)
+        if (LW(list + i * 4) == PC_CUSTOM_LAYOUT) SW(list + i * 4, PC_CUSTOM_LAYOUT + 1);
+}
+
+// ChooseJoystickConfigurationNumber (0x1550d0: the pad's type, the layout wanted): the layout if the type's list has it, else
+// the list's first. Player 2's own is not in the list as it is kept, and is a DualShock 2's layout all the same.
+void HOOK_ChooseJoystickConfig(Ctx &c, void (*orig)(Ctx &))
+{
+    if (c.r[4].w[0] == 0x79 && c.r[5].w[0] == PC_CUSTOM_LAYOUT + 1) {
+        c.r[2].d[0] = PC_CUSTOM_LAYOUT + 1;
+        return;
+    }
+    orig(c);
+}
+
+// JoystickConfigScreen::InitCurrentDisplayedConfig (0x23e0b0: this): the layout the screen shows first, the port's if the list
+// has it. From the screen's constructor too, where no other hook of the screen is around it.
+void HOOK_InitCurrentDisplayedConfig(Ctx &c, void (*orig)(Ctx &))
+{
+    const ConfigPort whose(c.r[4].w[0]);
+    orig(c);
+}
+
+// JoystickConfigScreen::HandleScreenCallback (0x23e148: this, message, ScreenCallbackData): a player's layouts, A to D. The game
+// hears the screen's own player alone there (+0 is the screen's port; Back from another port is dropped), so a screen opened by
+// the other player's device could not even be left. Every device is the screen's player here.
+void HOOK_JoystickConfigHandleScreenCallback(Ctx &c, void (*orig)(Ctx &))
+{
+    const u32 self = c.r[4].w[0], data = c.r[6].w[0];
+    const bool mine = self && data;
+    const ConfigPort whose(self);
+    // Select (message 1) is "take this layout and go back" there, for the player's own layout as for any other. The page
+    // where its buttons are chosen (pcsettings.cpp, "PC Layout 1" and "PC Layout 2") opens by Delete, or Square / X on a
+    // gamepad (the user, 2026-11-25: "let Enter / Cross / A confirm the choice, and Square / X / Del open the editing"; until
+    // then Select opened the page and the layout could only be taken by Back). Asked at every tick of the screen (message
+    // 18), so that a press is one press; the layout shown is the port's already (CycleConfiguration sets it at each step).
+    // The pointer's click on the hint under the list is the same press (mouse_frame).
+    bool edit = false;
+    if (self && c.r[5].w[0] == 18) {
+        edit = window_delete_pressed();
+        edit = g_mouse_edit || edit;
+        g_mouse_edit = false;
+    }
+    if (edit && pc_custom_layout(LW(self + 4))) {
+        g_pc_ctx = &c;
+        pc_open_page(LW(self) & 1 ? "PC Layout 2" : "PC Layout 1");
+        return;
+    }
+    const u32 pressed_by = mine ? LW(data + 4) : 0;
+    const bool tick = self && c.r[5].w[0] == 18;
+    if (mine) SW(data + 4, LW(self));
+    orig(c);
+    if (mine) SW(data + 4, pressed_by);
+    // (the screen sets its help at every tick, SetHelpOverride, 0x16d448, with nothing for "the screen's own list": after it)
+    if (tick && pc_custom_layout(LW(self + 4))) {
+        static u32 lines;
+        g_pc_ctx = &c;
+        if (!lines) lines = pc_keep(16), SW(lines, 801601), SW(lines + 4, (u32)kHelpEdit), SW(lines + 8, 801602);
+        pc_call(0x16d448, lines);
+    }
+}
+
+// FlailerScreenList::JoyHandler (0x16cab0: the port, the event, pressed, the list): every button of the menus comes through here.
+// A screen made for one player hears that player's port alone (FlailerScreen's port, +16: FlailerScreen::JoyHandler, 0x16aa00,
+// and IsPortFiltered, 0x16b3b0, drop the others), and a player's layouts ("Joystick Config Port2") and calibration are such
+// screens: opened from player 1's device or the keyboard, they heard nothing of it, not even Back (the user, 2026-11-24:
+// "player 2's layouts open, but I cannot leave the menu"). So while one of those screens is up, a button of any port is the
+// screen's own player's. (The first try gave the screen itself to every port, SetScreenFilterPort with -1. But that port is
+// also whose screen it is: FlailerScreen::Activate hands it to the screen's callback, which made the layouts of "player -1",
+// and both players' screens said "No configs available": the user's picture of the same day.)
+void HOOK_JoyHandler__17FlailerScreenList12JoystickPort8JoyEventUcPv(Ctx &c, void (*orig)(Ctx &))
+{
+    g_pc_ctx = &c;
+    const std::string name = screen_name();
+    if (name.rfind("Joystick Config Port", 0) == 0 || name.rfind("Joystick Calibration Port", 0) == 0)
+        c.r[4].d[0] = name.back() == '2' ? 1 : 0;
+    orig(c);
 }
 
 static void port_edits(u32 tail)
@@ -1546,15 +2556,25 @@ static void port_edits(u32 tail)
     g_page_alloc = true;
     for (PcPage *pg : pages()) build_page(tail, *pg);
     add_exit_row(tail);
+    add_device_rows(tail);
     add_master_row(tail);
     add_back_hints(tail);
     if (!g_profiles_page.empty()) add_delete_hint(tail, g_profiles_page);
     // The layouts' screen (Joystick Config): Help's icon is the buttons' font's 'k' and Back's 'j', Circle's and Triangle's cells, which
-    // the layouts themselves show as the gamepad's. There the two hints take Select's cell ('b') and L3's ('3'): pc_paint_buttons.
-    if (u32 lay = find_screen(tail, 0xb6657464)) {
-        if (u32 o = find_object(lay, pc_hash("PC_BACK_ICON"), 1)) set_text(o, "b");
-        for (u32 o = LW(lay + 32); o && o != lay + 32; o = LW(o))
-            if ((s8)LB(o + 40) == 1 && LW(o + 80) == 0xb85de386 && pc_str(o + 100) == "k" && fl(o + 52) > 400.0f) pc_call(fn::SetString, o, gstr("3"));
+    // the layouts themselves show as the gamepad's. There the hints have cells of their own, three of the sticks' ('p' Back, 'v'
+    // Help, 'u' the button that edits a layout of the player's own): pc_paint_buttons.
+    if (u32 lay = find_screen(tail, CONFIG_SCREEN)) {
+        u32 help_icon = 0, help_word = 0;
+        for (u32 o = LW(lay + 32); o && o != lay + 32; o = LW(o)) {
+            if ((s8)LB(o + 40) != 1) continue;
+            if (LW(o + 96) == 12000) help_word = o;
+            else if (LW(o + 80) == 0xb85de386 && pc_str(o + 100) == "k" && fl(o + 52) > 400.0f) help_icon = o;
+        }
+        if (u32 o = find_object(lay, pc_hash("PC_BACK_ICON"), 1)) set_text(o, "p");
+        if (help_icon) pc_call(fn::SetString, help_icon, gstr("v"));
+        g_help_icon = help_icon;
+        add_edit_hint(lay, help_icon, help_word);
+        add_info_hint(tail, lay, help_word);
     }
     if (!g_profiles_page.empty()) add_name_grid(tail, g_profiles_page);
     g_project_gen++;
@@ -1594,6 +2614,7 @@ void HOOK_UnloaderFlailerChunk__FP6bChunk(Ctx &c, void (*orig)(Ctx &))
     g_pc_ctx = &c;
     orig(c);
     if (!find_project(FRONTB_PROJECT)) free_pages();
+    if (g_hud_project && !find_project(g_hud_project)) g_hud_project = 0, native_hud_part(0, nullptr);
 }
 
 // the screens the game makes from its configs: ours go in before the screen list is built
@@ -1630,6 +2651,7 @@ void HOOK___14tOptionsScreeni(Ctx &c, void (*orig)(Ctx &))
         if (pg->rows.size() >= 7) pc_call(fn::GrayMenuItem, menuitem_hash(7), 1, hash);
         if (pg->on_open) {
             pg->on_open(*pg);
+            if (pg->rows.size() >= 7) pc_call(fn::GrayMenuItem, menuitem_hash(7), 1, hash);     // (by the rows it has now, not those of before)
             pg->top = 0;
             page_shape(*pg);
         }
@@ -1672,6 +2694,35 @@ void HOOK___21tDisplayOptionsScreeni(Ctx &c, void (*orig)(Ctx &))
     c.r[2].d[0] = sx32(ret);
 }
 
+// "<button> Edit" at the bottom of the layouts' screen (add_edit_hint): shown with a layout of the player's own only
+static void config_edit_hint(bool show)
+{
+    const u32 s = find_menu_screen(CONFIG_SCREEN);
+    if (!s) return;
+    for (const u32 o : {find_object(s, pc_hash("PC_EDIT_ICON"), 1), find_object(s, pc_hash("PC_EDIT_WORD"), 1)})
+        if (o && ((s8)LB(o + 41) == 1) != show) pc_call(fn::SetVisibility, o, show ? 1 : 0);
+}
+
+// The layouts' screen's Help with a layout of the player's own on it: the screen's own two lines (801601 Left / Right "Select
+// controller configuration", 801602 "Back to Controller Options": the list at 0x31a668) and between them a line of the
+// port's for the button that edits (the user, 2026-11-25: "do not forget to update the Help screen there"). The lines are
+// LanguageIDs, and the game's table has no room for a new one (pcplatform.cpp, patch_language, can only replace), so the id
+// is the port's own, the first free after the screen's, and GetTranslatedString (0x21e560: the id) answers it here. Its icon
+// is the help character 0x93, the cell 'u' of the buttons' font: the same button as the hint at the bottom shows.
+void HOOK_GetTranslatedString(Ctx &c, void (*orig)(Ctx &))
+{
+    if ((int)c.r[4].w[0] != kHelpEdit) {
+        orig(c);
+        return;
+    }
+    g_pc_ctx = &c;
+    static u32 text;
+    if (!text) text = pc_keep(128);
+    const std::string s = "\x93 " + tr("Edit the buttons of this layout");
+    memcpy(host(text), s.c_str(), std::min<size_t>(s.size() + 1, 127));
+    c.r[2].d[0] = sx32(text);
+}
+
 // The layouts' screen shows a picture of the controller, the texture CONTROLLER<the layout's id>: 30 to 33 are the DualShock 2's. The four
 // layouts of the triggers have the ids of the DualShock 1's old ones (20 to 22, with its picture) and a new one (34, with none). They are
 // all a DualShock 2's here: its picture goes on after the game has set its own (0x144a28: a screen's object gets a texture by hash).
@@ -1679,15 +2730,95 @@ void HOOK_DrawScreen__20JoystickConfigScreen(Ctx &c, void (*orig)(Ctx &))
 {
     g_pc_ctx = &c;
     const u32 self = c.r[4].w[0];
+    const ConfigPort whose(self);
     orig(c);
     pc_call(0x144a28, LW(self + 0x10), 0x0b2ad6df, pc_hash("CONTROLLER30"));
+    // The layout's name is its letter, 'A' and its place in the list ("%c": FlailerSetString, 0x143e70, of the screen +16 and
+    // the item +24): the game's own doing. The modern layout is the ninth, I, and the player's own the tenth, J, for both
+    // players (the list as a player's screen reads it: HOOK_GetJoystickConfigs). A word there, "Custom", ran over the arrows.
+    const bool own = pc_custom_layout(LW(self + 4));
+    if (const u32 s = find_menu_screen(CONFIG_SCREEN)) {
+        // The letter stands by its left edge, where the game's eight are all about one width; I and J are narrow and stood to
+        // the left of the others' middle (the user's picture, 2026-11-25: "line I and J up as the other letters in this
+        // space"). They are moved right by half of what they lack to the mean width of A to H (the font's own advances at the
+        // object's size, as its GetWidth, 0x140d30, adds them). The object's own place is kept as it was first met.
+        if (const u32 o = find_object(s, LW(self + 24), 1)) {
+            static int gen = -1;
+            static float home;
+            if (gen != g_project_gen) gen = g_project_gen, home = fl(o + 48);
+            float x = home;
+            const u32 font = pc_port_layout(LW(self + 4)) ? pc_call(0x13fe18, LW(o + 80)) : 0;      // FindFont
+            if (font) {
+                const auto advance = [font](u32 ch) {
+                    const u32 g = LW(font + 8 + ch * 4);
+                    return g ? fl(g + 20) : 0.0f;
+                };
+                float mean = 0.0f;
+                for (u32 ch = 'A'; ch <= 'H'; ch++) mean += advance(ch) / 8.0f;
+                const float mine = advance(LB(o + 100));
+                if (mine > 0.0f && mean > mine) x = home + (mean - mine) * fl(o + 56) / 2.0f;
+            }
+            if (fl(o + 48) != x) set_fl(o + 48, x), SB(o + 43, 5);
+        }
+        // Steering has two icons with a slash between them, the stick's (event 112: the object 0xcdf8d89a, shown with the
+        // slash, 0x7f670764, only when there is one) and the D-pad's (111: 0xff20a4fb, next to the word). A layout where the
+        // stick alone steers had the stick's icon far from the word, then the slash, then nothing (the same picture: "move
+        // the Steering icon closer to the words and take the slash away"): its icon goes where the D-pad's would be.
+        const u32 dpad = find_object(s, 0xff20a4fb, 1), stick = find_object(s, 0xcdf8d89a, 1), slash = find_object(s, 0x7f670764);
+        if (dpad && stick && !LB(dpad + 100) && LB(stick + 100) && (s8)LB(stick + 41) == 1) {
+            if (fl(dpad + 48) >= fl(stick + 48)) {
+                pc_call(fn::SetString, dpad, gstr(pc_str(stick + 100)));
+                pc_call(fn::SetVisibility, stick, 0);
+            }
+            if (slash) pc_call(fn::SetVisibility, slash, 0);
+        }
+        if (const u32 o = find_object(s, pc_hash("PC_INFO_TEXT"), 1)) {
+            const bool show = LW(self + 4) == PC_MODERN_LAYOUT;
+            if (((s8)LB(o + 41) == 1) != show) pc_call(fn::SetVisibility, o, show ? 1 : 0);
+        }
+    }
+    {   // the hints' characters by the cells the buttons' font has for them (pc_layout_hint_cells); "edit" without a cell of
+        // its own is Square's, which shows the gamepad's button whatever is in use
+        static int cells = -2, gen = -1;
+        const int now = pc_layout_hint_cells();
+        const u32 s = now >= 0 && (now != cells || gen != g_project_gen) ? find_menu_screen(CONFIG_SCREEN) : 0;
+        if (s) {
+            cells = now, gen = g_project_gen;
+            if (const u32 o = find_object(s, pc_hash("PC_BACK_ICON"), 1)) set_text(o, now ? "p" : "b");
+            if (g_help_icon) pc_call(fn::SetString, g_help_icon, gstr(now ? "v" : "3"));
+            if (const u32 o = find_object(s, pc_hash("PC_EDIT_ICON"), 1)) pc_call(fn::SetString, o, gstr(now ? "u" : "h"));
+        }
+    }
+    config_edit_hint(own);
+}
+
+// JoystickConfigScreen::CycleConfiguration (0x23e448: this, the way): the next layout of the list, or the one before. The list
+// is the screen's player's (HOOK_GetJoystickConfigs).
+void HOOK_CycleConfiguration__20JoystickConfigScreenb(Ctx &c, void (*orig)(Ctx &))
+{
+    const ConfigPort whose(c.r[4].w[0]);
+    orig(c);
 }
 
 void HOOK_SetInputMode__6Player16PlayerInputModes(Ctx &c, void (*orig)(Ctx &))
 {
     g_pc_ctx = &c;
     {
-        const u32 who = LW(c.r[4].w[0] + 88) & 1, mode = c.r[5].w[0];
+        // Whose mode: the Player's controller port, +8 (the constructor, 0x175188: +8 the port, +16 the player's number; the
+        // handlers below are added on that port). It was taken from +88 till 2026-11-18, and +88 is not a number but the zone
+        // camera the player is in (RequestZone writes it, ClearZone clears it): with two players, who have no zones, it was 0
+        // for both, so both wrote the first one's cell and the second one's was never written.
+        const u32 player = c.r[4].w[0], who = LW(player + 8) & 1, mode = c.r[5].w[0];
+        {   // speed.log: every change of a player's mode, with what the game decides it by (a tester's report, 0.14: the car's
+            // controls gone after a zone camera in a chase). From: the mode the Player has (+196). The zone camera it is in
+            // (+88: 1 and 2 are the frozen ones, mode 3), whether it is locked (+80: the finish, an arrest), the race's state
+            // (RaceCoordinator, gp-22216: 3 racing, 6 paused) and who drives its car (Car +32: 1 a person, 2 the AI).
+            static int told;
+            const u32 was = LW(player + 196), car = LW(player + 4), rc = LW(gp() - 22216);
+            if (was != mode && told < 3000)
+                told++, fprintf(stderr, "input: port %u, mode %u to %u; zone %u, locked %u, race state %u, car driven by %d\n", who, was, mode,
+                                LW(player + 88), LW(player + 80), rc ? LW(rc) : 99u, car ? (int)LW(car + 32) : -1);
+        }
         g_player_modes[who] = mode;
         g_player_mode = mode;
         if (pc_two_player_race()) {
@@ -1706,6 +2837,383 @@ void HOOK_SetInputMode__6Player16PlayerInputModes(Ctx &c, void (*orig)(Ctx &))
         if (test && asked == 2) pc_call(0x228f08, player);
     }
     pc_paint_buttons();
+}
+
+// Player::DetermineInputMode (0x177608): every frame for each player (DetermineAllPlayersInputModes, from MainLoop). A safety net
+// for a zone camera that has no end coming (a tester's report, 0.14: after the "look around" camera in a chase the car's controls
+// were gone). A frozen zone (Player +88 is 1, Freeze, or 2, Preview: the byte table 0x330790) holds the player in mode 3, where the
+// car has no controls, and it ends in one way only: World::UpdateWorldPaused (0x14d678) counts the world's pause (World +380) down
+// by the real time step and, as it passes 0, calls the one call the world keeps (+396, +400), PlayerClearZone. RequestZone
+// (0x177c88) sets that pause to the camera's length less a world step: 3 s for Freeze, for Preview what
+// ZonePreviewCameraMover::Duration (0x1637c8) works out for the fly-by. A pause that is not above 0 from the start, or a call that
+// is not there, never ends the zone: UpdateWorldPaused does nothing for it. That state held for half a second is ended here, with
+// the game's own PlayerClearZone (the camera back, the time scale back, the zone 0), and written to speed.log.
+static u32 g_player_car;
+u32 pc_player_car() { return pc_racing() ? g_player_car : 0; }
+
+// ---- the mirror's view for the car's own mirrors -----------------------------------------------------------------------
+// The glass of the player's car shows the rear-view mirror's picture (native.cpp, mirror_glass_now), and the game makes that
+// picture only while the HUD shows its mirror: Player::UpdateHud (0x17ecf0) works out the HUD's features (0x178da0: none before
+// the start, in a zone camera, in a replay, with the mirror turned off in the pause menu's display options) and
+// Player::SetHudFeatures (0x1796b0), where bit 0x1000 changes, calls Player::SetRearViewMirrorCameraMover (0x1767a8, player, on):
+// that deletes the mover of the mirror's view (Player +212), then whatever mover is first in that view's list (the view's
+// number is Player +28; the list is eView +60), and, if on, makes a new one for the player's car (48 bytes,
+// RearViewMirrorCameraMover(view, car), 0x158f78) and keeps it in +212. A view with no mover is not drawn (eUpdateViewMode,
+// 0x107ce0). The features in force are Player +768. So the glass was the game's plain grey until the race's start and then
+// filled at once (the user, 2026-11-24).
+//
+// Here the view has a mover of the port's own while the glass wants the picture and the game has none there (one player,
+// Reflections not the PS2's): made as the game makes its own, once the race's 3D is drawn with the player's car. It is NOT kept
+// in Player +212: Player::UpdateNonGameState (0x180e60), before the start, takes any of +200, +212, +216, +220, +224 for "the
+// player has a camera" and only without one begins the countdown's cameras and then the driving camera. The first try kept the
+// game's own mover on through +212, and the camera stayed where the fly-by left it (the user, 2026-11-24: "the camera does not
+// go to the race after the fly-by"). The game's own call deletes the port's mover as the first of the view's list, so the
+// hook forgets it before the call, and makes it again after a call that turned the game's off. While the port's mover is the
+// one there, the HUD's picture of the mirror (DisplayRVMs, 0x10edc8: a quad with the view's target for every mirror view that
+// is on) is not drawn. The player's end (its destructor, 0x175bf0) deletes it first.
+static bool g_mirror_closing;
+static u32 g_mirror_mover, g_mirror_player;         // the port's mover of the mirror's view, and whose
+static bool mirror_view_wanted(u32 player)
+{
+    return !g_mirror_closing && g_cfg.side_mirrors && g_cfg.reflections && pc_racing() && !pc_two_player_race() && player &&
+           (LW(player + 8) & 1) == 0 && LW(player + 4) && LW(player + 28);
+}
+
+// the port's mover is still one of the view's (the game has not deleted it some way this file does not know)
+static bool mirror_mover_alive(u32 player)
+{
+    if (!g_mirror_mover || !player || !LW(player + 28)) return false;
+    const u32 head = pc_call(0x107c90, LW(player + 28)) + 60;          // eGetView(id): the list of its movers
+    int n = 0;
+    for (u32 m = LW(head); m && m != head && n < 16; m = LW(m), n++)
+        if (m == g_mirror_mover) return true;
+    return false;
+}
+
+static void mirror_mover_delete(u32 player)
+{
+    if (mirror_mover_alive(player)) {
+        const u32 vt = LW(g_mirror_mover + 40);                         // the virtual destructor, as the game calls it
+        pc_call(LW(vt + 12), g_mirror_mover + (u32)(s32)(s16)LH(vt + 8), 3);
+    }
+    g_mirror_mover = 0;
+}
+
+static void mirror_mover_make(u32 player)
+{
+    const u32 mem = pc_call(0x2577c0, 48, 0x2b3a00, 0, 16);            // bMalloc, with the game's own name for it
+    if (!mem) return;
+    g_mirror_mover = pc_call(0x158f78, mem, LW(player + 28), LW(player + 4));
+    g_mirror_player = player;
+    static int told;
+    if (told < 4) told++, fprintf(stderr, "mirror: the mirror's view is on for the car's own mirrors (the HUD's mirror is off)\n");
+}
+
+static void mirror_view_frame(u32 player)
+{
+    if ((LW(player + 8) & 1) != 0) return;
+    if (g_mirror_mover && g_mirror_player != player) g_mirror_mover = 0;       // (another race's: gone with it)
+    if (g_mirror_mover && !mirror_mover_alive(player)) g_mirror_mover = 0;
+    const bool wanted = mirror_view_wanted(player) && !LW(player + 212);
+    // (the mover follows the car it was made for, +44: should the player's car ever be another one, it is made anew)
+    if (g_mirror_mover && (!wanted || LW(g_mirror_mover + 44) != LW(player + 4))) mirror_mover_delete(player);
+    if (wanted && !g_mirror_mover && native_player_car_drawn()) mirror_mover_make(player);
+}
+
+void HOOK_SetRearViewMirrorCameraMover(Ctx &c, void (*orig)(Ctx &))
+{
+    g_pc_ctx = &c;
+    const u32 player = c.r[4].w[0];
+    const bool off = c.r[5].w[0] == 0;
+    if (player == g_mirror_player) g_mirror_mover = 0;      // the call deletes it: the first mover of the view's list
+    orig(c);
+    if (off && mirror_view_wanted(player) && !LW(player + 212) && native_player_car_drawn()) mirror_mover_make(player);
+}
+
+void HOOK_DisplayRVMs(Ctx &c, void (*orig)(Ctx &))
+{
+    g_pc_ctx = &c;
+    if (g_mirror_mover && g_mirror_player && !LW(g_mirror_player + 212)) return;       // the view is on for the glass alone
+    orig(c);
+}
+
+// ---- the lights of the cars behind, with the mirror off ------------------------------------------------------------------
+// The yellow lights of the HUD (Player::DrawTracker, 0x17c278: under the mirror, at the bottom of the screen without it) are
+// the cars within 50 m whose Car +2192 is between -0.5 and 0.5. That number is written by the function at 0x135280 (car,
+// position, direction), which RenderCars (0x124060) calls for every car of every view it draws, with the view's camera
+// (+64 its place, +80 where it looks): (dot + 1) / 2 of the direction and the unit vector from the car to the camera, with
+// the sign of their cross product's z. So -0.5..0.5 is "the camera looks at the car". eDisplayFrame draws the players' views
+// and then the mirror's (views 1, 2, 3), the last one drawn wins, and with the mirror that is the view backward: the lights
+// are the cars behind. With the mirror turned off its view has no mover and is not drawn, the player's own view is the last,
+// and the lights showed the cars AHEAD (a tester, 2026-11-25: "they work backwards when it's turned off"; by this code the
+// PS2 does the same). Where the port keeps the mirror's view on for the car's own mirrors (above) it never showed.
+//
+// Here, for one player, the number written in the player's view while the mirror's view is not drawn is made again with the
+// camera the mirror would have (RearViewMirrorCameraMover::Update, 0x158ff8: the car's matrix transposed, turned a quarter
+// about x and then about y, the car's place taken off, the three numbers at 0x334180 added to the translation): it looks
+// against the matrix's first row, from the car's place (+80) less the first of those numbers along the second row, plus the
+// second along the third row and the third along the first. Whatever else the function does stays the game's own, with the
+// player's camera.
+void HOOK_CarTrackerSide(Ctx &c, void (*orig)(Ctx &))
+{
+    g_pc_ctx = &c;
+    const u32 car = c.r[4].w[0], place = c.r[5].w[0];
+    orig(c);
+    const u32 player = LW(gp() - 20928);                                // the first player
+    if (!player || !car || LW(gp() - 20920) == 2) return;               // (two players have no such lights)
+    const u32 own = LW(player + 4), view = 0x2c95b0 + LW(player + 24) * 128, mirror = 0x2c95b0 + LW(player + 28) * 128;    // eGetView
+    if (!own || own == car || !LW(player + 24) || !LW(player + 28) || LW(view + 56) + 64 != place) return;
+    const u32 target = LW(mirror + 48);
+    if (LB(mirror + 4) && target && LW(target + 8)) return;             // the mirror's view is drawn after this one: its number stays
+    const float off[3] = {fl(0x334180), fl(0x334184), fl(0x334188)};
+    float at[3], look[3], to[3], len = 0.0f, dot = 0.0f;
+    for (u32 i = 0; i < 3; i++) {
+        const float fwd = fl(own + 144 + i * 4), across = fl(own + 160 + i * 4), up = fl(own + 176 + i * 4);
+        at[i] = fl(own + 80 + i * 4) - off[0] * across + off[1] * up + off[2] * fwd;
+        look[i] = -fwd;
+        to[i] = at[i] - fl(car + 96 + i * 4);
+        len += to[i] * to[i];
+    }
+    const float norm = sqrtf(look[0] * look[0] + look[1] * look[1] + look[2] * look[2]);
+    len = sqrtf(len);
+    if (!(len > 0.0f) || !(norm > 0.0f)) return;
+    for (u32 i = 0; i < 3; i++) look[i] /= norm, to[i] /= len, dot += look[i] * to[i];
+    float side = (dot + 1.0f) * 0.5f;
+    if (look[0] * to[1] - look[1] * to[0] >= 0.0f) side = -side;
+    set_fl(car + 2192, side);
+}
+
+void HOOK_PlayerDestructor(Ctx &c, void (*orig)(Ctx &))
+{
+    g_pc_ctx = &c;
+    const u32 player = c.r[4].w[0];
+    g_mirror_closing = true;
+    if (player && player == g_mirror_player) {
+        mirror_mover_delete(player);
+        g_mirror_player = 0;
+    }
+    orig(c);
+    g_mirror_closing = false;
+}
+
+void HOOK_DetermineInputMode__6Player(Ctx &c, void (*orig)(Ctx &))
+{
+    g_pc_ctx = &c;
+    const u32 player = c.r[4].w[0];
+    if (player && (LW(player + 8) & 1) == 0) g_player_car = LW(player + 4);     // the first player's car, every frame
+    if (player) mirror_view_frame(player);
+    if (player) {
+        static u32 whose[2];
+        static int lost[2];
+        const u32 who = LW(player + 8) & 1, zone = LW(player + 88), world = LW(gp() - 22120);
+        bool no_end = false;
+        if (world && zone && zone < 16 && LB(0x330790 + zone) != 0) no_end = !(fl(world + 380) > 0.0f) || LW(world + 396) == 0;
+        if (whose[who] != player) whose[who] = player, lost[who] = 0;
+        lost[who] = no_end ? lost[who] + 1 : 0;
+        if (lost[who] >= 30) {
+            lost[who] = 0;
+            fprintf(stderr, "input: port %u was left in zone camera %u with no end coming (the world's pause %g s, its call %08x): the zone is ended\n", who, zone,
+                    (double)fl(world + 380), LW(world + 396));
+            pc_call(0x177c80, player);          // PlayerClearZone(player)
+        }
+    }
+    orig(c);
+}
+
+// ---- a help line too long for its place runs --------------------------------------------------------------------------
+// The menus' help line is a tAnimatedBlurb: +0 its screen, +4 its text object (SCROLLING_TEXT: 100 characters, left-aligned at
+// x 127, half the font's size), +148 the line (256 bytes), +412 its state (1 the old line fading, 2 the new one sliding in, 3
+// at rest). Animate (0x249348), once a frame, prints the line into the object ("%s", FlailerPrintf) and slides it in. A line
+// longer than the place simply went on past the screen's right edge and was cut there (the user's picture, 2026-11-24: "The
+// slow motion key works. On a gamepad: both stick", and: "can these lines be a running line?").
+// Here a line at rest that is wider than its place runs: it stands for three seconds, then moves left at an even pace until
+// its end is in view, stands there for two seconds and starts again. The move is by the pixel: the object itself is moved
+// left by what has passed of its first letter, and when a letter has passed whole it is dropped from what is printed and the
+// object steps back by its width; at the other end a letter is added as soon as there is room for it. So nothing is printed
+// past the place's right end, and at the left a letter goes at most its own width into the bar's margin before it is gone
+// (the menus have nothing to cut a text by, so a letter comes and goes whole). A line that fits is not touched.
+// The frontend's 2D is laid out 640 wide (a full-screen picture has the scale 1.2 of its 512), so the place is from the
+// object's x to the screen's right edge at 640, less a margin. (The first try took 512 for that edge and cut lines that had
+// always fitted: the user's second picture.) The widths are the font's own (FindFont, 0x13fe18; a glyph's advance at +20, as
+// GetStringWidth, 0x144e28, adds them).
+struct BlurbRun {
+    std::string line;
+    double since = 0;                       // when the line came to rest, or began to run, or reached its end
+    int phase = 0;                          // 0 standing at its start, 1 running, 2 standing at its end
+    int from = -1, to = -1;                 // what is printed now
+    float home = 0;                         // the object's own x
+    u32 obj = 0;
+};
+static std::map<u32, BlurbRun> g_blurb_runs;
+// The object's own x, as it was when first met. The object is left moved by up to a letter when its screen closes in the middle
+// of a run, and the next blurb made for it takes the x it finds for its home: without this the line would creep left, a little
+// with every visit. By the object's address and what it is (a screen's objects stay where they are while its file is loaded;
+// after another load the same object at the same address has the same x, and another object is another entry).
+static std::map<u64, float> g_blurb_home;
+
+void HOOK_BlurbAnimate(Ctx &c, void (*orig)(Ctx &))
+{
+    const u32 blurb = c.r[4].w[0];
+    orig(c);
+    if (!blurb || LW(blurb + 412) != 3) {
+        if (blurb) {                        // the line is changing: the object back at its own x, the run over
+            auto it = g_blurb_runs.find(blurb);
+            if (it != g_blurb_runs.end()) {
+                const u32 o = pc_call(0x143d50, LW(blurb), LW(blurb + 4), 1);
+                if (o && o == it->second.obj && LW(blurb + 412) == 1 && fl(o + 48) != it->second.home) set_fl(o + 48, it->second.home), SB(o + 43, 4);
+                g_blurb_runs.erase(it);
+            }
+        }
+        return;
+    }
+    g_pc_ctx = &c;
+    const u32 obj = pc_call(0x143d50, LW(blurb), LW(blurb + 4), 1);     // FindFlailerObject(screen, object, a text)
+    const u32 font = obj ? pc_call(0x13fe18, LW(obj + 80)) : 0;         // FindFont(the object's font)
+    if (!obj || !font) return;
+    const char *now = (const char *)host(blurb + 148);
+    const size_t len = strnlen(now, 255);
+    BlurbRun &r = g_blurb_runs[blurb];
+    if (r.line.size() != len || memcmp(r.line.data(), now, len)) {
+        r = BlurbRun();
+        r.line.assign(now, len);
+        r.since = menu_seconds();
+        r.obj = obj;
+        const u64 key = (u64)obj << 32 | (u32)(LW(blurb + 4) ^ LW(blurb) * 31u);
+        auto home = g_blurb_home.find(key);
+        if (home == g_blurb_home.end()) {
+            if (g_blurb_home.size() > 256) g_blurb_home.clear();
+            home = g_blurb_home.emplace(key, fl(obj + 48)).first;
+        }
+        r.home = home->second;
+        if (fl(obj + 48) != r.home) set_fl(obj + 48, r.home), SB(obj + 43, 4);      // (left moved by a run its screen closed on)
+    }
+    const float scale = fl(obj + 56), room = 640.0f - 14.0f - r.home;
+    if (len < 2 || !(scale > 0) || !(room > 40)) return;
+    float wide[256], total = 0;
+    for (size_t i = 0; i < len; i++) {
+        const u32 glyph = LW(font + 8 + (u8)r.line[i] * 4);
+        wide[i] = glyph ? fl(glyph + 20) * scale : 0;
+        total += wide[i];
+    }
+    if (total <= room) return;              // it fits: as the game has it
+    const double t = menu_seconds();
+    const float kPace = 45.0f, way = total - room;      // pixels a second; how far the line has to go for its end to show
+    float gone = 0;
+    if (r.phase == 0 && t - r.since > 3.0) r.phase = 1, r.since = t;
+    if (r.phase == 1) {
+        gone = (float)(t - r.since) * kPace;
+        if (gone >= way) gone = way, r.phase = 2, r.since = t;
+    } else if (r.phase == 2) {
+        gone = way;
+        if (t - r.since > 2.0) r.phase = 0, r.since = t, gone = 0;
+    }
+    // the letters gone whole, what is left of the first one in view, and the letters that fit after it
+    int first = 0;
+    float part = gone;
+    while (first < (int)len - 1 && part >= wide[first]) part -= wide[first++];
+    int last = first;
+    float w = -part;
+    while (last < (int)len && w + wide[last] <= room + 0.01f) w += wide[last++];
+    const float x = r.home - part;
+    if (fl(obj + 48) != x) {
+        set_fl(obj + 48, x);
+        SB(obj + 43, 4);                    // as SetTopLeftX (0x140a20) marks it
+    }
+    if (first == r.from && last == r.to) return;
+    r.from = first, r.to = last;
+    pc_call(0x143e70, LW(blurb), LW(blurb + 4), 0x331e50, gstr(r.line.substr((size_t)first, (size_t)(last - first))));     // FlailerPrintf "%s"
+}
+
+// ---- Zone Slow Motion: a second press ends it --------------------------------------------------------------------------
+// The slow motion is the third of the player's zones: Player::RacingJoyHandler (0x178978: player, port, event, value) answers
+// JOY_EVENT_ZONE_SLOMO (97, which only the port's keyboard has a key for) with RequestZone(player, 3, 1, 1, 1), which, granted,
+// sets the world's time scale for a while (World::SetTimeScale) and Player +88 to 3; when the while is over the world calls
+// ClearZone (0x178358: the blur off, World::ResetTimeScale, +88 to 0, the zone's sound stopped). Pressed again meanwhile the game
+// asks for the zone anew (and mostly refuses: the zones' own waits).
+// The user, 2026-11-24: "can the slow motion be turned off by pressing the key again?" So a press that comes while the player's
+// zone is the slow motion ends it the game's own way (PlayerClearZone, 0x177c80) and asks for nothing. It is done here, on the
+// event as the handler gets it, and not where the key is read: the event is what a replay keeps, so a replay ends it at the
+// same place.
+void HOOK_RacingJoyHandler(Ctx &c, void (*orig)(Ctx &))
+{
+    g_pc_ctx = &c;
+    const u32 player = c.r[4].w[0], event = c.r[6].w[0], value = c.r[7].w[0] & 0xff;
+    if (event == 97 && value && player && LW(player + 88) == 3) {
+        static int told;
+        if (told < 8) told++, fprintf(stderr, "zone: the slow motion is ended by its key\n");
+        pc_call(0x177c80, player);
+        return;
+    }
+    orig(c);
+}
+
+// ---- the Debug menu's Environment row: the wipers ---------------------------------------------------------------------
+// The row was the storm's kind: PauseDebugMenu::OnMenuItemScroll (0x174364) steps it (SetStormType(GetStormType() - 1), 0 to 2),
+// prints "Environment: %s" with GetStormTypeString's word, and gives every car of the world its "wipers always" word, Car +2116,
+// from GetStormType() != 0 (CarRenderInfo::Render draws the two wiper models moving while it is set, or between the times at
+// +2108 and +2112 that water under a wheel sets: Car::TurnWipersOnForDuration, 0x133528). The storm itself is not in the retail
+// game: SetStormType (0x1703c0) is an empty function, GetStormType (0x1703c8) answers 1 always, the word is "<default>". So any
+// step of the row turned every car's wipers on for good, with no way to turn them off but another race (the user, 2026-11-24:
+// "there is a way to turn the wipers on, but then they do not go off").
+// Here the row is the switch it was to be (the user: "yes, do it"): a step turns the wipers of every car on, the next one off;
+// the three functions answer by what the cars have, and the row says which.
+static bool wipers_always()
+{
+    const u32 world = g_pc_ctx ? LW(gp() - 22120) : 0;
+    const u32 car = world ? LW(world) : 0;
+    return car && car != world && LW(car + 2116) != 0;
+}
+
+void HOOK_SetStormType(Ctx &c, void (*orig)(Ctx &))
+{
+    (void)orig;
+    g_pc_ctx = &c;
+    const u32 on = wipers_always() ? 0 : 1;
+    const u32 world = LW(gp() - 22120);
+    int n = 0;
+    for (u32 car = world ? LW(world) : 0; car && car != world && n < 64; car = LW(car), n++) SW(car + 2116, on);
+    fprintf(stderr, "debug menu: the wipers of %d cars are %s\n", n, on ? "on" : "off");
+}
+
+void HOOK_GetStormType(Ctx &c, void (*orig)(Ctx &))
+{
+    (void)orig;
+    g_pc_ctx = &c;
+    c.r[2].d[0] = wipers_always() ? 1 : 0;
+}
+
+void HOOK_GetStormTypeString(Ctx &c, void (*orig)(Ctx &))
+{
+    (void)orig;
+    g_pc_ctx = &c;
+    static u32 on, off;
+    if (!on) on = gstr_keep("Wipers On"), off = gstr_keep("Wipers Off");
+    c.r[2].d[0] = (s64)(s32)(wipers_always() ? on : off);
+}
+
+// The developers' Debug menu (Extras' DEBUG.not.pretty) is always left with Esc (the user, 2026-11-18; a tester, 0.14: "ESCAPE
+// doesn't back out"). Its own way back is MENU_BACK: PauseDebugMenu::MenuCallback (0x1740c0) answers message 17 with
+// ChangeToScreen("Pause Menu", 0). Esc used to press Start with Triangle there, and the menus take one press a frame
+// (FlailerScreenList::JoyHandler, 0x16cab0), so Start, a Select of the row, took Back's place; now Esc is Triangle alone on that
+// screen (window_pad). And if the screen is still up eight frames after Esc went down (a popup, the help, a filtered port: what
+// keeps MENU_BACK from a screen), the same change of screen is made here.
+static void debug_menu_esc_frame()
+{
+    static bool held;
+    static int wait = -1;
+    const bool esc = window_key_down(0x1B);
+    if (!pc_debug_menu()) {
+        wait = -1;
+        held = esc;
+        return;
+    }
+    if (esc && !held) wait = 8;
+    held = esc;
+    if (wait > 0 && --wait == 0) {
+        wait = -1;
+        fprintf(stderr, "menus: Esc did not take the Debug menu back by itself: the pause menu is opened\n");
+        pc_call(fn::ChangeToScreen, gstr("Pause Menu"), 0);
+    }
 }
 
 // the game's OnHighlight and Select know rows 1..3 only
@@ -1736,6 +3244,14 @@ int window_wheel();
 static int g_mouse_out, g_mouse_wait;
 
 int pc_mouse_buttons() { return g_mouse_out; }
+
+bool pc_tap(int button)
+{
+    if (g_mouse_wait > 0) return false;
+    g_mouse_out = 1 << button;
+    g_mouse_wait = 4;
+    return true;
+}
 
 // the object of a menu item: by the screen's hash, in whichever project has it
 static u32 find_menu_screen(u32 hash)
@@ -1828,6 +3344,19 @@ static void mouse_frame()
             return;
         }
 
+    // The title screen has no rows, only its line "PRESS ENTER": a click anywhere in the window is that press, Cross, as Enter is
+    // (the user, 2026-11-25: "make it so that the mouse can press Press Enter on the title screen"). Not while it plays a film
+    // (TitleScreen::pInstance gp-21156, State +12 == 2): no pointer shows then.
+    if (pc_on_title()) {
+        pending = -1, click = false;
+        const u32 title = LW(gp() - 21156);
+        if (pressed && inside && g_mouse_wait <= 0 && !(title && LW(title + 12) == 2)) {
+            g_mouse_out = 1 << PCB_CROSS;
+            g_mouse_wait = 4;
+        }
+        return;
+    }
+
     u32 list = LW(gp() - 21324), node = list ? LW(list + 412) : 0;
     u32 screens = node ? node + 8 : 0, screen = screens ? LW(screens) : 0;
     u32 menu = screen && screen != screens ? LW(screen + 8) : 0;
@@ -1860,7 +3389,71 @@ static void mouse_frame()
             if (inside && x >= ix - 24 && d < 22 && d < best) best = d, hovered = count;
         }
     }
-    if (moved && hovered >= 0) pending = hovered, tries = count + 2;
+    // The pointer in the menus, directly (the user, 2026-11-23: "hit the items directly"). The highlight used to walk to the row
+    // pointed at, a pad's Up or Down every four frames, and a click waited for it to arrive. Now the menu's own handler of those
+    // events is called here, at once and as often as it takes: FlailerMenu::JoyHandler (0x16a458: menu, port, event, value) is
+    // what FlailerScreenList::JoyHandler ends in for a pad's event. Event 3 / 4 (up / down) asks the screen (message 8 / 9, which
+    // moves a list's mask and may refuse) and steps to the next row that can be chosen, with the sound; 9 (MENU_SELECT) is the
+    // row's Select (message 1); 5 / 6 its Left / Right. So everything the game does for a press is done, only not through a pad.
+    // Not while the help panel is up, nor on a screen that listens to the other pad alone (FlailerScreen +16, its filter port:
+    // the mouse is the first player's, as its presses were). hp2.ini [keyboard] mouse_direct=0: the old way.
+    bool direct = false;
+    if (g_cfg.mouse_direct && menu && chunk && count) {
+        const u32 filter = LW(screen + 16);
+        bool help = false;
+        if (const u32 panel = LW(list + 0x1c4))
+            if (const u32 mover = LW(panel + 0x14)) help = fl(mover + 8) < 640.0f;
+        direct = !help && (filter == 0xffffffffu || filter == 0);
+    }
+    const auto current_now = [&]() {
+        int i = 0;
+        for (u32 item = LW(menu); item && item != menu; item = LW(item), i++)
+            if (item == LW(menu + 8)) return i;
+        return -1;
+    };
+    // the highlight to a row, the shorter way round by the rows that can be chosen; false: the menu would not go there
+    const auto go = [&](int target) {
+        if (LW(menu + 20) == CONTROLLER_SCREEN) {
+            // the Controller screen's rows are not in the order of their numbers (Select Device, above): the row itself is set
+            int i = 0;
+            for (u32 item = LW(menu); item && item != menu; item = LW(item), i++)
+                if (i == target) pc_call(0x16a3a8, menu, LW(item + 12));     // FlailerMenu::SetActiveMenuItem
+            return current_now() == target;
+        }
+        for (int step = 0; step < count + 2; step++) {
+            const int at = current_now();
+            if (at < 0) return false;
+            if (at == target) return true;
+            int down = 0, up = 0;
+            for (int i = at; i != target;) {
+                i = (i + 1) % count;
+                if (i >= 64 || (usable >> i & 1)) down++;
+            }
+            for (int i = at; i != target;) {
+                i = (i + count - 1) % count;
+                if (i >= 64 || (usable >> i & 1)) up++;
+            }
+            pc_call(0x16a458, menu, 0, down <= up ? 4 : 3, 1);
+            if (current_now() == at) return false;      // refused: an edge that scrolls instead, a screen on its way out
+        }
+        return current_now() == target;
+    };
+    if (direct) {
+        pending = -1, click = false;
+        if (inside && (moved || pressed)) {
+            // the screen hears of the activity as it does with every pad event (message 24: the attract demo's idle clock),
+            // and so does the pads' own clock (GenerateJoyEvents: 0x2effe0 +12 = RealTimeNow, gp-19608)
+            if (const u32 callback = LW(menu + 12)) {
+                const u32 data = g_pc_ctx->r[29].w[0] - 0x40;      // room under the stack pointer that pc_call steps over
+                SW(data, 0), SW(data + 4, 0), SW(data + 8, 0), SW(data + 12, 0);
+                pc_call(callback, 24, data);
+            }
+            SW(0x2effe0 + 12, LW(gp() - 19608));
+        }
+        if (moved && hovered >= 0 && hovered != current) go(hovered);
+    } else if (moved && hovered >= 0) {
+        pending = hovered, tries = count + 2;
+    }
     // the back button at the bottom: Flailer's 640 x 480 in the 512 x 448, as above
     bool on_back = false;
     if (u32 b = chunk ? find_object(chunk, back_text_hash(), 1) : 0)
@@ -1881,7 +3474,36 @@ static void mouse_frame()
                 if (LW(o + 92) != color) SW(o + 92, color), SB(o + 43, 7);
                 break;
             }
-    if (pressed && (on_back || on_help)) {
+    // and the port's own hints of the Delete key: the three objects under a layout of the player's own, the word on a page
+    // of the profiles (not while a name is typed there: the button is the letters' then)
+    bool on_edit = false, on_delete = false;
+    if (screen_name().rfind("Joystick Config Port", 0) == 0) {
+        static const u32 word_hash = pc_hash("PC_EDIT_WORD");
+        const u32 lay = find_menu_screen(CONFIG_SCREEN);
+        const u32 word = lay ? find_object(lay, word_hash, 1) : 0;
+        if (word && (s8)LB(word + 41) == 1) {       // (the word with its icon to the left of it, as Back and Help are)
+            const float ex = fl(word + 48) * 0.8f, ey = fl(word + 52) * (448.0f / 480.0f);
+            on_edit = inside && x >= ex - 30 && x < ex + 44 && y >= ey - 8 && y < ey + 20;
+            const u32 color = on_edit ? 0x80004080u : 0x80808080u;
+            if (LW(word + 92) != color) SW(word + 92, color), SB(word + 43, 7);
+        }
+    } else {
+        g_mouse_edit = false;               // (a click nobody took: the layouts' screen went away under it)
+    }
+    if (!on_edit && chunk && !pc_name_grid_up() && screen_name().rfind("Joystick Config Port", 0) != 0) {
+        static const u32 del_hash = pc_hash("PC_DEL_TEXT");
+        const u32 o = find_object(chunk, del_hash, 1);
+        if (o && (s8)LB(o + 41) == 1) {
+            const float dx = fl(o + 48) * 0.8f, dy = fl(o + 52) * (448.0f / 480.0f);
+            on_delete = inside && x >= dx - 30 && x < dx + 60 && y >= dy - 8 && y < dy + 20;
+            const u32 color = on_delete ? 0x80004080u : 0x80808080u;
+            if (LW(o + 92) != color) SW(o + 92, color), SB(o + 43, 7);
+        }
+    }
+    if (pressed && (on_edit || on_delete)) {
+        (on_edit ? g_mouse_edit : g_mouse_delete) = true;
+        pending = -1, click = false;
+    } else if (pressed && (on_back || on_help)) {
         if (g_mouse_wait <= 0) {
             g_mouse_out = 1 << (on_back ? PCB_TRIANGLE : PCB_CIRCLE);
             g_mouse_wait = 4;
@@ -1899,7 +3521,13 @@ static void mouse_frame()
                 float ax = fl(o + 48) * 0.8f, ay = fl(o + 52) * (448.0f / 480.0f) + 6.0f;
                 if (x > ax - 16 && x < ax + 24 && y > ay - 16 && y < ay + 16) arrow = side ? 2 : 1;
             }
-        if (arrow && g_mouse_wait <= 0) {
+        if (arrow && direct) {
+            pc_call(0x16a458, menu, 0, arrow == 1 ? 5 : 6, 1);      // the row's Left or Right
+            return;
+        } else if (!arrow && direct && hovered >= 0) {
+            if (go(hovered)) pc_call(0x16a458, menu, 0, 9, 1);      // the row's Select; the screen may be another after it
+            return;
+        } else if (arrow && g_mouse_wait <= 0) {
             g_mouse_out = 1 << (arrow == 1 ? PCB_LEFT : PCB_RIGHT);
             g_mouse_wait = 4;
         } else if (!arrow && (hovered >= 0 || !count)) {
@@ -1915,9 +3543,13 @@ static void mouse_frame()
         return;
     }
     if (const int wheel = window_wheel()) {     // the wheel moves the selection, a list with it
+        pending = -1;
+        if (direct) {
+            pc_call(0x16a458, menu, 0, wheel > 0 ? 3 : 4, 1);
+            return;
+        }
         g_mouse_out = 1 << (wheel > 0 ? PCB_UP : PCB_DOWN);
         g_mouse_wait = 4;
-        pending = -1;
         return;
     }
     // A row pointed at on one screen is not a row of the next: when the screen under the pointer changed to one with fewer rows before the
@@ -2139,7 +3771,12 @@ void HOOK_Tick__17FlailerScreenList(Ctx &c, void (*orig)(Ctx &))
     list_frame();
     grid_typed_frame();
     page_back_frame();
+    debug_menu_esc_frame();
+    ask_frame();
     for (auto &f : g_frame_fns) f();
+    if (screen_name() != "Joystick PreConfig") g_controller_away++;         // (HOOK_JoystickPreConfigHandleEvent: the screen is new)
+    if (g_calibration_watch && --g_calibration_watch == 0)
+        fprintf(stderr, "menus: half a second after the wheels' Calibration was chosen the screen is \"%s\"\n", screen_name().c_str());
     if (g_pc_ui_dirty.exchange(false)) pc_refresh_page();
     if (go && ++tick == (strchr(go, ',') ? atoi(strchr(go, ',') + 1) : 900)) {
         std::string name(go, strchr(go, ',') ? (size_t)(strchr(go, ',') - go) : strlen(go));

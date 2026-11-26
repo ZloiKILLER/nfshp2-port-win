@@ -31,6 +31,20 @@ Tracks a code opens.	Circuitos que abre un código.
 All	Todos
 Every one in this list, on or off.	Todos los de esta lista, activados o no.
 Some	Algunos
+One of these effects at a time.	Solo uno de estos efectos a la vez.
+Opens this car in the car lists.	Desbloquea este coche en las listas.
+Opens this police car for You're The Cop.	Desbloquea este coche de policía para el modo Policía.
+Opens this track in the track lists.	Desbloquea este circuito en las listas.
+Opens this track driven the other way.	Desbloquea este circuito en sentido contrario.
+A blur of speed over the whole picture.	Un desenfoque de velocidad en toda la imagen.
+The race in black and white.	La carrera en blanco y negro.
+Thick fog on every track.	Niebla densa en todos los circuitos.
+The cars at half their size, like radio-controlled models.	Los coches a mitad de tamaño, como modelos de radiocontrol.
+Black and white, with a video camera's overlay in the HUD.	Blanco y negro, con la superposición de una videocámara en el HUD.
+A helicopter of your own in every race.	Un helicóptero propio en cada carrera.
+Opens the bonus event of the Championship.	Desbloquea la prueba extra del Campeonato.
+Opens the bonus event of Ultimate Racer.	Desbloquea la prueba extra de Piloto definitivo.
+Every car's body in chrome.	Todas las carrocerías en cromo.
 As if its code had been entered.	Como si se hubiera introducido su código.
 Credits	Créditos
 See who made this game.	Descubre quién hizo este juego.
@@ -51,6 +65,7 @@ Selected	Elegido
 Current	Actual
 Maximum	Máximo
 Ultra	Ultra
+Very High	Muy alto
 Original	Original
 Fullscreen	Pantalla completa
 Windowed	Ventana
@@ -86,11 +101,11 @@ Level of Detail	Nivel de detalle
 Maximum: scenery and cars always at their most detailed models. Original: as on the PS2.	Máximo: escenario y coches siempre con sus modelos más detallados. Original: como en PS2.
 Reflections	Reflejos
 Shadows	Sombras
-The cars' shadows. High: the body's own outline, lying on whatever is under it. Maximum: finer still.	Las sombras de los coches. Alto: el contorno de la propia carrocería, sobre lo que haya debajo. Máximo: aún más fino.
+The cars' shadows. High: the body's own outline, lying on whatever is under it. Very High: finer, and the tunnels' lamps cast them too.	Las sombras de los coches. Alto: el contorno de la propia carrocería, sobre lo que haya debajo. Muy alto: más fino, y también las proyectan las lámparas de los túneles.
 Particles	Partículas
 Smoke, sparks and dust. Advanced: the same, with soft edges.	Humo, chispas y polvo. Avanzado: las mismas, con bordes suaves.
 High	Alto
-The reflections on the cars. Advanced: new every frame. High: new every frame, at twice the resolution.	Los reflejos en los coches. Avanzado: actualizados en cada fotograma. Alto: en cada fotograma, al doble de resolución.
+The reflections on the cars. Advanced: new every frame, your mirrors show the road behind. High: the same at twice the resolution.	Reflejos en los coches. Avanzado: en cada fotograma, los retrovisores muestran lo que hay detrás. Alto: lo mismo, a doble resolución.
 Show FPS	Mostrar FPS
 Frames per second in the corner of the picture.	Fotogramas por segundo en una esquina de la imagen.
 Advanced	Avanzado
@@ -120,6 +135,15 @@ Ambient Occlusion	Oclusión ambiental
 Soft shading where surfaces meet: under cars, by walls and kerbs.	Sombreado suave donde se juntan las superficies: bajo los coches, junto a muros y bordillos.
 Unlimited	Ilimitado
 Monitor	Monitor
+Speed Boost for All Cars	Turbo para todos los coches
+The speed boost in every car and every mode.	El turbo en todos los coches y todos los modos.
+No Intro Movies	Sin vídeos de introducción
+The game starts without its opening films.	El juego arranca sin sus vídeos de apertura.
+Playable Traffic Cars	Coches del tráfico jugables
+Traffic cars as racers, more skins, more traffic: the mod by 379Felipe. Switching it restarts the game.	Coches del tráfico en carrera, más pinturas, más tráfico: el mod de 379Felipe. Cambiarlo reinicia el juego.
+The game will restart now to switch this mod. Continue?	El juego se reiniciará ahora para cambiar este mod. ¿Continuar?
+This disc's cars are not the ones the mod is made for.	Los coches de este disco no son aquellos para los que está hecho el mod.
+This is the only screen.	Esta es la única pantalla.
 The screen the game is shown on.	La pantalla en la que se muestra el juego.
 Automatic	Automático
 Select GPU	Elegir GPU
@@ -136,10 +160,26 @@ Defaults	Por defecto
 Brightness, contrast and gamma as they were.	Brillo, contraste y gamma como estaban.
 The picture is back to the defaults.	La imagen vuelve a los valores por defecto.
 Keyboard	Teclado
-The keys for driving. In menus: arrows, Enter, Esc.	Las teclas para conducir. En los menús: flechas, Intro, Esc.
+The keys for driving, for both players.	Las teclas de conducción de ambos jugadores.
+Zone Slow Motion	Zona: cámara lenta
+The game's slow motion, on and off. Works with Slow Motion on in Extras.	La cámara lenta del juego, encender y apagar. Funciona con Cámara lenta activada en Extras.
+Slow Motion	Cámara lenta
+Disable Catchup	Sin propulsor
+No catch-up boost for the opponents in Quick Race and the career.	Sin propulsor para los rivales en Carrera rápida y en el modo carrera.
+Cinematic Replays	Repeticiones de cine
+Hiding the replay's controls hides the black bars too.	Ocultar los controles de la repetición oculta también las franjas negras.
+The slow motion key works. On a gamepad: both sticks pressed together.	La tecla de cámara lenta funciona. En el mando: los dos sticks pulsados a la vez.
+Put player 2's keys back as they were.	Devuelve las teclas del jugador 2 a como estaban.
 Gamepad	Mando
 The buttons for driving, the stick and vibration.	Los botones para conducir, el stick y la vibración.
 Player 2	Jugador 2
+Select, then choose the gamepad of player 1.	Selecciona y elige el mando del jugador 1.
+Select, then choose the gamepad of player 2.	Selecciona y elige el mando del jugador 2.
+Select Device	Elegir dispositivo
+None	Ninguno
+Player 2 Controls	Controles del jugador 2
+Device	Dispositivo
+Gamepad: the one chosen in Gamepad > Layouts. Keyboard: player 2's keys.	Mando: el elegido en Mando > Disposiciones. Teclado: las teclas del jugador 2.
 What the second player drives with in a two-player race.	Con qué conduce el segundo jugador en una carrera a dos.
 Second: the second gamepad or half the keyboard. First: the first one.	Segundo: el segundo mando o medio teclado. Primero: el primero.
 Player 2's keys, when the keyboard is shared.	Las teclas del jugador 2 cuando se comparte el teclado.
@@ -277,3 +317,87 @@ The gamepad's layouts, A to D: what each button does in a race.	Los esquemas del
 Leave the game?	¿Salir del juego?
 Pick the letters. The last key of the grid makes it.	Elige las letras. La última tecla de la cuadrícula lo confirma.
 Type the new name. Enter sets it, Esc leaves it.	Escribe el nombre nuevo. Intro lo guarda, Esc lo deja.
+The game will restart to change the language. Continue?	El juego se reiniciará para cambiar el idioma. ¿Continuar?
+Steering Wheel	Volante
+Force feedback and rotation of a steering wheel.	Force feedback y giro de un volante.
+Pad/Wheel	Mando/Volante
+Gamepad: Player 1	Mando: jugador 1
+Gamepad: Player 2	Mando: jugador 2
+Vibration Strength	Fuerza de vibración
+How strongly the gamepad shakes. 0% is off.	La fuerza con que vibra el mando. 0 % es apagado.
+Trigger Dead Zone	Zona muerta de gatillos
+How far a trigger moves before it counts.	Cuánto se pulsa un gatillo antes de que cuente.
+Put this gamepad's settings back as they were.	Restablece los ajustes de este mando.
+The settings are back to the defaults.	Los ajustes han vuelto a los valores por defecto.
+Force Feedback	Force feedback
+The strength of all the wheel's forces. 0% is off.	La fuerza de todos los efectos del volante. 0 % es apagado.
+Centering Spring	Muelle de centrado
+How strongly the wheel returns to its middle.	La fuerza con que el volante vuelve al centro.
+Damper	Amortiguador
+How heavy the wheel is to turn.	Lo que pesa girar el volante.
+Road Feel	Tacto de la carretera
+The road's surface in the wheel.	El firme de la carretera en el volante.
+Collisions	Colisiones
+The jolt of a hit.	La sacudida de un golpe.
+Shake	Temblor
+The wheel's shaking.	El temblor del volante.
+Rotation	Giro
+The rotation is 40 to 900 degrees.	El giro va de 40 a 900 grados.
+Set Rotation	Fijar el giro
+On: a Logitech wheel is set to this rotation while the game runs.	Sí: un volante Logitech toma este giro mientras se juega.
+Invert Steering	Invertir dirección
+The wheel steers the other way.	El volante gira al revés.
+Put the wheel's settings back as they were.	Restablece los ajustes del volante.
+The dead zones, the steering and the vibration of player 1's gamepad.	Zonas muertas, dirección y vibración del mando del jugador 1.
+The dead zones, the steering and the vibration of player 2's gamepad.	Zonas muertas, dirección y vibración del mando del jugador 2.
+Degrees from lock to lock. Select, then set the number.	Grados de tope a tope. Selecciona y ajusta el número.
+Left, Right: the digit. Up, Down: its value. Select takes it, Back cancels.	Izquierda, derecha: la cifra. Arriba, abajo: su valor. Seleccionar acepta, Atrás cancela.
+Calibration	Calibración
+The game's own calibration of the wheel and its pedals.	La calibración del volante y los pedales del propio juego.
+Wheel	Volante
+Steering Wheel: Player 1	Volante: jugador 1
+Steering Wheel: Player 2	Volante: jugador 2
+The forces and the rotation of this player's wheel.	Las fuerzas y el giro del volante de este jugador.
+Select, then choose the steering wheel of player 1.	Selecciona y elige el volante del jugador 1.
+Select, then choose the steering wheel of player 2.	Selecciona y elige el volante del jugador 2.
+Force feedback of this player's wheel, on or off.	El force feedback del volante de este jugador, activado o no.
+Player 1 has no steering wheel.	El jugador 1 no tiene volante.
+Player 2 has no steering wheel.	El jugador 2 no tiene volante.
+Custom	Personalizada
+Custom Layout: Player 1	Config. propia: jugador 1
+Custom Layout: Player 2	Config. propia: jugador 2
+Accelerate/Brake	Acelerar/Frenar
+Analog	Analógico
+Digital	Digital
+Shift Up	Subir marcha
+Shift Down	Reducir marcha
+Select, then press the button for it. Esc cancels.	Selecciona y pulsa el botón. Esc cancela.
+Press a button. Esc cancels.	Pulsa un botón. Esc cancela.
+Analog: the left stick. Digital: two buttons. Both: either.	Analógico: stick izquierdo. Digital: dos botones. Ambos: cualquiera.
+Both	Ambos
+Zone Cameras	Cámaras de zona
+View + Shift	Vista + marcha
+Own Buttons	Botones propios
+View + Shift: hold Change View, press Shift Down or Up. Own Buttons: a button each.	Vista + marcha: mantén Cambiar vista, pulsa una marcha. Botones propios: uno cada una.
+Now without a button:	Ahora sin botón:
+The right stick turns the camera.	El stick derecho gira la cámara.
+Right Stick	Stick derecho
+Camera	Cámara
+Camera: look around the car. Accelerate/Brake: up is the throttle, down the brake.	Cámara: mirar alrededor del coche. Acelerar/Frenar: arriba acelera, abajo frena.
+Edit	Editar
+Edit the buttons of this layout	Editar los botones de esta configuración
+Analog: a trigger, by how far it is pressed. Digital: any button, all at once.	Analógico: un gatillo, según su recorrido. Digital: un botón, todo o nada.
+Left, Right: which trigger it is.	Izquierda, derecha: elige el gatillo.
+The triggers are the pedals while Accelerate/Brake is Analog.	Los gatillos son los pedales mientras Acelerar/Frenar esté en Analógico.
+Adaptive Triggers	Gatillos adaptativos
+Both triggers kick at a gear change and stiffen when a tyre is blown.	Ambos gatillos dan un golpe al cambiar de marcha y se endurecen con un pinchazo.
+Vibration Mode	Modo de vibración
+Responsive	Reactivo
+Original: as the game plays it. Responsive: it follows the car at once and does not linger.	Original: como la reproduce el juego. Reactivo: sigue al coche al instante y no se alarga.
+Police Radio Speaker	Radio policial en el mando
+The police radio plays from the gamepad's speaker.	La radio policial suena por el altavoz del mando.
+Speaker Volume	Volumen del altavoz
+How loud the gamepad's speaker is.	El volumen del altavoz del mando.
+Start is always Pause.	Start es siempre Pausa.
+This button cannot be used.	Este botón no se puede usar.
+Put this layout back as it was.	Restablecer esta configuración.

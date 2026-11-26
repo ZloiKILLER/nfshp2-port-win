@@ -152,6 +152,23 @@ static void snd_log_packet(u32 fno, u32 send, u32 ssize, u32 ra)
     fflush(f);
 }
 
+// The speech's voice, for the police radio on a gamepad's speaker (spu2.h). A packet of the sound driver's commands: a count, then
+// each {command, how many words, the words}. PlayStream (1) has the file and then stream << 8 | channel: the game's speech is
+// stream 2 (a sentence and the chain after it; work/nshots/t5/speech.py reads the same from a log), on one channel of the 48
+// (0x2d in the logs of October). StopStream (5) of stream 2 ends it.
+static void radio_watch(u32 send, u32 ssize)
+{
+    const u32 count = LH(send) & 0xffff;
+    u32 p = send + 2;
+    for (u32 i = 0; i < count && p + 4 <= send + ssize; i++) {
+        const u32 cmd = LH(p) & 0xffff, n = LH(p + 2) & 0xffff;
+        p += 4;
+        if (cmd == 1 && n >= 2 && ((LH(p + 2) & 0xffff) >> 8) == 2) spu2_radio_voice((int)(LH(p + 2) & 0xff));
+        else if (cmd == 5 && n >= 1 && (LH(p) & 0xffff) == 2) spu2_radio_stop();
+        p += 2 * n;
+    }
+}
+
 // ---- SIF / IOP ----------------------------------------------------------------------
 // sceSifClientData: rpcd(16) command buff cbuff func para serve
 static const u32 CD_SERVE = 36;
@@ -272,6 +289,7 @@ void HLE_sceSifCallRpc(Ctx &c)
         LOG("RPC call server %08x fn %u send %08x/%u recv %08x/%u (ra %08x)\n", sid, fno,
             T0 ? A3 : 0, T0, recv, rsize, c.r[31].w[0]);
     if (sid == SOUND_SID) snd_log_packet(fno, A3, T0, c.r[31].w[0]);
+    if (sid == SOUND_SID && fno == 0 && A3 && T0 >= 6) radio_watch(A3, T0);
     if (iop_has_server(sid)) {
         iop_call_rpc(sid, fno, A3, T0, recv, rsize);
         // HP2_SNDLOG: the driver's answer too (its first 256 bytes: the channels' and streams' status), the words that changed since the last

@@ -10,7 +10,10 @@
 #include "pcconfig.h"
 #include "pcmenu.h"
 #include "memwatch.h"
+#include "mirror_glass.h"
+#include "track_roofs.h"
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <algorithm>
@@ -199,6 +202,8 @@ static u32 g_light_ctx, g_light_mat;
 static int g_light = -1;
 static u32 g_strip_flags;
 static u32 g_draw_target;
+struct MidOwner;
+static const MidOwner *g_owner;             // the car whose node the list's reader is at (mid_owner_of), or null: the world's
 
 static u32 g_rvm_texture, g_rvm_target;  // the mirror's TextureInfo and target
 static u32 g_prev_texture, g_prev_target;  // the screen buffer that holds the last frame
@@ -235,6 +240,7 @@ static void set_draw_state(NativeDraw &d)
     d.depth_test = !g_target_ptr || LW(g_target_ptr + 0x44) != 1;
     d.target = (u8)g_draw_target;
     d.flags = (u16)g_strip_flags;
+    d.car = g_owner != nullptr;
     d.light = g_light;
     d.depth_write = (g_mode & 2) != 0;
     d.alpha_test = !(g_mode & 1);
@@ -265,6 +271,53 @@ static void set_draw_state(NativeDraw &d)
     else if (g_texture == g_prev_texture) d.rt = NATIVE_RT_PREVIOUS;
     else d.tex = native_texture(g_texture, g_frame_no);
     if (d.tex) d.tex_mode = native_tex_mode(*d.tex), d.tex_upscaled = d.tex->upscaled, d.tex_min_linear = d.tex->min_linear;
+}
+
+// ---- a strip draw's state once a list (2026-11-24) ------------------------------------------------------------------------------
+// set_draw_state reads the target's rectangle and depth test, the texture's blend, filter and scroll, and asks for the texture: the
+// same answers for every draw of strips of one list (a list is one texture's, read in one go with nothing of the game running in
+// between), and a list of the scenery's has hundreds of draws. So the first draw's state is kept and the others take it: while the
+// list, the texture, the target, its mode and the picture are what they were. Every field set_draw_state sets is copied (a field
+// added there is to be added here); the flags and the light are each draw's own. HP2_STATEKEEP=0: asked for every draw, as before.
+static const bool g_state_keep = !(getenv("HP2_STATEKEEP") && atoi(getenv("HP2_STATEKEEP")) == 0);
+static u32 g_list_serial;                   // counted up by every list read
+static struct {
+    bool have;
+    u32 list, texture, target, mode, draw_target, bits;
+    NativeDraw d;
+} g_state_kept;
+
+static void strip_state(NativeDraw &d)
+{
+    auto &k = g_state_kept;
+    if (g_state_keep && k.have && k.list == g_list_serial && k.texture == g_texture && k.target == g_target_ptr && k.mode == g_mode &&
+        k.draw_target == (u32)g_draw_target) {
+        const NativeDraw &s = k.d;
+        d.rt = s.rt;
+        d.snap_x = s.snap_x, d.snap_y = s.snap_y;
+        memcpy(d.view, s.view, sizeof d.view);
+        d.tfx = s.tfx;
+        d.lod_l = s.lod_l;
+        d.depth_test = s.depth_test;
+        d.target = s.target;
+        d.depth_write = s.depth_write;
+        d.alpha_test = s.alpha_test;
+        d.blend = s.blend;
+        d.blend_fix = s.blend_fix;
+        d.scroll_s = s.scroll_s, d.scroll_t = s.scroll_t;
+        d.tex = s.tex;
+        d.tex_mode = s.tex_mode, d.tex_upscaled = s.tex_upscaled, d.tex_min_linear = s.tex_min_linear;
+        d.flags = (u16)g_strip_flags;
+        d.car = g_owner != nullptr;
+        d.light = g_light;
+        if (g_texture) g_alpha_seen[k.bits]++;          // (HP2_NATIVESTATS counts the draws by their blend)
+        return;
+    }
+    set_draw_state(d);
+    k.have = true;
+    k.list = g_list_serial, k.texture = g_texture, k.target = g_target_ptr, k.mode = g_mode, k.draw_target = (u32)g_draw_target;
+    k.bits = g_texture ? LB(g_texture + 118) : 0;
+    k.d = d;
 }
 static float g_clip[16];
 static bool g_clip_stale;                   // the target, the pack or the local-world changed since g_clip was made (update_clip)
@@ -435,6 +488,37 @@ struct StripSpan {
 static std::unordered_map<u32, std::vector<StripSpan>> g_packet_spans;
 static std::vector<StripSpan> g_strip_spans;
 
+// Whose a packet of the 2D layer is (the HUD in a picture between two frames, hud_between): taken from the game where the packet is
+// made, kept by the packet's address till the lists are read.
+//  - A Flailer object's (a text, a bitmap; the HUD is made of them): its strip is being rendered (FlailerStrip::Render, 0x145950).
+//    The strip is made anew whenever the object changes, but it has its object at +8 (the constructor, 0x145758), and the object
+//    stays. The group is the object and which of its strips this frame it is (an object rendered several times a frame, a list's
+//    rows through one text object, has a strip each time, in the same order every frame); the index is the poly's place in the
+//    strip, the strips chained to it (+32, another texture of the same object) counted on.
+//  - The track map's (TrackMap::Render, 0x1bade8: the map's pieces and the cars' markers, straight through ePoly::Render): the
+//    group is the map, the index the poly's place among all it draws.
+// Anything else of the layer has no owner and is drawn in every picture as the frame has it.
+struct HudWho {
+    u64 group;
+    u32 index;
+    float x;                                // the object's own place across as its strip was rendered (FlailerObjectChunk +48)
+};
+static std::unordered_map<u32, HudWho> g_packet_who;
+static u64 g_hud_group;                     // whose packets are being made now; 0: nobody's
+static u32 g_hud_index;
+static float g_hud_x;
+static int g_hud_strips;                    // FlailerStrip::Render inside itself (a chained strip)
+static std::unordered_map<u32, u32> g_hud_times;        // a Flailer object's strips rendered this frame so far
+struct HudDraw {
+    u32 draw;                               // in g_frame.draws
+    u64 group;
+    u32 index;
+    u32 tex;                                // the game's TextureInfo, for HP2_HUDAUDIT's names
+};
+static std::vector<HudDraw> g_hud_draws;    // this frame's draws of packets that have an owner
+static std::unordered_map<std::string, int> g_hud_strangers;       // HP2_HUDAUDIT: the layer's packets with none, by texture
+static inline u64 hud_group(u32 kind, u32 who, u32 time) { return ((u64)kind << 60) ^ ((u64)time << 32) ^ who; }
+
 // The 2D of a wide frame. The game lays it out for 4:3; on a wider picture every piece is narrowed by the same factor, and what matters is
 // where: the HUD's left part keeps to the left edge, its right part to the right edge, the middle (the mirror and its lights, 160..351, and
 // the messages) to the middle. A piece is placed by the middle of the line it belongs to, never by its own: letters of one line placed one
@@ -448,9 +532,58 @@ struct Wide2D {
     float x0, x1, y0, y1, ox;                               // x without the target's offset
     u32 packet, mark;                                       // the packet (its strip's spans), and what the quad shows: its texture and corner
     bool edges;
+    u64 who;                                                // the game's object that drew it (g_packet_who's group), 0: none known
+    u32 tex;                                                // its TextureInfo (for the log's names)
 };
 static std::vector<Wide2D> g_wide_2d;
+// The developers' readout (the Debug menu's frame rates, the car's place, the distance: "C: 79fps", "G: 4934fps", "0.215 km") is
+// the screen's printf: FlailerRenderManager::RenderScreenPrintf (0x146190) renders the text objects of a screen of its own
+// (0xd1d43ff1) while any were printed this frame. On a wide picture its lines keep to the picture's left edge whatever else is
+// up: with the pause menu over the race the 2D is narrowed to the middle as a whole, and the readout stood in the menu's rows
+// (the user's picture, 2026-11-24: "can the debug data go by the edges of the aspect in use too, so that they are at the edge").
+// The packets made inside that call are marked by their address, as the HUD's owners are (g_packet_who).
+static bool g_printf_now;
+static std::unordered_map<u32, bool> g_packet_edge;
 
+// The part of the picture a HUD object is put by, known from the layout itself (the user, 2026-11-26, after two evenings of
+// pieces put by what happened to be drawn near them: "why not settle it at the root?", and of the ways offered: "B"). The
+// HUD is Flailer objects of a file, each at a place the layout gives it; tools/recomp/make_hud_anchors.py works out from that
+// file which part of a wide picture each belongs to (by the middle of its box, with the few the numbers do not say right
+// named there; drawn for the user's eye at 16:9, 21:9 and 32:9 before it was built), pcmenu.cpp gives every object of a loaded
+// screen its part, and a quad of such an object is put here at once, by that part and nothing else: it keeps it for as long
+// as it lives, whatever is drawn beside it, so there is nothing to jump.
+//
+// The game moves its objects: an animation writes the object's own place and size frame by frame (HudAnimator::DoAnimation,
+// 0x23b788: +48, +52, +56, +60), and plain code puts some where the layout does not have them at all (the user, the same
+// day: "can you see by the code how the elements' animations go, and write it all into the anchors?"). By the code: a
+// pursuit's star comes from 300 to the left of its place, four times its size (UpdatePursuitMeter, 0x17c380); a score's
+// words stand at 530, 236 and leave by 90, -100 (StartScore), on the two players' screens as well, where the layout has
+// them in the middle; the place number's and the speed's second copies grow or drop from where the first stands; the
+// wrong way sign shows at 258 and parks 105, 95 or 240 to the left (HudStartWrongWay, 0x17c888); a gauge's needle and
+// backing, which the layout keeps off the screen at the left, are put on the car's own gauge (SetHudFeatures); the marks
+// of the cars behind run from 120 to 520 (DrawTracker, 0x17c278). So an object's number is its part's and what the
+// parts' blend (hud_blend: the same places as a moving line's, wide_place) changes by between where the layout has it and
+// where it is now, the object's own place read as its strip is rendered. Standing where the layout has it, that is the
+// part itself; moved inside one part, still the part; taken from the middle to a side, it goes there evenly with the
+// way; put by code in another part, it is in that part. One number for all the object's quads, and no step in it
+// anywhere. Two kinds the table names apart: one that keeps its part wherever it is (the marks of the cars behind), one
+// with two places and a part for each (the wrong way sign: the middle where it shows, the left where it parks).
+// What has no part (drawn outside the Flailer's strips: the mirror, the track's map; the screens that are no HUD) goes the
+// old way, by the lines of each frame (resolve_wide_2d). hp2.ini's hud_anchors=0: everything the old way.
+static std::unordered_map<u32, NativeHudPart> g_hud_part;
+void native_hud_part(uint32_t object, const NativeHudPart *part)
+{
+    if (!object || !part) g_hud_part.clear();
+    else g_hud_part[object] = *part;
+}
+
+// the parts' numbers blended, by a middle in the layout's 640: 0 to the left of 147.5, 0.5 from 227.5 to 400, 1 past 480
+static float hud_blend(float m)
+{
+    return m < 147.5f ? 0.0f : m < 227.5f ? (m - 147.5f) / 160.0f : m <= 400.0f ? 0.5f : m <= 480.0f ? 0.5f + (m - 400.0f) / 160.0f : 1.0f;
+}
+
+static float wide_place(float m, bool edges, bool moving, float f);
 static bool dumping();
 static void unstretch_2d(u32 first, u32 data, float ox)
 {
@@ -462,7 +595,24 @@ static void unstretch_2d(u32 first, u32 data, float ox)
     bool layer = id == 0 || id == 3;
     u32 radial = LW(g_pc_ctx->r[28].w[0] - 25124);          // pTextureInfoRadialBlur
     if (!layer && g_texture && (g_texture == radial || g_texture == g_prev_texture)) return;    // the whole view, cut in four
-    bool edges = pc_hud_up();
+    bool edges = pc_hud_up() || g_packet_edge.count(data) != 0;
+    const auto owner = g_packet_who.find(data);
+    const u64 who = owner != g_packet_who.end() ? owner->second.group : 0;
+    // (the object's part, if the layout's table has one for it: a Flailer object's strip, with the HUD up)
+    float part = -1.0f;
+    if (layer && edges && who >> 60 == 1 && g_cfg.hud_anchors && !g_hud_part.empty())
+        if (const auto known = g_hud_part.find((u32)who); known != g_hud_part.end()) {
+            const NativeHudPart &p = known->second;
+            const float x = owner->second.x;
+            part = p.k;
+            if (p.kind == 2 && p.ax != p.bx) {
+                const float t = (x - p.ax) / (p.bx - p.ax);
+                part = p.ak + (p.bk - p.ak) * (t < 0.0f ? 0.0f : t > 1.0f ? 1.0f : t);
+            } else if (p.kind == 0 && std::fabs(x - p.x) > 0.01f) {
+                part = p.k + hud_blend(p.mid + x - p.x) - hud_blend(p.mid);
+                part = part < 0.0f ? 0.0f : part > 1.0f ? 1.0f : part;
+            }
+        }
     size_t group = n % 6 ? n : 6;
     for (size_t at = 0; at < n; at += group) {
         NativeVertex *v = &g_frame.vertices[first + at];
@@ -476,15 +626,36 @@ static void unstretch_2d(u32 first, u32 data, float ox)
             fprintf(g_hle_log, "dump wide quad target %u x %.1f..%.1f y %.1f..%.1f texture %08x %dx%d colour %02x%02x%02x%02x packet %08x%c", id, x0, x1, y0, y1, g_texture,
                     g_texture ? LH(g_texture + 0x24) : 0, g_texture ? LH(g_texture + 0x26) : 0, v[0].r, v[0].g, v[0].b, v[0].a, data, 10);
         // across the whole screen: a plain colour (a fade, a letterbox, a line) stays across the wide screen too; a picture keeps its shape
-        if (x1 - x0 >= 400 && (!g_texture || LH(g_texture + 0x24) <= 64)) continue;
+        if (x1 - x0 >= 400 && (!g_texture || LH(g_texture + 0x24) <= 64)) {
+            // Left as it is, such a piece keeps its 4:3 numbers on the wide picture: its right end is at the right edge or past
+            // it, and its left end as far in as 4:3 has it. A window over the race (a question of the pause menu, the screens
+            // after a race) has its sheet, its red line and its white one so, from 73 of 512 on: with the title's bar now across
+            // the whole picture (resolve_wide_2d, a band) they began a seventh of the way in (the user's picture, 2026-11-26:
+            // "the backdrop with the white line must go to the end too"). The same band: from the left edge. Not with the HUD up.
+            if (layer && !edges && x0 > 0.5f && x1 >= 508.0f) {
+                const float to = std::max(512.0f, x1) / (x1 - x0);
+                for (size_t i = 0; i < group; i++) v[i].x = ox + (v[i].x - ox - x0) * to;
+            }
+            continue;
+        }
         // A sheet over the 2D layer from its left edge to its right one is a backdrop, whatever its texture: the film lines that darken
         // the picture under Busted, a ticket and the starting grid (NISOverlayManager's screen: three quads 0..512 of a 640x304 texture).
         // Narrowed like a picture it left the wide screen's sides lighter than its middle; a backdrop covers the wide screen too.
-        if (layer && x0 <= 0.5f && x1 >= 511.5f) continue;
+        // Not the replay's bar of buttons (REPLAYBOTTOM_NEW, 640 texels shown across the 512): it is the screen's controls, and
+        // stretched over a wide picture its symbols and keys were a third wider and further apart than the places the pointer
+        // presses them at, which go by the 4:3 block (the user, 2026-11-23: "the buttons' places do not match the mouse").
+        // It is narrowed and centred with the rest of the replay's 2D.
+        const bool replay_bar = g_texture && !strcmp((const char *)host(g_texture + 8), "REPLAYBOTTOM_NEW");
+        if (layer && x0 <= 0.5f && x1 >= 511.5f && !replay_bar) continue;
+        if (part >= 0.0f) {
+            const float shift = part * 512.0f * (1.0f - f);
+            for (size_t i = 0; i < group; i++) v[i].x = ox + (v[i].x - ox) * f + shift;
+            continue;
+        }
         if (layer) {
             u32 st[2];
             memcpy(st, &v[0].s, 8);
-            g_wide_2d.push_back({(u32)(first + at), (u32)group, x0, x1, y0, y1, ox, data, g_texture ^ st[0] * 31 ^ st[1] * 131, edges});
+            g_wide_2d.push_back({(u32)(first + at), (u32)group, x0, x1, y0, y1, ox, data, g_texture ^ st[0] * 31 ^ st[1] * 131, edges, who, g_texture});
             continue;
         }
         float mid = (x0 + x1) / 2;                          // in the view (the sun, a spark): narrowed where it is
@@ -507,12 +678,88 @@ static float wide_place(float m, bool edges, bool moving, float f)
     return right;
 }
 
+// What holds a piece of the HUD in its place (the user, 2026-11-25: "when the player gets the stars of a pursuit the table at
+// the top left jerks and loses its place ... let us close the HUD's problems once and for all, this one and whatever others
+// there may be"; the song's name at a race's start was the same kind of thing a day before).
+//
+// A piece's place across a wide picture is one number: x' = x * f + k * 512 * (1 - f), k 0 by the left edge, 0.5 in the
+// middle, 1 by the right edge, and between them for what is on its way. That number was worked out anew in every frame, for
+// every piece, from what happened to be drawn around it: the lines are found by what lies near what (below), so a thing
+// passing by (a pursuit's star flying from the middle of the screen to its panel on the right) made one line of two for a
+// few frames, the line's middle was somewhere else, and the pieces that had stood there all along were put by it: the list
+// of racers went towards the middle and back.
+//
+// So the number is the game object's, kept from frame to frame (g_wide_held, by the Flailer object whose strip made the
+// quad: g_packet_who, as the pictures between two frames know their objects):
+//  - an object that stands where it stood keeps its number, whatever is drawn around it now. Standing: its span across is what
+//    it was; or it is a text that got longer or shorter (as tall as it was, one end moved, or both apart: its middle by no
+//    more than half the change of its width). NOT one that grows or shrinks, taller or lower as well as wider: the count
+//    before a race, 3 2 1, comes in large and shrinks to its place with its left edge where it is, so the 1 was born with
+//    its middle in the right part of the screen and, held to that, stayed by the right edge, far from the 2 (the user's
+//    picture of the same evening: "the 1 is too far"). What changes its size is put anew in each frame until it rests;
+//  - an object that is moving (both ends of its span went the same way since the frame before) is no part of the lines of what
+//    stands, neither one of them nor a bridge between two; the moving ones make lines among themselves (a message of several
+//    words slides in as one) and are put by their line's middle, with the parts' places blended, as a moving line always was.
+//    When it comes to rest it keeps the number it arrived with;
+//  - an object that is new (or was put somewhere else at once) gets its number from the lines, as before; in a line with
+//    objects that stand and agree on theirs it takes theirs (a new row of the list, a new letter of a number), with ones that
+//    disagree it goes by its own middle;
+//  - an object whose pieces are in different parts of the screen (one strip's pieces far apart) has no number of its own: its
+//    pieces go by the lines, as before. So does everything with no object (drawn outside the Flailer's strips).
+// A text on a panel is taken into the panel's line only if most of the text's own span lies on the panel: a thing passing
+// over a wide backdrop is not written on it.
+// hp2.ini's hud_steady=0: every piece by the lines of each frame, as it was.
+struct WideHeld {
+    float lo, hi, top, bottom, k;           // the object's span a frame ago, across and down, and its number
+    u32 frame;
+    bool split;
+    u8 rule;                                // how it got the number: 0 new (by the lines), 1 held, 2 moving, 3 split
+    u32 told;                               // the frame speed.log was last told of it
+};
+static std::unordered_map<u64, WideHeld> g_wide_held;
+
 static bool dumping();
 static void resolve_wide_2d()
 {
     if (g_wide_2d.empty()) return;
     const float f = native_narrow();
     const size_t n = g_wide_2d.size();
+    const float room = 512.0f * (1.0f - f);
+    const bool hold = g_cfg.hud_steady && room > 0.01f;
+    // the objects of this frame: their spans, and which of them stand, which move
+    struct Obj {
+        float lo = 1e9f, hi = -1e9f, top = 1e9f, bottom = -1e9f, k = 0.5f, kmin = 1e9f, kmax = -1e9f;
+        bool moving = false, standing = false, split = false;
+        u32 tex = 0;                                                    // (for the log: its first quad's texture and line)
+        int line = -1;
+    };
+    std::unordered_map<u64, Obj> objs;
+    std::vector<Obj *> obj_of(n, nullptr);
+    if (hold) {
+        for (const Wide2D &q : g_wide_2d)
+            if (q.who && q.edges) {
+                Obj &o = objs[q.who];
+                o.lo = std::min(o.lo, q.x0), o.hi = std::max(o.hi, q.x1);
+                o.top = std::min(o.top, q.y0), o.bottom = std::max(o.bottom, q.y1);
+                if (!o.tex) o.tex = q.tex;
+            }
+        for (size_t i = 0; i < n; i++)
+            if (g_wide_2d[i].who && g_wide_2d[i].edges) obj_of[i] = &objs[g_wide_2d[i].who];
+        for (auto &e : objs) {
+            Obj &o = e.second;
+            const auto was = g_wide_held.find(e.first);
+            if (was == g_wide_held.end()) continue;
+            const WideHeld &h = was->second;
+            const float dlo = o.lo - h.lo, dhi = o.hi - h.hi;
+            const bool same = std::fabs(dlo) <= 0.25f && std::fabs(dhi) <= 0.25f;
+            const bool as_tall = std::fabs((o.bottom - o.top) - (h.bottom - h.top)) <= 0.5f;
+            const bool text_changed = as_tall && std::fabs((o.lo + o.hi) - (h.lo + h.hi)) / 2 <= std::fabs((o.hi - o.lo) - (h.hi - h.lo)) / 2 + 0.5f;
+            if (g_frame_no - h.frame <= 2 && std::fabs(dlo) > 0.25f && std::fabs(dhi) > 0.25f && (dlo > 0) == (dhi > 0)) o.moving = true;
+            else if (!h.split && (same || text_changed)) o.standing = true, o.k = h.k;
+        }
+    }
+    std::vector<char> mover(n, 0);
+    for (size_t i = 0; i < n; i++) mover[i] = obj_of[i] && obj_of[i]->moving;
     // a letter's quad: the HUD's fonts are under 40 pixels a glyph, a message growing in can be larger for a moment
     auto letter = [](const Wide2D &q) { return q.x1 - q.x0 <= 64 && q.y1 - q.y0 <= 64; };
     std::vector<int> order(n), up(n);
@@ -523,7 +770,8 @@ static void resolve_wide_2d()
         return i;
     };
     // letters within a word's gap of each other across, and on the same line (or touching the next): one line. The gap goes by the letters'
-    // height, so that a large font's wider spaces are still spaces. Only letters make a line: a panel or a bar is no word of one.
+    // height, so that a large font's wider spaces are still spaces. Only letters make a line: a panel or a bar is no word of one. What
+    // moves and what stands make no line together.
     for (size_t a = 0; a < n; a++) {
         const Wide2D &i = g_wide_2d[order[a]];
         if (!letter(i)) continue;
@@ -532,26 +780,61 @@ static void resolve_wide_2d()
             if (j.x0 - i.x1 >= 64) break;
             if (!letter(j) || j.y0 > i.y1 + 4 || i.y0 > j.y1 + 4) continue;
             if (j.x0 - i.x1 >= std::max(32.0f, 0.9f * std::max(i.y1 - i.y0, j.y1 - j.y0))) continue;
+            if (mover[order[a]] != mover[order[b]]) continue;
             up[root(order[b])] = root(order[a]);
+        }
+    }
+    // A panel and what is written on it are one thing. A backdrop (a piece that is no letter) takes in every letter whose middle
+    // lies on it, and with the letters their lines: the song's name as a race begins is four lines on a panel that fades out
+    // far to the right, so the lines' middles were in the screen's left part and the panel's own in the middle one, and on a
+    // wide picture the text went to the left edge while its panel stayed where 4:3 has it (the user's picture, 2026-11-25:
+    // "the text is shifted"). The whole is placed by its letters, the panel with them. Not a sheet 400 wide or more: that is no
+    // panel of one thing, and what lies on it keeps its own places. A letter of an object most of which is off the panel is
+    // not written on it (above).
+    for (size_t p = 0; p < n; p++) {
+        const Wide2D &panel = g_wide_2d[p];
+        if (letter(panel) || panel.x1 - panel.x0 >= 400) continue;
+        for (size_t j = 0; j < n; j++) {
+            const Wide2D &q = g_wide_2d[j];
+            if (!letter(q) || mover[p] != mover[j]) continue;
+            const float mx = (q.x0 + q.x1) / 2, my = (q.y0 + q.y1) / 2;
+            if (mx < panel.x0 || mx > panel.x1 || my < panel.y0 || my > panel.y1) continue;
+            if (const Obj *o = obj_of[j]) {
+                const float on = std::min(o->hi, panel.x1) - std::max(o->lo, panel.x0);
+                if (on < 0.75f * (o->hi - o->lo)) continue;
+            }
+            up[root((int)j)] = root((int)p);
         }
     }
     struct Line {
         float lo = 1e9f, hi = -1e9f, top = 1e9f;
-        int count = 0;
+        int count = 0, panels = 0;                                      // its letters; the backdrops they lie on
         u32 mark = 0;
         float mark_x = 1e9f;
         bool moving = false;
+        int seniors = 0;                                                // standing objects in it: 0 none, 1 all of one number, 2 of several
+        float senior_k = 0;
     };
     std::vector<Line> lines(n);
     for (size_t i = 0; i < n; i++) {
         const Wide2D &q = g_wide_2d[i];
         Line &l = lines[root((int)i)];
+        if (const Obj *o = obj_of[i]; o && o->standing) {
+            if (!l.seniors) l.seniors = 1, l.senior_k = o->k;
+            else if (std::fabs(l.senior_k - o->k) > 0.01f) l.seniors = 2;
+        }
+        if (mover[i]) l.moving = true;
+        if (!letter(q)) {
+            l.panels++;                                                 // (placed by the letters, its own span is no part of theirs)
+            continue;
+        }
         l.lo = std::min(l.lo, q.x0), l.hi = std::max(l.hi, q.x1), l.top = std::min(l.top, q.y0);
         l.count++;
         if (q.x0 < l.mark_x) l.mark_x = q.x0, l.mark = q.mark;          // the line's first letter
     }
-    // Does the line move? It is known from one frame to the next by its first letter, its length and its row; once seen moving it is a
-    // moving line for as long as it is there, so that it does not jump where it comes to rest either.
+    // Does the line move? What has an object says so itself (above). The rest is known from one frame to the next by its first letter,
+    // its length and its row; once seen moving it is a moving line for as long as it is there, so that it does not jump where it comes
+    // to rest either.
     struct Seen {
         float mid;
         bool moving;
@@ -564,17 +847,19 @@ static void resolve_wide_2d()
         const u64 key = (u64)l.mark << 32 | (u32)l.count << 8 | ((u32)(l.top / 64) & 255);
         const float mid = (l.lo + l.hi) / 2;
         auto was = seen.find(key);
-        l.moving = was != seen.end() && (was->second.moving || std::fabs(was->second.mid - mid) > 0.25f);
+        l.moving = l.moving || (was != seen.end() && (was->second.moving || std::fabs(was->second.mid - mid) > 0.25f));
         now[key] = {mid, l.moving};
     }
     seen.swap(now);
+    // every quad's number by the lines of this frame
+    std::vector<float> shift(n), middle(n);
     for (size_t i = 0; i < n; i++) {
         const Wide2D &q = g_wide_2d[i];
         const Line &l = lines[root((int)i)];
         const float mid = (q.x0 + q.x1) / 2;
         float whole = mid;
-        if (l.count >= 2) {
-            whole = (l.lo + l.hi) / 2;
+        if (l.count >= 2 || (l.count == 1 && l.panels)) {
+            whole = (l.lo + l.hi) / 2;                                  // a line, or what is written on a panel and the panel itself
         } else {
             // a piece on its own: its strip's span, as the game's objects have it (a panel in several parts)
             auto spans = g_packet_spans.find(q.packet);
@@ -582,23 +867,138 @@ static void resolve_wide_2d()
                 for (const StripSpan &sp : spans->second)
                     if (mid >= sp.x0 && mid <= sp.x1) whole = sp.whole;
         }
-        const float place = wide_place(whole, q.edges, l.moving, f);
+        middle[i] = whole;
+        shift[i] = wide_place(whole, q.edges, l.moving, f) - whole * f;
+        if (Obj *o = obj_of[i]) {
+            const float k = shift[i] / room;
+            o->kmin = std::min(o->kmin, k), o->kmax = std::max(o->kmax, k);
+            if (o->line < 0) o->line = root((int)i);
+        }
+    }
+    // the objects' own numbers
+    if (hold) {
+        // (a new object in a line with standing ones: all its lines' standing objects agree, or they do not)
+        std::unordered_map<Obj *, int> agree;                           // 1 one number, 2 several
+        std::unordered_map<Obj *, float> agreed;
+        for (size_t i = 0; i < n; i++) {
+            Obj *o = obj_of[i];
+            if (!o || o->standing || o->moving) continue;
+            const Line &l = lines[root((int)i)];
+            if (!l.seniors) continue;
+            int &a = agree[o];
+            if (l.seniors == 2 || (a == 1 && std::fabs(agreed[o] - l.senior_k) > 0.01f)) a = 2;
+            else if (!a) a = 1, agreed[o] = l.senior_k;
+        }
+        for (auto &e : objs) {
+            Obj &o = e.second;
+            if (!o.standing) {
+                const auto a = agree.find(&o);
+                if (o.kmax - o.kmin > 0.01f) o.split = true;            // (its pieces are in different lines, with different numbers)
+                else if (a != agree.end() && a->second == 1) o.k = agreed[&o];
+                else if (a != agree.end()) o.k = (wide_place((o.lo + o.hi) / 2, true, true, f) - (o.lo + o.hi) / 2 * f) / room;
+                else o.k = o.kmin;
+            }
+            // speed.log: an object on the screen that was put somewhere else than a frame ago (the user, 2026-11-26, after a
+            // word of a message came in at a wrong place and nobody had a picture of it: "yes, add it"). Its number changed by
+            // more than 2 of the picture's 512 while it did not simply go on moving: what it is (the Flailer object's name,
+            // a text's words, the texture), where it stood and stands in the game's 4:3 numbers, the numbers and how each was
+            // come by, and the line it was put with. An object once in 20 frames, 600 lines a run.
+            const u8 rule = o.split ? 3 : o.moving ? 2 : o.standing ? 1 : 0;
+            u32 told = 0;
+            if (const auto was = g_wide_held.find(e.first); was != g_wide_held.end()) {
+                const WideHeld &h = was->second;
+                told = h.told;
+                static int lines_told;
+                const float jump = (o.k - h.k) * room;
+                if (!h.split && !o.split && g_frame_no - h.frame <= 2 && !(h.rule == 2 && rule == 2) && std::fabs(jump) > 2.0f &&
+                    g_frame_no - h.told >= 20 && lines_told < 600) {
+                    lines_told++;
+                    told = g_frame_no;
+                    static const char *const kRule[4] = {"new, by the lines", "held", "moving", "split"};
+                    const u32 kind = (u32)(e.first >> 60), object = (u32)e.first;
+                    char name[25] = "", words[41] = "";
+                    if (kind == 1 && object >= 0x100000 && object < 0x2000000 - 160) {
+                        for (int c = 0; c < 24; c++) {
+                            const u8 ch = *host(object + 16 + (u32)c);
+                            if (!ch) break;
+                            name[c] = ch >= 32 && ch < 127 ? (char)ch : '?', name[c + 1] = 0;
+                        }
+                        if ((s8)*host(object + 40) == 1)
+                            for (int c = 0; c < 40; c++) {
+                                const u8 ch = *host(object + 100 + (u32)c);
+                                if (!ch) break;
+                                words[c] = ch >= 32 && ch < 127 ? (char)ch : '?', words[c + 1] = 0;
+                            }
+                    }
+                    const Line *l = o.line >= 0 ? &lines[(size_t)o.line] : nullptr;
+                    fprintf(stderr, "hud: frame %u: %s%s%s%s (texture %s) was put %.1f of 512 %s: x %.1f..%.1f -> %.1f..%.1f, y %.1f..%.1f -> %.1f..%.1f, "
+                                    "number %.3f (%s) -> %.3f (%s), line of %d letters %.1f..%.1f%s%s, narrowed %.3f\n",
+                            g_frame_no, kind == 2 ? "the track map" : name[0] ? name : "an object", words[0] ? " \"" : "", words, words[0] ? "\"" : "",
+                            o.tex ? (const char *)host(o.tex + 8) : "-", std::fabs(jump), jump > 0 ? "to the right" : "to the left", h.lo, h.hi, o.lo, o.hi,
+                            h.top, h.bottom, o.top, o.bottom, h.k, kRule[h.rule & 3], o.k, kRule[rule], l ? l->count : 0, l ? l->lo : 0.0f, l ? l->hi : 0.0f,
+                            l && l->moving ? ", moving" : "", l && l->seniors ? (l->seniors == 1 ? ", with held ones of one number" : ", with held ones of several numbers") : "", f);
+                }
+            }
+            g_wide_held[e.first] = {o.lo, o.hi, o.top, o.bottom, o.k, g_frame_no, o.split, rule, told};
+        }
+        if ((g_frame_no & 511) == 0)
+            for (auto it = g_wide_held.begin(); it != g_wide_held.end();) it = g_frame_no - it->second.frame > 3600 ? g_wide_held.erase(it) : std::next(it);
+    }
+    // A band of a screen that is over the race (the windows after a race and the questions of the pause menu: a title's bar with
+    // its red line, the sheet under the text): a backdrop that runs off the picture's right edge in 4:3. Narrowed to the
+    // middle with the rest of the screen it began a long way in from the wide picture's left edge, and a title's bar, which
+    // ends at the 4:3 edge, stopped short of the right one too (the user's pictures, 2026-11-25: "from edge to edge, with no
+    // empty room on the left and on the right"). Such a band goes across the whole wide picture: from its left end at the
+    // left edge to its right end where it was, or at the right edge. A band: every quad of one object (or of one packet,
+    // where no object is known), none of them a letter's size, 200 across or more together, ending within 4 of the right
+    // edge or past it. Not while the HUD is up: its parts keep to their edges. The texts on a band stay with the screen.
+    struct Band {
+        float lo = 1e9f, hi = -1e9f;
+        bool plain = true;
+    };
+    std::unordered_map<u64, Band> bands;
+    const auto band_of = [](const Wide2D &q) { return q.who ? q.who : (u64)q.packet | 1ull << 63; };
+    for (const Wide2D &q : g_wide_2d) {
+        if (q.edges) continue;
+        Band &b = bands[band_of(q)];
+        b.lo = std::min(b.lo, q.x0), b.hi = std::max(b.hi, q.x1);
+        if (letter(q)) b.plain = false;
+    }
+    for (size_t i = 0; i < n; i++) {
+        const Wide2D &q = g_wide_2d[i];
+        const Line &l = lines[root((int)i)];
+        const Obj *o = obj_of[i];
+        const float s = o && !o->split ? o->k * room : shift[i];
+        if (!q.edges) {
+            const Band &b = bands[band_of(q)];
+            // (not one that begins at the left edge: a sheet across the whole 4:3 picture that is narrowed on purpose, the
+            // replay's bar of buttons, stays as it is)
+            if (b.plain && b.lo > 0.5f && b.hi >= 508.0f && b.hi - b.lo >= 200.0f) {
+                const float to = std::max(512.0f, b.hi) / (b.hi - b.lo);
+                NativeVertex *v = &g_frame.vertices[q.first];
+                for (u32 k = 0; k < q.count; k++) v[k].x = q.ox + (v[k].x - q.ox - b.lo) * to;
+                if (dumping())
+                    fprintf(g_hle_log, "dump 2D quad %zu x %.1f..%.1f y %.1f..%.1f a band %.1f..%.1f -> across the picture\n", i, q.x0, q.x1, q.y0, q.y1, b.lo, b.hi);
+                continue;
+            }
+        }
         {   // TEMP HP2_HUDLOG=1: a piece of the top right corner that is not put by the right edge
             static const bool on = getenv("HP2_HUDLOG") != nullptr;
             static int told;
             static u32 last_frame;
-            const float right = 512 - (512 - whole) * f;
-            if (on && q.y0 < 90 && q.x0 > 352 && right - place > 2 && told < 200 && pc_racing()) {
+            if (on && q.y0 < 90 && q.x0 > 352 && room - s > 2 && told < 200 && pc_racing()) {
                 if (last_frame != g_frame_no) told++, last_frame = g_frame_no;
-                fprintf(g_hle_log, "hudlog: frame %u quad x %.1f..%.1f y %.1f..%.1f line %.1f..%.1f of %d%s edges %d mode %u: middle %.1f put at %.1f, the right edge's place %.1f%c", g_frame_no, q.x0, q.x1,
-                        q.y0, q.y1, l.lo, l.hi, l.count, l.moving ? " moving" : "", q.edges, pc_input_mode(), whole, place, right, 10);
+                fprintf(g_hle_log, "hudlog: frame %u quad x %.1f..%.1f y %.1f..%.1f line %.1f..%.1f of %d%s edges %d mode %u: middle %.1f, shift %.1f of %.1f%s%c", g_frame_no, q.x0, q.x1,
+                        q.y0, q.y1, l.lo, l.hi, l.count, l.moving ? " moving" : "", q.edges, pc_input_mode(), middle[i], s, room,
+                        !o ? "" : o->standing ? " (held)" : o->moving ? " (its object moves)" : " (new)", 10);
             }
         }
         NativeVertex *v = &g_frame.vertices[q.first];
-        for (u32 k = 0; k < q.count; k++) v[k].x = q.ox + place + (v[k].x - q.ox - whole) * f;
+        for (u32 k = 0; k < q.count; k++) v[k].x = q.ox + (v[k].x - q.ox) * f + s;
         if (dumping())
-            fprintf(g_hle_log, "dump 2D quad %zu x %.1f..%.1f y %.1f..%.1f %s line %d of %d, %.1f..%.1f%s -> middle %.1f at %.1f\n", i, q.x0, q.x1, q.y0, q.y1,
-                    letter(q) ? "letter" : "piece", root((int)i), l.count, l.lo, l.hi, l.moving ? " moving" : "", whole, place);
+            fprintf(g_hle_log, "dump 2D quad %zu x %.1f..%.1f y %.1f..%.1f %s line %d of %d, %.1f..%.1f%s -> middle %.1f, shift %.1f%s\n", i, q.x0, q.x1, q.y0, q.y1,
+                    letter(q) ? "letter" : "piece", root((int)i), l.count, l.lo, l.hi, l.moving ? " moving" : "", middle[i], s,
+                    !o ? "" : o->standing ? " held" : o->moving ? " moving object" : o->split ? " split object" : " new object");
     }
     g_wide_2d.clear();
 }
@@ -725,12 +1125,137 @@ static inline StripSeen *strip_seen(u32 data)
     return &g_strip_seen[data >> 7 & ((1u << 18) - 1)];
 }
 
+// ---- the strips' triangles by indices (change 3, 2026-11-24) -------------------------------------------------------------------
+// A strip of n vertices is up to n - 2 triangles, and the cache held each triangle's three vertices: 84 vertices of 32 bytes for a
+// strip of 30, every vertex there about three times. A far view at the most detailed models had 13 million of them in the GPU's
+// memory (430 MB) and gave the GPU 1.5 million vertices a frame to work on. Now the cache holds the strip's own vertices once and,
+// apart, the triangles as indices: 4 bytes where a vertex's copy was 32, and the GPU works a vertex once however many triangles
+// share it. The same triangles of the same vertices in the same order: the picture is the same by construction.
+// The cache is one buffer of the GPU's still, counted in vertices (32 bytes, a "slot"). The vertices fill it from the bottom as
+// before (g_cache_top). The indices take chunks from its top down (kIdxChunk slots each, 8 indices a slot) and fill a chunk upwards,
+// so strips cached one after another have their indices one after another, and a draw's strips are still a few ranges (now of
+// indices). A range's first is an index's place in the buffer read as 32-bit words from its start; an index is its vertex's slot.
+// The indices go to the GPU the way the vertices do, as slots of the frame's "fresh" ones: the chunk being filled is kept here
+// (g_idx_mirror) and the slots touched in a frame are sent whole at its end. A strip the cache has no room for (or the mirror's
+// glass, which is never cached) goes into the frame's own vertices the same way: its vertices, then its indices in slots after them.
+// HP2_GEOINDEX=0: every triangle's vertices, as before (and so with HP2_INDEXED=1, or on a GPU that takes no 32-bit index).
+static const bool kGeoDefault = true;       // on since 2026-11-24: the five demos in step, 939 thousand strips read back the same
+static const u32 kIdxChunk = 512;           // slots: 4096 indices
+static bool g_geo;                          // this frame's strips are made that way (set between frames only: geo_frame)
+static u32 g_idx_low;                       // the lowest slot the indices have taken; 0: none yet
+static u32 g_idx_at, g_idx_end;             // the next index's place, and the chunk's end
+static u32 g_idx_mirror[kIdxChunk * 8];
+static u32 g_idx_dirty_lo, g_idx_dirty_hi;  // the chunk's indices not sent to the GPU yet
+
+static u32 cache_used() { return g_cache_top + (g_idx_low ? g_cache_cap - g_idx_low : 0); }
+
+// the chunk's indices written since the last time, as whole slots of the frame's fresh ones
+static void idx_send()
+{
+    if (g_idx_dirty_hi <= g_idx_dirty_lo) return;
+    const u32 chunk = g_idx_end - kIdxChunk * 8, slot_lo = g_idx_dirty_lo / 8, slots = (g_idx_dirty_hi + 7) / 8 - slot_lo;
+    const size_t src = g_frame.fresh.size();
+    g_frame.fresh.resize(src + slots);
+    memcpy((void *)&g_frame.fresh[src], g_idx_mirror + (slot_lo * 8 - chunk), (size_t)slots * sizeof(NativeVertex));
+    g_frame.fresh_runs.push_back({slot_lo, (u32)src, slots});
+    g_idx_dirty_lo = g_idx_dirty_hi = 0;
+}
+
+// room in the cache for a strip of n vertices and count indices; a new chunk of indices is begun here when the one in use is full
+static bool geo_room(u32 n, u32 count)
+{
+    const bool chunk = !g_idx_low || g_idx_at + count > g_idx_end;
+    u32 low = g_idx_low ? g_idx_low : g_cache_cap;
+    if (chunk) {
+        if (low < kIdxChunk) return false;
+        low -= kIdxChunk;
+    }
+    if (g_cache_top + n > low) return false;
+    if (chunk) {
+        idx_send();
+        g_idx_low = low;
+        g_idx_at = low * 8;
+        g_idx_end = (low + kIdxChunk) * 8;
+        memset(g_idx_mirror, 0, sizeof g_idx_mirror);
+    }
+    return true;
+}
+
+// HP2_GEOCHECK=1. The cache as the GPU is to have it, kept on this side: every frame's fresh slots are put into it the way the
+// renderer's copy puts them (and must never write a slot that is in use with anything else), and every strip put into the cache
+// or the frame's own vertices that frame is read back the way a draw reads it, index by index, against its triangles.
+static const bool g_geo_check = getenv("HP2_GEOCHECK") != nullptr;
+struct GeoPut {
+    u32 base, count, data;
+    NativeVertex tri[84];
+};
+static std::vector<NativeVertex> g_geo_copy;
+static std::vector<u8> g_geo_set;           // a slot of the copy has been written since the cache was emptied
+static std::vector<GeoPut> g_geo_puts;
+static u64 g_geo_read, g_geo_bad, g_geo_over;
+
+static void geo_check_frame()
+{
+    if (!g_geo_check || !g_geo) {
+        g_geo_puts.clear();
+        return;
+    }
+    if (g_geo_copy.size() != g_cache_cap) g_geo_copy.assign(g_cache_cap, NativeVertex{}), g_geo_set.assign(g_cache_cap, 0);
+    for (const NativeFreshRun &r : g_frame.fresh_runs)
+        for (u32 i = 0; i < r.count; i++) {
+            const u32 slot = r.dst + i;
+            if (slot >= g_cache_cap) {
+                g_geo_over++;
+                continue;
+            }
+            const NativeVertex &now = g_frame.fresh[r.src + i];
+            // a slot written again: only the indices' last slot is, filled further, and what it had stays
+            if (g_geo_set[slot]) {
+                u32 was[8], is[8];
+                memcpy(was, &g_geo_copy[slot], 32), memcpy(is, &now, 32);
+                bool grown = slot >= g_idx_low && g_idx_low;
+                for (int k = 0; k < 8 && grown; k++) grown = !was[k] || was[k] == is[k];
+                if (!grown) g_geo_over++;
+            }
+            g_geo_copy[slot] = now;
+            g_geo_set[slot] = 1;
+        }
+    const u32 dyn = g_frame.dyn_base, own = (u32)g_frame.vertices.size();
+    const auto slot_of = [&](u32 slot) -> const NativeVertex * {
+        if (slot < g_cache_cap && slot < dyn) return g_geo_set[slot] ? &g_geo_copy[slot] : nullptr;
+        if (slot >= dyn && slot - dyn < own) return &g_frame.vertices[slot - dyn];
+        return nullptr;
+    };
+    for (const GeoPut &put : g_geo_puts) {
+        bool same = true;
+        for (u32 k = 0; k < put.count && same; k++) {
+            const u32 at = put.base + k;
+            const NativeVertex *words = slot_of(at / 8);
+            u32 index = 0;
+            if (words) memcpy(&index, (const char *)words + (at % 8) * 4, 4);
+            const NativeVertex *v = words ? slot_of(index) : nullptr;
+            same = v && !memcmp(v, &put.tri[k], sizeof(NativeVertex));
+        }
+        g_geo_read++;
+        if (!same && g_geo_bad++ < 10)
+            fprintf(g_hle_log, "geocheck: a strip at %08x put at index %u (%u of them) does not read back as its triangles\n", put.data, put.base, put.count);
+    }
+    g_geo_puts.clear();
+    if (g_frame_no % 600 == 0)
+        fprintf(g_hle_log, "geocheck: %llu strips read back through their indices, %llu not the same; %llu slots written over\n", (unsigned long long)g_geo_read,
+                (unsigned long long)g_geo_bad, (unsigned long long)g_geo_over),
+            fflush(g_hle_log);
+}
+
 static void cache_flush()
 {
+    std::fill(g_geo_set.begin(), g_geo_set.end(), (u8)0);
     g_strip_generation++;
     g_strip_count = 0;
     g_strip_check.clear();
     g_cache_top = 0;
+    g_idx_low = g_idx_at = g_idx_end = 0;
+    g_idx_dirty_lo = g_idx_dirty_hi = 0;
     g_cache_flushes++;
 }
 
@@ -742,8 +1267,6 @@ struct StripAhead {
 
 static bool g_double_now;                   // 120 pictures a second: this frame is to be drawn twice (mid_frame)
 static void mid_matrix(NativeDraw &d, u32 strip);
-struct MidOwner;
-static const MidOwner *g_owner;             // the car whose node the list's reader is at (mid_owner_of), or null: the world's
 static const MidOwner *g_strip_owner;       // of the last draw of strips made
 static void mid_direct(NativeDraw &d);
 static int shadows_level();
@@ -763,14 +1286,274 @@ static void mid_particles(size_t first_draw);
 // the indices, as it was, for comparing.
 static const bool g_ranged = getenv("HP2_INDEXED") == nullptr;
 
+// ---- the player's side mirrors ------------------------------------------------------------------------------------------
+// The user, 2026-11-24: "for the fun of it: the side mirrors of the driver's car show a small copy of the HUD's rear-view
+// mirror; every car that has such a glass, the bonus ones too; where there is none, touch nothing; not on a split screen".
+// The game makes one reflection: the rear-view mirror of the HUD, its own view of the world behind (target 7). A car's side
+// mirrors are parts of their own, <CAR>_SIDE_MIRROR_LEFT / _RIGHT, on all 29 cars that can be driven, and one strip of each is
+// the glass (mirror_glass.h, made from the car files by tools/recomp/make_mirror_glass.py, which says how it is told from the
+// housing; checked on a sheet of all 58, work/nshots/mirrors). The glass has no picture laid out on it: the whole strip is one
+// texel of the car's texture.
+//
+// Here that strip, of the first player's car in the player's own view, is drawn with the mirror's picture instead: as a draw of
+// its own, its vertices' texture coordinates made from where each lies on the glass's plane, unlit and with no reflection
+// pass (the strip's own flags are for the car's paint). The left mirror shows the picture's part about three quarters across,
+// the right one about a quarter: the mirror's view looks backward, so the car's left is the picture's right; the HUD turns it
+// round as it shows it, and the glass, seen from behind the car, takes it the same way. As tall as the picture, and as wide
+// as the glass's own shape makes that.
+//
+// Only while the mirror's view is drawn (the frame before had draws of target 7: the HUD's mirror is on), with one player, and
+// for a strip whose first vertex and count are a row of the table: a car bent by a crash, a car of a mod, another car's
+// mirrors, the car in the mirror's own view or in the reflections' views are all left as they are. hp2.ini side_mirrors=0: off.
+//
+// The user, 2026-11-24, having seen it ("works fine in a race"): it goes by the Reflections setting, never at the PS2's, on at
+// the others; the picture on the glass at a quarter of the mirror's resolution (first a half, then "let us try four times"),
+// the HUD's own mirror as it is; the side mirrors aspheric, their outer third showing more ("the second variant, on the side
+// ones only"); and the glass of the mirror inside the car, where a car has one as a plate of its own (side 0 in the table:
+// four open cars), shows the picture's middle. All of that is native.frag's sample_glass (NativeDraw::tex_mode 128): the
+// vertices carry the place on the glass (s: across it, -1 to 1 toward the car's left; t: the picture's own) and, as their
+// colour, the glass's numbers (r the side, g the part's width, b its middle), and the shader makes the picture's place of them
+// for every pixel: a glass has a dozen vertices, all on its outline, so a curve made at the vertices would be no curve.
+//
+// And the mirror's view is there before the HUD's mirror is (the user: "the glass is empty until the race starts, then it
+// fills at once"): pcmenu.cpp keeps the mirror's camera on for the whole race (mirror_view_frame), and the HUD's own picture
+// of it is not drawn while the game does not want it.
+static bool g_rvm_now, g_rvm_was;           // the mirror's view has draws this frame; it had the frame before
+struct GlassSeen {
+    u32 qwords, generation;
+    int row;                                // of kMirrorGlass, -1: not a glass
+};
+static std::unordered_map<u32, GlassSeen> g_glass_seen;        // by the strip's address: asked of the table once
+
+static u32 owner_car(const MidOwner *o);    // the Car a car's nodes are of
+static int glass_row(u32 data, u32 qwords)
+{
+    static thread_local u32 vu[VU_QUADS][4];
+    memset(vu, 0, sizeof vu);
+    if (!unpack_strip(data, qwords, vu)) return -1;
+    const int n = (int)(vu[0][0] & 0xff);
+    // (cars that share a mirror's shape have rows that are the same: the first is as good as the other)
+    for (size_t i = 0; i < sizeof kMirrorGlass / sizeof kMirrorGlass[0]; i++) {
+        const MirrorGlass &m = kMirrorGlass[i];
+        if (m.n == n && m.first[0] == vu[2][0] && m.first[1] == vu[3][0] && m.first[2] == vu[4][0]) return (int)i;
+    }
+    return -1;
+}
+
+static const float kGlassCurve = 1.0f;     // native.frag's GLASS_CURVE
+static bool g_pcar_now, g_pcar_was;         // the first player's car was drawn this frame; the frame before
+bool native_player_car_drawn() { return g_pcar_was; }
+static const MirrorGlass *mirror_glass_now(u32 data, u32 qwords)
+{
+    if (!g_cfg.side_mirrors || !g_cfg.reflections || !g_rvm_was || g_draw_target != 1 || !g_owner) return nullptr;
+    const u32 pcar = owner_car(g_owner);
+    if (!pcar || pcar != pc_player_car() || pc_two_player_race()) return nullptr;
+    // What an address was found to be is kept while the car is being drawn: after a pause in that (another race is loaded, and
+    // another car may lie at the same place) all is asked again. A strip found to be a glass is asked every time: two a frame.
+    static u32 last_frame;
+    if (g_frame_no - last_frame > 30) g_glass_seen.clear();
+    last_frame = g_frame_no;
+    auto it = g_glass_seen.find(data);
+    if (it == g_glass_seen.end() || it->second.qwords != qwords || it->second.generation != g_strip_generation || it->second.row >= 0) {
+        if (g_glass_seen.size() > 4096) g_glass_seen.clear();
+        const int row = glass_row(data, qwords);
+        static int told;
+        if (row >= 0 && it == g_glass_seen.end() && told < 8)
+            told++, fprintf(g_hle_log, "native: side mirrors: a glass of the player's car at %08x, row %d of the table\n", data, row);
+        g_glass_seen[data] = GlassSeen{qwords, g_strip_generation, row};
+        return row >= 0 ? &kMirrorGlass[row] : nullptr;
+    }
+    return nullptr;
+}
+
+// what g_clip was made of: the pack's quads and the local-world matrix, for the picture between two frames (mid_matrix)
+static float g_now_p[16], g_now_q[8], g_now_l[16];
+
+// ---- the clip matrix made later (change 4, 2026-11-24) ----------------------------------------------------------------------
+// Every draw of strips has a clip matrix: the view's matrix pack times the draw's local-world matrix, scaled to the target. The
+// game's thread made it as the draw began, several thousand products a frame (clip_now was 1.4 % of the thread's samples), though
+// nothing on that thread reads it but the pictures between frames. So it now hands over what the matrix is made of: the draw keeps
+// its local-world matrix where the product will be, and the number of the view's pack among the frame's (NativePack); the
+// renderer's thread makes the product before it draws (native_frame_clips). The same function on the same numbers, on a thread
+// that rounds the same way (ee_float_mode_here): the same matrix to the bit.
+// Not at more than 60 pictures a second: the picture between needs the product at once (mid_matrix), and so do the shadows'
+// casters, which ask clip_now themselves. HP2_CLIPLATER=0: made at once, as before. HP2_CLIPCHECK=1: made at once as well, and at
+// the frame's end the two are compared.
+static bool g_clip_made;                    // g_clip is the product of what g_now_p, g_now_q and g_now_l hold
+static const bool g_clip_later = getenv("HP2_CLIPLATER") ? atoi(getenv("HP2_CLIPLATER")) != 0 : true;
+static const bool g_clip_check = getenv("HP2_CLIPCHECK") != nullptr;
+struct ClipKept {
+    u32 draw;
+    float clip[16];
+};
+static std::vector<ClipKept> g_clip_kept;
+static u64 g_clip_laters, g_clip_checked, g_clip_bad;
+
+// What a clip matrix is made of, read; the product not made. The view's pack is read again only when a list's node has named the
+// target or the pack anew, or another list has begun (g_pack_stale): between two draws of a list it is most often only the
+// local-world matrix that is another, and the pack's 96 bytes were read and compared with the frame's last for each of them.
+static bool g_pack_stale = true;
+static int g_pack_slot = -1;                // the pack's place among the frame's (frame_pack); -1: not looked for yet
+
+static void clip_read()
+{
+    if (!g_clip_stale) return;
+    g_clip_stale = false;
+    g_clip_made = false;
+    if (g_pack_stale || !g_state_keep) {
+        g_pack_stale = false;
+        g_pack_slot = -1;
+        read_quads(g_pack, g_now_p, 4);
+        read_quads(g_pack + 64, g_now_q, 2);
+    }
+    read_quads(g_local, g_now_l, 4);
+}
+
+static void clip_now()
+{
+    clip_read();
+    if (g_clip_made) return;
+    g_clip_made = true;
+    clip_matrix_host(g_clip, g_now_p, g_now_q, g_now_l, LW(g_target + 0x1c) / 2, LW(g_target + 0x20) / 2, depth_scale(g_target));
+}
+
+// the view's pack as the frame's NativePack: the last one again while it is the same
+static int frame_pack()
+{
+    if (g_pack_slot >= 0 && (size_t)g_pack_slot < g_frame.packs.size()) return g_pack_slot;
+    NativePack k;
+    memcpy(k.p, g_now_p, sizeof k.p);
+    memcpy(k.q, g_now_q, sizeof k.q);
+    k.half_w = (int)(LW(g_target + 0x1c) / 2);
+    k.half_h = (int)(LW(g_target + 0x20) / 2);
+    k.z_scale = depth_scale(g_target);
+    if (!g_frame.packs.empty() && !memcmp(&g_frame.packs.back(), &k, sizeof k)) return g_pack_slot = (int)g_frame.packs.size() - 1;
+    if (g_frame.packs.size() >= 65535) return -1;
+    g_frame.packs.push_back(k);
+    return g_pack_slot = (int)g_frame.packs.size() - 1;
+}
+
+void native_frame_clips(NativeFrame &frame)
+{
+    for (NativeDraw &d : frame.draws) {
+        if (!d.clip_local) continue;
+        d.clip_local = false;
+        if (d.pack >= frame.packs.size()) continue;
+        const NativePack &k = frame.packs[d.pack];
+        float local[16];
+        memcpy(local, d.clip, sizeof local);
+        clip_matrix_host(d.clip, k.p, k.q, local, k.half_w, k.half_h, k.z_scale);
+    }
+}
+
+// HP2_CLIPCHECK: the frame's draws left to the renderer, each against the matrix made at once when the draw began
+static void clip_check_frame()
+{
+    for (const ClipKept &kept : g_clip_kept) {
+        if (kept.draw >= g_frame.draws.size()) continue;
+        const NativeDraw &d = g_frame.draws[kept.draw];
+        float made[16] = {};
+        bool same = d.clip_local && d.pack < g_frame.packs.size();
+        if (same) {
+            const NativePack &k = g_frame.packs[d.pack];
+            clip_matrix_host(made, k.p, k.q, d.clip, k.half_w, k.half_h, k.z_scale);
+            same = !memcmp(made, kept.clip, sizeof made);
+        }
+        g_clip_checked++;
+        if (!same && g_clip_bad++ < 10) fprintf(g_hle_log, "clipcheck: draw %u of frame %u: the matrix made later is not the one made at once\n", kept.draw, g_frame_no);
+    }
+    g_clip_kept.clear();
+    if (g_clip_check && g_frame_no % 600 == 0)
+        fprintf(g_hle_log, "clipcheck: %llu matrices compared, %llu not the same; %llu left to the renderer so far, %zu packs this frame\n",
+                (unsigned long long)g_clip_checked, (unsigned long long)g_clip_bad, (unsigned long long)g_clip_laters, g_frame.packs.size()),
+            fflush(g_hle_log);
+}
+
+static u32 g_strip_last_base, g_strip_last_tris;      // add_strip's last: where its vertices are (HP2_DIRECTCHECK)
+
+// A strip's draw: the one before it goes on with this strip, or a new one begins here (the last of g_frame.draws either way). tri: the
+// strip's vertices where they were unpacked, for a frame's dump only.
+static void strip_draw(u32 flags, u32 data, const NativeVertex *tri, u32 tri_n)
+{
+    update_light();
+    const NativeDraw *prev = g_frame.draws.empty() ? nullptr : &g_frame.draws.back();
+    if (g_clip_new || !prev || !prev->indexed || prev->flags != (u16)flags || prev->light != g_light || prev->target != (u8)g_draw_target ||
+        g_owner != g_strip_owner) {
+        g_strip_owner = g_owner;
+        g_strip_flags = flags;
+        NativeDraw d;
+        int pack = -1;
+        if (g_clip_later && !g_double_now) {
+            clip_read();
+            pack = frame_pack();
+        }
+        if (pack >= 0) {
+            // the product is the renderer's thread's to make (native_frame_clips)
+            memcpy(d.clip, g_now_l, sizeof d.clip);
+            d.clip_local = true;
+            d.pack = (uint16_t)pack;
+            g_clip_laters++;
+            if (g_clip_check) {
+                clip_now();
+                g_clip_kept.emplace_back();
+                g_clip_kept.back().draw = (u32)g_frame.draws.size();
+                memcpy(g_clip_kept.back().clip, g_clip, sizeof g_clip);
+            }
+        } else {
+            clip_now();
+            memcpy(d.clip, g_clip, sizeof d.clip);
+        }
+        note_view_pack(g_target_ptr, g_pack);
+        d.has_mid = false;
+        if (g_double_now) mid_matrix(d, data);
+        d.first = g_ranged ? (u32)g_frame.ranges.size() : (u32)g_frame.indices.size();
+        d.count = 0;
+        d.indexed = true;
+        d.ranges = 0;
+        strip_state(d);
+        if (dumping())
+            fprintf(g_hle_log, "dump draw %zu target %u tex %s flags %x blend %d fix %g tfx %d atest %d zw %d light %d mode %u a %d mmag %d mmin %d levels %d\n",
+                    g_frame.draws.size(), g_draw_target, g_texture ? (const char *)host(g_texture + 8) : "-", flags, d.blend, d.blend_fix, d.tfx, d.alpha_test,
+                    d.depth_write, g_light, g_mode, tri_n ? tri[0].a : -1, g_texture ? LB(g_texture + 0x6f) : -1, g_texture ? LB(g_texture + 0x70) : -1,
+                    d.tex ? d.tex->levels : 0);
+        if (dumping() && g_light >= 0 && (flags & 0x100)) {      // the light a reflecting strip has: colours, ambient, material
+            const NativeLight &l = g_frame.lights[g_light];
+            float f[22][4];
+            memcpy(f, l.q, sizeof f);
+            fprintf(g_hle_log, "dump light %d frame %u vertex colour %d %d %d:", g_light, g_frame_no, tri_n ? tri[0].r : -1, tri_n ? tri[0].g : -1, tri_n ? tri[0].b : -1);
+            for (int q : {0, 1, 2, 3, 18, 19, 20, 21}) fprintf(g_hle_log, " [%d] %.4g %.4g %.4g %.4g", q, f[q][0], f[q][1], f[q][2], f[q][3]);
+            fputc(10, g_hle_log);
+            if (g_light_mat) {                      // eLightMaterial: its head, then the frontend's and the race's data (20 floats each)
+                const u32 m = g_light_mat - (LW(g_pc_ctx->r[28].w[0] - 21424) ? 256 : 192);
+                fprintf(g_hle_log, "dump material %08x head", m);
+                for (u32 i = 0; i < 8; i++) fprintf(g_hle_log, " %08x", LW(m + i * 4));
+                for (u32 blk : {0x20u, 0x70u}) {
+                    fprintf(g_hle_log, " | +%x:", blk);
+                    for (u32 i = 0; i < 20; i++) fprintf(g_hle_log, " %.4g", *(float *)host(m + blk + i * 4));
+                }
+                fputc(10, g_hle_log);
+            }
+        }
+        d.snap_x = (float)(LW(g_target_ptr + 0x1c) / 2);
+        d.snap_y = (float)(LW(g_target_ptr + 0x20) / 2);
+        if (g_draw_target == 7) g_rvm_now = true;
+        g_frame.draws.push_back(d);
+        g_clip_new = false;
+        if (g_owner) shadow_caster();
+    }
+}
+
 static void add_strip(u32 data, u32 qwords, u32 flags, const StripAhead *ahead = nullptr)
 {
-    const bool caching = g_cache_cap && !g_cache_off;
+    g_strip_last_tris = 0;
+    // (a side mirror's glass of the player's car is not the cache's: its vertices get coordinates of their own, below)
+    const MirrorGlass *const glass = mirror_glass_now(data, qwords);
+    const bool caching = g_cache_cap && !g_cache_off && !glass;
     StripKey key = {};
     const CachedStrip *hit = nullptr;
     // Known ahead: the table by address is not asked again. (Its slot may have gone to another strip meanwhile, read earlier in this
     // list; the strip is then still in the cache under its key, at the same place, so what is drawn is the same either way.)
-    const bool ahead_known = ahead && ahead->known;
+    const bool ahead_known = ahead && ahead->known && !glass;
     StripSeen *seen = caching && !ahead_known ? strip_seen(data) : nullptr;
     const bool known = ahead_known || (seen && seen->fast && seen->data == data && seen->qwords == qwords && seen->generation == g_strip_generation &&
                                        seen->stamp == memwatch_stamp(data, qwords * 16));
@@ -796,6 +1579,8 @@ static void add_strip(u32 data, u32 qwords, u32 flags, const StripAhead *ahead =
         hit = strip_find(key);
     }
     NativeVertex tri[84];                   // 28 triangles at most
+    NativeVertex in[30];                    // the strip's own vertices
+    u8 ix[84];                              // and each triangle's corner as a number among them
     u32 tri_n = 0, n = 0;
     if (!hit || g_cache_checking) {
     static thread_local u32 vu[VU_QUADS][4];
@@ -810,7 +1595,6 @@ static void add_strip(u32 data, u32 qwords, u32 flags, const StripAhead *ahead =
         g_stat.bad++;
         return;
     }
-    NativeVertex in[30];
     s8 k = lod_k(vu[1][1]);                 // VU1's "lq.y vf01y,1(vi12)", stored into TEX1's upper word
     for (u32 v = 0; v < n; v++) {
         u32 g = 2 + 3 * (v / 4), l = v % 4;
@@ -839,6 +1623,7 @@ static void add_strip(u32 data, u32 qwords, u32 flags, const StripAhead *ahead =
             continue;
         }
         bool odd = (v - restart) & 1;
+        ix[tri_n] = (u8)(v - 2), ix[tri_n + 1] = (u8)(odd ? v : v - 1), ix[tri_n + 2] = (u8)(odd ? v - 1 : v);
         tri[tri_n++] = in[v - 2];
         tri[tri_n++] = in[odd ? v : v - 1];
         tri[tri_n++] = in[odd ? v - 1 : v];
@@ -851,61 +1636,84 @@ static void add_strip(u32 data, u32 qwords, u32 flags, const StripAhead *ahead =
                 fprintf(g_hle_log, "native: vcachecheck: a strip at %08x (%u qwords) is not what the cache holds for its bytes\n", data, qwords);
         }
     }
-    update_light();
-    const NativeDraw *prev = g_frame.draws.empty() ? nullptr : &g_frame.draws.back();
-    if (g_clip_new || !prev || !prev->indexed || prev->flags != (u16)flags || prev->light != g_light || prev->target != (u8)g_draw_target ||
-        g_owner != g_strip_owner) {
-        g_strip_owner = g_owner;
-        g_strip_flags = flags;
-        NativeDraw d;
-        clip_now();
-        memcpy(d.clip, g_clip, sizeof d.clip);
-        note_view_pack(g_target_ptr, g_pack);
-        d.has_mid = false;
-        if (g_double_now) mid_matrix(d, data);
-        d.first = g_ranged ? (u32)g_frame.ranges.size() : (u32)g_frame.indices.size();
-        d.count = 0;
-        d.indexed = true;
-        d.ranges = 0;
-        set_draw_state(d);
-        if (dumping())
-            fprintf(g_hle_log, "dump draw %zu target %u tex %s flags %x blend %d fix %g tfx %d atest %d zw %d light %d mode %u a %d mmag %d mmin %d levels %d\n",
-                    g_frame.draws.size(), g_draw_target, g_texture ? (const char *)host(g_texture + 8) : "-", flags, d.blend, d.blend_fix, d.tfx, d.alpha_test,
-                    d.depth_write, g_light, g_mode, tri_n ? tri[0].a : -1, g_texture ? LB(g_texture + 0x6f) : -1, g_texture ? LB(g_texture + 0x70) : -1,
-                    d.tex ? d.tex->levels : 0);
-        if (dumping() && g_light >= 0 && (flags & 0x100)) {      // the light a reflecting strip has: colours, ambient, material
-            const NativeLight &l = g_frame.lights[g_light];
-            float f[22][4];
-            memcpy(f, l.q, sizeof f);
-            fprintf(g_hle_log, "dump light %d frame %u vertex colour %d %d %d:", g_light, g_frame_no, tri_n ? tri[0].r : -1, tri_n ? tri[0].g : -1, tri_n ? tri[0].b : -1);
-            for (int q : {0, 1, 2, 3, 18, 19, 20, 21}) fprintf(g_hle_log, " [%d] %.4g %.4g %.4g %.4g", q, f[q][0], f[q][1], f[q][2], f[q][3]);
-            fputc(10, g_hle_log);
-            if (g_light_mat) {                      // eLightMaterial: its head, then the frontend's and the race's data (20 floats each)
-                const u32 m = g_light_mat - (LW(g_pc_ctx->r[28].w[0] - 21424) ? 256 : 192);
-                fprintf(g_hle_log, "dump material %08x head", m);
-                for (u32 i = 0; i < 8; i++) fprintf(g_hle_log, " %08x", LW(m + i * 4));
-                for (u32 blk : {0x20u, 0x70u}) {
-                    fprintf(g_hle_log, " | +%x:", blk);
-                    for (u32 i = 0; i < 20; i++) fprintf(g_hle_log, " %.4g", *(float *)host(m + blk + i * 4));
-                }
-                fputc(10, g_hle_log);
-            }
-        }
-        d.snap_x = (float)(LW(g_target_ptr + 0x1c) / 2);
-        d.snap_y = (float)(LW(g_target_ptr + 0x20) / 2);
-        g_frame.draws.push_back(d);
-        g_clip_new = false;
-        if (g_owner) shadow_caster();
+    if (glass) {
+        // the mirror's picture is half the 4:3 width by a seventh of the height: 14 / 3 wide for 1 tall
+        const float wide = std::min(glass->half_w / glass->half_h * (3.0f / 14.0f), 0.9f);
+        const float part = glass->side > 0 ? 0.75f : glass->side < 0 ? 0.25f : 0.5f;
+        // a side mirror's outer third reaches further (sample_glass): by the curve times (2 / 3) squared of half the part
+        const float reach = glass->side ? kGlassCurve * 4.0f / 9.0f : 0.0f;
+        const float lo = 0.02f + wide / 2 * (1 + (glass->side < 0 ? reach : 0.0f)), hi = 0.98f - wide / 2 * (1 + (glass->side > 0 ? reach : 0.0f));
+        const float middle = std::min(std::max(part, lo), std::max(lo, hi));
+        const u8 r = glass->side > 0 ? 255 : glass->side < 0 ? 0 : 128;
+        const u8 g = (u8)std::min(wide * 255.0f + 0.5f, 255.0f), b = (u8)(middle * 255.0f + 0.5f);
+        const auto on_glass = [&](NativeVertex &v) {
+            const float rx = v.x - glass->centre[0], ry = v.y - glass->centre[1], rz = v.z - glass->centre[2];
+            const float up = (rx * glass->up[0] + ry * glass->up[1] + rz * glass->up[2]) / glass->half_h;
+            v.s = (rx * glass->across[0] + ry * glass->across[1] + rz * glass->across[2]) / glass->half_w;
+            v.t = 0.5f - up * 0.47f;
+            v.r = r, v.g = g, v.b = b, v.a = 128;
+        };
+        for (u32 i = 0; i < tri_n; i++) on_glass(tri[i]);
+        for (u32 i = 0; i < n; i++) on_glass(in[i]);
+        flags = 0;                          // unlit, no reflection pass: the picture as it is
+        g_clip_new = true;                  // a draw of its own
     }
+    strip_draw(flags, data, tri, tri_n);
     NativeDraw &d = g_frame.draws.back();
+    if (glass) {                            // the mirror's picture, laid on as it is (DECAL), opaque
+        d.rt = NATIVE_RT_MIRROR;
+        d.tex = nullptr;
+        d.blend = NB_OPAQUE;
+        d.blend_fix = -1;
+        d.alpha_test = false;
+        d.tfx = 1;
+        d.lod_l = 0;
+        d.tex_mode = 128;                   // native.frag: sample_glass
+        d.scroll_s = d.scroll_t = 0;
+        g_clip_new = true;                  // and the strip after it starts another
+    }
     u32 base;
+    bool in_cache = false;
     if (hit) {
+        in_cache = true;
         base = hit->base;
         tri_n = hit->count;
         n = hit->n;
         g_cache_hits++;
+    } else if (g_geo && caching && geo_room(n, tri_n)) {
+        // new to the cache, by indices: the strip's own vertices at the cache's top, the triangles' indices in the chunk
+        const u32 first = g_cache_top;
+        g_cache_top += n;
+        if (!g_frame.fresh_runs.empty() && g_frame.fresh_runs.back().dst + g_frame.fresh_runs.back().count == first)
+            g_frame.fresh_runs.back().count += n;
+        else
+            g_frame.fresh_runs.push_back({first, (u32)g_frame.fresh.size(), n});
+        g_frame.fresh.insert(g_frame.fresh.end(), in, in + n);
+        base = g_idx_at;
+        u32 *out = g_idx_mirror + (base - (g_idx_end - kIdxChunk * 8));
+        for (u32 i = 0; i < tri_n; i++) out[i] = first + ix[i];
+        if (g_idx_dirty_hi <= g_idx_dirty_lo) g_idx_dirty_lo = base;
+        g_idx_at += tri_n;
+        g_idx_dirty_hi = g_idx_at;
+        in_cache = true;
+        strip_put(key, {base, tri_n, n});
+        if (g_cache_checking) g_strip_check[key].assign(tri, tri + tri_n);
+        g_cache_misses++;
+    } else if (g_geo) {
+        // no cache, or no room in it this frame: the frame's own vertices, the strip's and then its indices in slots of their own
+        const u32 slots = (tri_n + 7) / 8;
+        if (caching) g_frame.cache_short += n + slots;
+        const u32 first = g_frame.dyn_base + (u32)g_frame.vertices.size();
+        g_frame.vertices.insert(g_frame.vertices.end(), in, in + n);
+        u32 words[88] = {};
+        for (u32 i = 0; i < tri_n; i++) words[i] = first + ix[i];
+        const size_t at = g_frame.vertices.size();
+        g_frame.vertices.resize(at + slots);
+        memcpy((void *)&g_frame.vertices[at], words, (size_t)slots * sizeof(NativeVertex));
+        base = (g_frame.dyn_base + (u32)at) * 8;
     } else if (caching && g_cache_top + tri_n <= g_cache_cap) {
         // new to the cache: uploaded with this frame, a run with the strip before it if they follow each other
+        in_cache = true;
         base = g_cache_top;
         g_cache_top += tri_n;
         if (!g_frame.fresh_runs.empty() && g_frame.fresh_runs.back().dst + g_frame.fresh_runs.back().count == base)
@@ -922,8 +1730,14 @@ static void add_strip(u32 data, u32 qwords, u32 flags, const StripAhead *ahead =
         base = g_frame.dyn_base + (u32)g_frame.vertices.size();
         g_frame.vertices.insert(g_frame.vertices.end(), tri, tri + tri_n);
     }
+    if (g_geo_check && g_geo && !hit && g_geo_puts.size() < 200000) {
+        g_geo_puts.emplace_back();
+        GeoPut &put = g_geo_puts.back();
+        put.base = base, put.count = tri_n, put.data = data;
+        memcpy((void *)put.tri, tri, (size_t)tri_n * sizeof(NativeVertex));
+    }
     // what the address is remembered by: the key that keeps coming out the same gets its pages watched
-    if (seen && !known && (hit || (caching && base < g_cache_cap))) {
+    if (seen && !known && in_cache) {
         const bool again = seen->data == data && seen->qwords == qwords && seen->key == key;
         seen->same = again ? (u8)std::min<u32>(seen->same + 1, 255) : 0;
         seen->data = data;
@@ -946,7 +1760,7 @@ static void add_strip(u32 data, u32 qwords, u32 flags, const StripAhead *ahead =
         const u32 this_draw = (u32)g_frame.draws.size();
         strips++;
         verts += tri_n;
-        if (base < g_cache_cap) cached++;
+        if (in_cache) cached++;
         if (this_draw == last_draw && d.count && base == last_end) joined++;
         if (!d.count) draws++;
         last_end = base + tri_n;
@@ -978,11 +1792,111 @@ static void add_strip(u32 data, u32 qwords, u32 flags, const StripAhead *ahead =
     g_stat.tris += tri_n / 3;
     g_stat.strips++;
     g_stat.verts += n;
+    g_strip_last_base = base;
+    g_strip_last_tris = tri_n;
+}
+
+// ---- the direct output: a model's strips straight to the frame (2026-11-24) -----------------------------------------------------
+// eModel::RenderStrips (render_strips_native, below) handed every strip to the lists as a node of its own, and the lists' reader
+// (native_read_list) then asked of every node what add_strip asks: where the strip is in the GPU's vertex cache, and whether a new
+// draw begins with it. For a strip known by its address (StripSeen) the first answer is there when the strip is handed out, and the
+// second is the same for all the strips handed out one after another to one list with nothing between them. So such strips go out
+// as a run: one node of the port's own kind (EDMA_RUN) in the list, where the strips' nodes would be, and here the run's ranges of
+// the vertex cache, put together already. The reader makes the draw's decision once and appends the ranges.
+// The frame is the same as before by construction. What the reader would have found is what the run holds, or the run is not used:
+// each strip was known by its pages' generations when it was handed out (sum: of the very numbers memwatch_stamp gave then), and
+// the reader makes that sum again; with another one, or another generation of the cache, the strips go through add_strip one by
+// one, as before. A car's strips are never runs (the mirrors' glass, the shadows, the body that moves as one: all by the node), nor
+// are alpha strips (a list each) or blended ones (copies in the frame's memory).
+// HP2_DIRECT=0: none, every strip a node; =1: on. HP2_DIRECTCHECK=1: every run goes the long way and is compared with what it holds.
+struct RunStrip {
+    u32 data, qwords;
+};
+struct DirectRun {
+    u32 range0, ranges;                     // g_run_ranges
+    u32 strip0, strips;                     // g_run_strips
+    u32 tris, verts;                        // the vertices drawn; the strips' own (the statistics)
+    u32 generation;                         // the cache's
+    u64 sum;                                // of the strips' pages' generations
+};
+static std::vector<DirectRun> g_runs;       // a frame's, emptied at its end
+static std::vector<NativeRange> g_run_ranges;
+static std::vector<RunStrip> g_run_strips;
+static u64 g_direct_runs, g_direct_strips, g_direct_slow, g_direct_stale, g_direct_checked, g_direct_bad;
+static const bool kDirectDefault = true;    // on since 2026-11-24: the five demos in step, 16.7 million runs the same the long way
+static const bool g_direct_check = getenv("HP2_DIRECTCHECK") != nullptr;
+static bool g_in_car_render, g_car_asked_plain;     // CarRenderInfo::Render is running (its hook, below)
+static u32 g_car_now;                               // and whose it is (CarRenderInfo::pCar)
+
+static bool direct_on()
+{
+    // not with what reads the lists as the game's (HP2_KEEPPACKETS) or holds the output against the game's own (HP2_RSCHECK)
+    static const bool on = (getenv("HP2_DIRECT") ? atoi(getenv("HP2_DIRECT")) != 0 : kDirectDefault) && g_ranged && !g_cache_off && !g_cache_checking &&
+                           !getenv("HP2_KEEPPACKETS") && !getenv("HP2_RSCHECK");
+    return on && g_cache_cap;
+}
+
+// a run's node of a list, read
+static void add_run(const DirectRun &r, u32 flags)
+{
+    const RunStrip *strips = &g_run_strips[r.strip0];
+    const NativeRange *in = &g_run_ranges[r.range0];
+    u64 sum = 0;
+    for (u32 i = 0; i < r.strips; i++) {
+        const u64 stamp = memwatch_stamp(strips[i].data, strips[i].qwords * 16);
+        sum += (stamp >> 32) + (u32)stamp;
+    }
+    const bool stands = sum == r.sum && r.generation == g_strip_generation;
+    if (!stands || g_direct_check) {
+        // the long way, a strip at a time; and with the run still standing it must come to what the run holds
+        if (!stands) g_direct_slow++;
+        bool same = true;
+        u32 at = 0, used = 0, tris = 0;
+        for (u32 i = 0; i < r.strips; i++) {
+            const size_t draws = g_frame.draws.size();
+            add_strip(strips[i].data, strips[i].qwords, flags);
+            if (i && g_frame.draws.size() != draws) same = false;       // a new draw inside the run
+            if (at < r.ranges && used == in[at].count) at++, used = 0;
+            if (at >= r.ranges || in[at].first + used != g_strip_last_base) same = false;
+            used += g_strip_last_tris;
+            tris += g_strip_last_tris;
+        }
+        if (stands) {
+            g_direct_checked++;
+            if (!same || tris != r.tris || at + 1 != r.ranges || used != in[at].count)
+                if (g_direct_bad++ < 10)
+                    fprintf(g_hle_log, "directcheck: a run of %u strips from %08x (%u ranges, %u vertices) is not what the long way gives (%u vertices)\n", r.strips,
+                            strips[0].data, r.ranges, r.tris, tris);
+            if (g_direct_checked % 500000 == 0)
+                fprintf(g_hle_log, "directcheck: %llu runs gone the long way too, %llu not the same\n", (unsigned long long)g_direct_checked, (unsigned long long)g_direct_bad),
+                    fflush(g_hle_log);
+        }
+        return;
+    }
+    strip_draw(flags, strips[0].data, nullptr, 0);
+    NativeDraw &d = g_frame.draws.back();
+    u32 k = 0;
+    if (d.ranges) {         // one range with the draw's last where the run begins right after it
+        NativeRange &last = g_frame.ranges.p[g_frame.ranges.n - 1];
+        if (last.first + last.count == in[0].first) last.count += in[0].count, k = 1;
+    }
+    if (k < r.ranges) {
+        memcpy(g_frame.ranges.grow(r.ranges - k), in + k, (size_t)(r.ranges - k) * sizeof(NativeRange));
+        d.ranges += r.ranges - k;
+    }
+    d.count += r.tris;
+    g_frame.strip_vertices += r.tris;
+    g_stat.tris += r.tris / 3;
+    g_stat.strips += r.strips;
+    g_stat.verts += r.verts;
+    g_cache_hits += r.strips;
+    g_seen_hits += r.strips;
 }
 
 // ---- the lists -------------------------------------------------------------------------------
 enum { EDMA_STRIP = 0, EDMA_SETTARGET = 1, EDMA_LIGHTMATERIAL = 2, EDMA_LIGHTCONTEXT = 3, EDMA_DIRECT = 4, EDMA_POLY3D = 5,
-       EDMA_SET_MATRIX_PACK = 9, EDMA_SET_LOCAL_WORLD = 12 };
+       EDMA_SET_MATRIX_PACK = 9, EDMA_SET_LOCAL_WORLD = 12,
+       EDMA_RUN = 14 };     // the port's own (the direct output, above): +6 the strips' parameter, +8 their number, +10 the frame, +12 the run
 
 static const bool g_native_stats = getenv("HP2_NATIVESTATS") != nullptr;
 static u32 g_nodes_seen[16], g_prims_seen[8];
@@ -1287,6 +2201,16 @@ static void add_direct(u32 data, u32 qwords)
         if (g_texture && g_texture == g_rvm_texture && LW(g_target) != 7) trim_mirror(first_vertex);
     }
     if (g_frame.wide) unstretch_2d(first_vertex, data, ox);
+    if (const u32 id = LW(g_target); id == 0 || id == 3) {          // the 2D layer: whose the packet is (hud_between)
+        auto who = g_packet_who.find(data);
+        if (who != g_packet_who.end()) {
+            for (size_t i = first_draw; i < g_frame.draws.size(); i++)
+                g_hud_draws.push_back({(u32)i, who->second.group, who->second.index * 16 + (u32)std::min<size_t>(i - first_draw, 15), g_texture});
+        } else {
+            static const bool audit = getenv("HP2_HUDAUDIT") != nullptr;
+            if (audit && g_frame.draws.size() > first_draw) g_hud_strangers[g_texture ? (const char *)host(g_texture + 8) : "(no texture)"]++;
+        }
+    }
     {   // TEMP: HP2_MIRRORFXLOG=1, the particles in the mirror
         static const bool on = getenv("HP2_MIRRORFXLOG") != nullptr;
         if ((on || dumping()) && LW(g_target) == 7 && g_texture && strncmp((const char *)host(g_texture + 8), "RVM", 3)) {
@@ -1327,18 +2251,6 @@ static void update_clip()
     g_clip_new = true;
 }
 
-// what g_clip was made of: the pack's quads and the local-world matrix, for the picture between two frames (mid_matrix)
-static float g_now_p[16], g_now_q[8], g_now_l[16];
-
-static void clip_now()
-{
-    if (!g_clip_stale) return;
-    g_clip_stale = false;
-    read_quads(g_pack, g_now_p, 4);
-    read_quads(g_pack + 64, g_now_q, 2);
-    read_quads(g_local, g_now_l, 4);
-    clip_matrix_host(g_clip, g_now_p, g_now_q, g_now_l, LW(g_target + 0x1c) / 2, LW(g_target + 0x20) / 2, depth_scale(g_target));
-}
 
 // ---- 120 pictures a second: a picture between each two of the race's ------------------------------
 // Options > Graphics > Frame Rate above 60 (g_cfg.pictures). The game still makes 60 frames a second, its physics and its logic untouched.
@@ -1493,6 +2405,7 @@ static const PackSeen *pack_seen(u32 pack)
 // kept by its CarRenderInfo. No search for a car's draws at all.
 struct MidOwner {
     u32 from, to;                           // the frame's memory its nodes are in
+    u32 pcar = 0;                           // the Car it is (CarRenderInfo::pCar)
     bool moves;                             // it was drawn the frame before, and not put somewhere else since
     float move[16];                         // where a point of the car's was a frame before: its place then times its place now inverted
     int car = -1;                           // Shadows: High: the car among g_shadow_cars
@@ -1509,13 +2422,23 @@ struct CarMove {
 };
 static std::vector<CarMove> g_car_moves;    // this frame's cars that were drawn the frame before too
 static u64 g_mid_owned, g_mid_direct;
+static u32 owner_car(const MidOwner *o) { return o->pcar; }
 static const MidOwner *g_owner_last;        // mid_owner_of's last answer: the next node is most often the same car's
+
+// Ambient Occlusion is on in this race (Options > Graphics > Advanced, or HP2_AO)
+static bool ao_on()
+{
+    static const char *env = getenv("HP2_AO");
+    return (env ? atoi(env) : g_cfg.ao) && pc_racing();
+}
 
 // CarRenderInfo::Render is about to run: where the frame's memory is now, and the car's place (the matrix with the position in it)
 static u32 mid_car_begin(Ctx &c, float pose[16])
 {
     const u32 pos = c.r[6].w[0], orient = c.r[7].w[0];
-    if ((!g_double_now && !shadows_level()) || !pos || !orient) return 0;
+    // (the side mirrors' picture needs to know the player's car too: mirror_glass_now; Ambient Occlusion which draws are a car's,
+    // NativeDraw::car)
+    if ((!g_double_now && !shadows_level() && !(g_cfg.side_mirrors && g_cfg.reflections) && !ao_on()) || !pos || !orient) return 0;
     read_quads(orient, pose, 4);
     memcpy(pose + 12, host(pos), 12);
     pose[3] = pose[7] = pose[11] = 0;
@@ -1531,6 +2454,8 @@ static void mid_car_end(Ctx &c, u32 info, u32 from, const float pose[16])
     MidOwner o = {};
     o.from = from;
     o.to = to;
+    o.pcar = LW(info);
+    if (o.pcar && o.pcar == pc_player_car()) g_pcar_now = true;
     for (const CarPose &was : g_poses_prev)
         if (was.info == info) {
             const float dx = was.m[12] - pose[12], dy = was.m[13] - pose[13], dz = was.m[14] - pose[14];
@@ -3201,6 +4126,10 @@ static void mid_frame()
     g_poses_prev.swap(g_poses_now);
     g_poses_now.clear();
     g_car_moves.clear();
+    g_rvm_was = g_rvm_now;
+    g_rvm_now = false;
+    g_pcar_was = g_pcar_now;
+    g_pcar_now = false;
     shadow_frame();
     g_parts_prev.swap(g_parts_now);
     g_parts_now.clear();
@@ -3280,6 +4209,8 @@ static void look_ahead(u32 list)
 void native_read_list(u32 list)
 {
     g_stat.lists++;
+    g_list_serial++;                        // a draw's state and the view's pack are kept within a list only (strip_state, clip_read)
+    g_pack_stale = true;
     look_ahead(list);
     // A strip is known by its address from a table of 16 MB (strip_seen), a line of the CPU's cache a strip, and a heavy frame asks for
     // 65 thousand of them all over it: each was a wait for memory. So the line of the strip four nodes on is asked for now, and the
@@ -3289,7 +4220,12 @@ void native_read_list(u32 list)
     const auto ask = [&] {
         if (!ahead || !by_address) return;
         const u32 t = LH(ahead + 4);
-        if (t == EDMA_STRIP || t == EDMA_POLY3D) __builtin_prefetch(strip_seen(LW(ahead + 12)));
+        if (t == EDMA_STRIP || t == EDMA_POLY3D) {
+            __builtin_prefetch(strip_seen(LW(ahead + 12)));
+        } else if (t == EDMA_RUN) {         // a run's record, wherever it is among the frame's
+            const u32 at = LW(ahead + 12);
+            if (at < g_runs.size()) __builtin_prefetch(&g_runs[at]);
+        }
     };
     ask();
     for (int i = 0; i < 3 && ahead; i++) ahead = LW(ahead), ask();
@@ -3298,6 +4234,17 @@ void native_read_list(u32 list)
     for (u32 node = LW(list); node; node = LW(node)) {
         if (ahead) ahead = LW(ahead), ask();
         u32 type = LH(node + 4), data = LW(node + 12);
+        // the next node's run: its record was asked for three nodes ago, now its strips and its ranges
+        if (by_address)
+            if (const u32 next = LW(node))
+                if (LH(next + 4) == EDMA_RUN) {
+                    const u32 at = LW(next + 12);
+                    if (at < g_runs.size()) {
+                        const DirectRun &r = g_runs[at];
+                        if (r.strip0 < g_run_strips.size()) __builtin_prefetch(&g_run_strips[r.strip0]);
+                        if (r.range0 < g_run_ranges.size()) __builtin_prefetch(&g_run_ranges[r.range0]);
+                    }
+                }
         if (owners) g_owner = mid_owner_of(node);
         if (g_native_stats) g_nodes_seen[type & 15]++;
         switch (type) {
@@ -3305,6 +4252,7 @@ void native_read_list(u32 list)
             g_target = data;
             g_target_ptr = data;
             g_mode = LH(node + 6);
+            g_pack_stale = true;
             if (dumping())                          // the target's GS registers, as the game sends them
                 if (u32 block = LW(data + 0x7c + (g_mode & 3) * 4)) {
                     fprintf(g_hle_log, "dump target %u mode %u regs", LW(data), g_mode);
@@ -3316,6 +4264,7 @@ void native_read_list(u32 list)
             break;
         case EDMA_SET_MATRIX_PACK:
             g_pack = data;
+            g_pack_stale = true;
             update_clip();
             break;
         case EDMA_SET_LOCAL_WORLD:
@@ -3342,6 +4291,24 @@ void native_read_list(u32 list)
                 if (!port_sprites_emit(data)) add_direct(data, LH(node + 10));
             }
             break;
+        case EDMA_RUN: {                    // strips handed out as a run (the direct output)
+            if (g_native_stats && g_target && LW(g_target) < 16) {
+                auto &t = g_by_target[LW(g_target)];
+                t.strips += LH(node + 8);
+                t.pack = g_pack;
+                t.target = g_target;
+            }
+            if (data >= g_runs.size() || LH(node + 10) != (u16)g_frame_no) {      // not this frame's: nothing of it is left
+                if (g_direct_stale++ < 5) fprintf(g_hle_log, "native: a run's node of another frame in list %08x (frame %u), not drawn\n", list, g_frame_no);
+                break;
+            }
+            if (main_target() && g_pack && g_local) {
+                g_draw_target = LW(g_target);
+                g_node_poly = false;
+                add_run(g_runs[data], LH(node + 6));
+            }
+            break;
+        }
         case EDMA_POLY3D:                   // the same packet as a strip's: ePoly::Render3D, eEndStrip
         case EDMA_STRIP: {
             // this node's strips in g_ahead: counted for every node of the kind, drawn or not, as look_ahead counted them
@@ -3439,16 +4406,31 @@ static void log_frame()
 
 static int g_lod_flip_now = -1;            // HP2_LODFLIP's: 0 Original, 1 Maximum, -1 the setting's
 
+static void native_scenery_log();           // the scenery's own loop (below): its numbers
+static void depth_settle();                 // the sun's depth the game asked for, now (below, by HOOK_FetchVRAM)
+
 // ---- the renderer's thread ----------------------------------------------------------------------------
 // The lists are read on the game's thread, as they are handed over (native_read_list): they point all over the game's live data. What
 // comes of them, the frame (NativeFrame: vertices, indices, draws, the textures decoded for it), is all the Vulkan side needs, and it
 // reads nothing of the game's. So the finished frame goes to a thread that records and submits it while the game's thread is already at
 // the next one. One frame in hand at most: the game's thread waits for the renderer's before it hands over another, and before it asks
 // for the last frame's depth (the sun's flare). HP2_RENDERSYNC=1: drawn on the game's thread, as it was.
+// A queue of one (2026-11-18, the user: "let the game stop waiting for the renderer"). With VSync and a rate that is not a whole
+// number of pictures a frame (144, 165, 75 on such a screen) a frame takes the renderer two refreshes or three by turns, and the
+// game, waiting for it at the hand-over and again for the sun's depth, had its own frames of uneven length: on a model of it
+// (work/nshots/t5/sim_queue.py) 2300 of 5800 steps were held at 144 Hz. There a frame may now wait in a place of its own while
+// the renderer finishes the one before, and the game's thread goes on; it waits only while that place is taken. The renderer,
+// when a frame has waited for it more than 12.5 ms, leaves one picture out and so catches up (native_vk.cpp): a screen is never
+// exactly its nominal rate, and the queue would otherwise fill and stay full. Everywhere else it is as it was: a rate of 60, 120,
+// 240 has the same pictures every frame and holds the game evenly at the screen's own pace, where a queue would only add a frame
+// of delay; without VSync the renderer keeps to the frame's own time by itself. HP2_NOQUEUE=1: never.
 static NativeFrame g_out;                   // what the renderer's thread has: g_frame as it was at the hand-over
+static NativeFrame g_next;                  // the queue's place: handed over while g_out was still in hand
 static std::mutex g_render_mx;
 static std::condition_variable g_render_cv;
 static bool g_render_busy, g_render_started;
+static bool g_next_full;                    // (under g_render_mx, as g_render_busy is)
+static bool g_queue_now;                    // the game's thread: the frame handed over last went by the queue's rules
 static const bool g_render_sync = getenv("HP2_RENDERSYNC") != nullptr;
 static u32 g_seen_epoch;                    // g_native_epoch as this thread last took note of it
 void ee_float_mode_here();
@@ -3468,7 +4450,12 @@ static void render_thread()
         native_vk_draw(g_out);
         {
             std::lock_guard<std::mutex> lock(g_render_mx);
-            g_render_busy = false;
+            if (g_next_full) {              // the one that waited: in hand at once
+                std::swap(g_out, g_next);
+                g_next_full = false;
+            } else {
+                g_render_busy = false;
+            }
         }
         g_render_cv.notify_all();
     }
@@ -3479,93 +4466,219 @@ void native_render_wait()
     if (!g_render_started) return;
     Phase timed(PH_WAIT_RENDER);
     std::unique_lock<std::mutex> lock(g_render_mx);
-    g_render_cv.wait(lock, [] { return !g_render_busy; });
+    g_render_cv.wait(lock, [] { return !g_render_busy && !g_next_full; });
 }
 
-// the frame to the renderer; g_frame is then the one before it, to be emptied and filled again
+// The sun's depth, waited for no longer than it has to be (2026-11-26, the user: "the exact way"). See HOOK_FetchVRAM below.
+static uint32_t g_hand_count;               // the game's thread: frames handed over (NativeFrame::handed)
+static uint32_t g_depth_sent_no;            // (under g_render_mx) the last frame whose depth rects the GPU has on their own fence
+void native_depth_sent(uint32_t handed)
+{
+    {
+        std::lock_guard<std::mutex> lock(g_render_mx);
+        g_depth_sent_no = handed;
+    }
+    g_render_cv.notify_all();
+}
+// The renderer made again for other settings (2026-11-26, the user's item 3): it took 0.1 to 4 s, the game's thread waited at the
+// hand-over all that time, and the sound, which it feeds, went round the last two seconds of the music. Now, while it is at it, the
+// game goes on: a frame it hands over then is not drawn (it would not be anyway: the renderer's cache and textures are gone, and the
+// frames made before the game hears of that, NativeFrame::epoch, are not drawn either), its textures' uploads wait for the next
+// frame that is handed over, and the picture stands till the renderer is back. Not while the player drives in a race (pc_car_input:
+// the pause menu and the race's other menus are not driving): there the game is held as before, rather than run on with no picture.
+// HP2_REBUILDHOLD=1: held always, as it was.
+static bool g_rebuilding;                   // (under g_render_mx) the renderer's thread is in rebuild()
+static std::vector<NativeTexUpload> g_carried;  // the game's thread: uploads of the frames not handed over, in the order they came
+void native_rebuild_mark(bool on)
+{
+    {
+        std::lock_guard<std::mutex> lock(g_render_mx);
+        g_rebuilding = on;
+    }
+    g_render_cv.notify_all();
+}
+
+// the game's thread: till that frame's depth is with the GPU on its own, or the renderer has no frame in hand (a frame it did not
+// draw, or one with its depth at the end as before: then all of it, as native_render_wait). False: the renderer is being made again,
+// and the frame's depth is not there to read (that frame is not drawn: the words stay as they are, as they did when it was waited for)
+static bool native_depth_wait(uint32_t handed)
+{
+    if (!g_render_started) return true;
+    Phase timed(PH_WAIT_RENDER);
+    std::unique_lock<std::mutex> lock(g_render_mx);
+    g_render_cv.wait(lock, [handed] { return g_depth_sent_no == handed || (!g_render_busy && !g_next_full) || g_rebuilding; });
+    return g_depth_sent_no == handed || (!g_render_busy && !g_next_full);
+}
+
+// A frame may wait for the renderer in the queue's place: VSync, pictures between the frames, and not the same number of them every
+// frame (the rate as the renderer will have it, native_vk.cpp's picture_rate: no more than the screen's).
+static bool queue_wanted()
+{
+    static const bool off = getenv("HP2_NOQUEUE") != nullptr;
+    if (off || !g_frame.doubled || !g_cfg.vsync) return false;
+    int rate = g_frame.pictures;
+    if (rate >= 1000) return false;
+    const int hz = native_vk_screen_hz();
+    if (hz && rate > hz) rate = hz;
+    return rate > 60 && rate % 60 != 0;
+}
+
+// the frame to the renderer; g_frame is then one of those before it, to be emptied and filled again
 static void hand_over()
 {
+    g_frame.handed = ++g_hand_count;
     if (g_render_sync) {
         native_vk_draw(g_frame);
         return;
     }
-    native_render_wait();
-    std::swap(g_frame, g_out);
+    const bool queue = queue_wanted();
+    g_queue_now = queue;
+    g_frame.queued = queue;
+    g_frame.made_s = native_vk_clock();
+    // the uploads of frames that were not handed over, before this one's (see g_rebuilding)
+    static u32 not_drawn;
+    if (!g_carried.empty()) {
+        g_carried.insert(g_carried.end(), std::make_move_iterator(g_frame.uploads.begin()), std::make_move_iterator(g_frame.uploads.end()));
+        g_frame.uploads.swap(g_carried);
+        g_carried.clear();
+    }
+    static const bool hold = getenv("HP2_REBUILDHOLD") != nullptr;
+    const bool may_go_on = !hold && !(pc_racing() && pc_car_input());
+    bool dropped = false;
+    {
+        Phase timed(PH_WAIT_RENDER);
+        std::unique_lock<std::mutex> lock(g_render_mx);
+        auto room = [queue] { return queue ? !g_next_full : !g_render_busy && !g_next_full; };
+        g_render_cv.wait(lock, [&] { return room() || (may_go_on && g_rebuilding); });
+        if (!room()) {
+            dropped = true;                 // the renderer is being made again: the game goes on
+        } else if (!g_render_busy) {
+            std::swap(g_frame, g_out);
+            g_render_busy = true;
+        } else {
+            std::swap(g_frame, g_next);
+            g_next_full = true;
+        }
+    }
+    if (dropped) {
+        g_carried.swap(g_frame.uploads);    // (g_frame is emptied and filled again, as one handed over would be)
+        g_frame.uploads.clear();
+        not_drawn++;
+        return;
+    }
+    if (not_drawn) {
+        fprintf(g_hle_log, "native: %u frames went on while the renderer was made again (not drawn); their textures went with this one\n", not_drawn);
+        not_drawn = 0;
+    }
     if (!g_render_started) {
         g_render_started = true;
         std::thread(render_thread).detach();
-    }
-    {
-        std::lock_guard<std::mutex> lock(g_render_mx);
-        g_render_busy = true;
     }
     g_render_cv.notify_all();
 }
 
 // The 2D layer in a picture between two frames (the user, 2026-11-15: "the HUD's lines"). The game draws it 60 times a second: a
 // message sliding in, the needle of the rev counter, a dot on the map stood still in the pictures between and jumped with the frame.
-// A draw of the layer is known again in the next frame by what it shows (its texture, how many vertices, their places in the
-// texture); where two frames have the same one within 40 pixels, the picture between has its vertices on the way (a second copy
-// halfway, NativeDraw::mid_verts, which the renderer puts on the line for any picture). What changed its look (other digits)
-// or jumped further is drawn as the frame has it.
+// A draw of the layer has the game's object that drew it and its place among that object's (g_hud_draws, from g_packet_who): the
+// same object's same poly a frame before is where it comes from, and the picture between has its vertices on the way (a second
+// copy halfway, NativeDraw::mid_verts, which the renderer puts on the line for any picture). An object goes as a whole or not at
+// all: one that was not there a frame before, that has another number of polys now (a text grown longer), or that went further than
+// kHudJump in the frame (put somewhere else, not moved there) is drawn as the frame has it.
+// It was done by looks till 2026-11-18: a draw was "the same" as one of the frame before with the same texture, vertex count and
+// places in the texture within 40 pixels. But the HUD's text comes a letter a packet, so that was "the same letter near by": where a
+// text changed, its letters came from the same letters of the next place or the next row (a tester on a 144 Hz screen: the labels
+// in the list of racers blink). hp2.ini's hud_smooth=0: the layer as the game draws it, in every picture.
 struct HudSeen {
-    u64 what;
-    u32 first, count;                       // in g_hud_prev
-    bool taken;
+    u64 group;
+    u32 index, first, count;                // first: in g_hud_prev (the frame before) or in the frame's own list (this one)
+    u32 draw, tex;
 };
-static std::vector<HudSeen> g_hud_seen;
+static std::vector<HudSeen> g_hud_seen;     // the frame before, by group and index
 static std::vector<NativeVertex> g_hud_prev;
+static const float kHudJump = 64.0f;
 static void hud_between()
 {
     static std::vector<HudSeen> now;
     static std::vector<NativeVertex> now_verts;
+    static const bool audit = getenv("HP2_HUDAUDIT") != nullptr;
     now.clear();
     now_verts.clear();
-    if (!g_double_now) {
+    if (!g_double_now || !g_cfg.hud_smooth) {
         g_hud_seen.clear();
         g_hud_prev.clear();
+        g_hud_draws.clear();
+        g_hud_strangers.clear();
         return;
     }
-    const size_t draws = g_frame.draws.size();
-    for (size_t di = 0; di < draws; di++) {
-        NativeDraw &d = g_frame.draws[di];
+    for (const HudDraw &h : g_hud_draws) {
+        if (h.draw >= g_frame.draws.size()) continue;
+        const NativeDraw &d = g_frame.draws[h.draw];
         if ((d.target != 0 && d.target != 3) || !d.count || d.indexed || d.ranges || d.mid_verts || (d.flags & kPartFlag)) continue;
-        u64 what = (u64)(uintptr_t)d.tex * 0x9e3779b97f4a7c15ull ^ (u64)d.count << 32 ^ (u64)(d.rt + 1) << 56;
-        for (u32 i = 0; i < d.count; i++) {
-            const NativeVertex &v = g_frame.vertices[d.first + i];
-            u32 st[2];
-            memcpy(st, &v.s, 8);
-            what = (what ^ st[0]) * 0x100000001b3ull;
-            what = (what ^ st[1]) * 0x100000001b3ull;
-        }
-        // the same one a frame before: the nearest of those not taken yet
-        int best = -1;
-        float best_far = 40.0f;
-        for (size_t k = 0; k < g_hud_seen.size(); k++) {
-            const HudSeen &h = g_hud_seen[k];
-            if (h.what != what || h.count != d.count || h.taken) continue;
-            float far = 0;
-            for (u32 i = 0; i < d.count; i++) {
-                const NativeVertex &a = g_hud_prev[h.first + i], &b = g_frame.vertices[d.first + i];
-                far = std::max(far, std::max(fabsf(a.x - b.x), fabsf(a.y - b.y)));
-            }
-            if (far < best_far) best_far = far, best = (int)k;
-        }
-        now.push_back({what, (u32)now_verts.size(), d.count, false});
+        now.push_back({h.group, h.index, (u32)now_verts.size(), d.count, h.draw, h.tex});
         now_verts.insert(now_verts.end(), g_frame.vertices.begin() + d.first, g_frame.vertices.begin() + d.first + d.count);
-        if (best < 0 || best_far < 0.01f) continue;
-        g_hud_seen[best].taken = true;
-        const u32 m0 = (u32)g_frame.vertices.size();
-        g_frame.vertices.resize((size_t)m0 + d.count);
-        for (u32 i = 0; i < d.count; i++) {
-            const NativeVertex &was = g_hud_prev[g_hud_seen[best].first + i];
-            NativeVertex v = g_frame.vertices[d.first + i];
-            v.x = 0.5f * (was.x + v.x), v.y = 0.5f * (was.y + v.y);
-            g_frame.vertices[m0 + i] = v;
-        }
-        d.mid_first = m0;
-        d.mid_verts = true;
     }
+    std::stable_sort(now.begin(), now.end(), [](const HudSeen &a, const HudSeen &b) { return a.group != b.group ? a.group < b.group : a.index < b.index; });
+    int groups = 0, moved = 0, still = 0, fresh = 0, other = 0, jumped = 0, moved_draws = 0;
+    float furthest = 0;
+    const bool tell = audit && g_frame_no % 120 == 0;
+    std::string told;                       // HP2_HUDAUDIT: what became of each object that is not standing still
+    for (size_t a = 0; a < now.size();) {
+        size_t b = a;
+        while (b < now.size() && now[b].group == now[a].group) b++;
+        groups++;
+        // the same object a frame before
+        const auto less = [](const HudSeen &h, u64 group) { return h.group < group; };
+        const auto was = std::lower_bound(g_hud_seen.begin(), g_hud_seen.end(), now[a].group, less);
+        size_t n = 0;
+        while (was + n != g_hud_seen.end() && was[n].group == now[a].group) n++;
+        bool same = n == b - a;
+        for (size_t k = 0; same && k < n; k++) same = was[k].index == now[a + k].index && was[k].count == now[a + k].count;
+        float far = 0;
+        if (same)
+            for (size_t k = 0; k < n; k++)
+                for (u32 i = 0; i < was[k].count; i++) {
+                    const NativeVertex &p = g_hud_prev[was[k].first + i], &q = now_verts[now[a + k].first + i];
+                    far = std::max(far, std::max(fabsf(p.x - q.x), fabsf(p.y - q.y)));
+                }
+        if (tell && !(same && far < 0.01f)) {
+            char line[160];
+            snprintf(line, sizeof line, " [%s x%zu %s %.1f]", now[a].tex ? (const char *)host(now[a].tex + 8) : "-", b - a,
+                     !same ? (n ? "resized" : "new") : far > kHudJump ? "jumped" : "moved", far);
+            told += line;
+        }
+        if (!same) (n ? other : fresh)++;
+        else if (far < 0.01f) still++;
+        else if (far > kHudJump) jumped++;
+        else {
+            moved++;
+            furthest = std::max(furthest, far);
+            for (size_t k = 0; k < n; k++) {
+                NativeDraw &d = g_frame.draws[now[a + k].draw];
+                const u32 m0 = (u32)g_frame.vertices.size();
+                g_frame.vertices.resize((size_t)m0 + d.count);
+                for (u32 i = 0; i < d.count; i++) {
+                    const NativeVertex &p = g_hud_prev[was[k].first + i];
+                    NativeVertex v = g_frame.vertices[d.first + i];
+                    v.x = 0.5f * (p.x + v.x), v.y = 0.5f * (p.y + v.y);
+                    g_frame.vertices[m0 + i] = v;
+                }
+                d.mid_first = m0;
+                d.mid_verts = true;
+                moved_draws++;
+            }
+        }
+        a = b;
+    }
+    if (tell) {
+        int layer = 0;
+        for (const NativeDraw &d : g_frame.draws) layer += (d.target == 0 || d.target == 3) && d.count;
+        fprintf(g_hle_log, "hudaudit: frame %u: the layer has %d draws, %zu of them owned, in %d objects: %d moved (%d draws, %.1f pixels at the most), %d still, "
+                           "%d new, %d of another size, %d jumped; with no owner:", g_frame_no, layer, now.size(), groups, moved, moved_draws, furthest, still, fresh, other, jumped);
+        for (const auto &t : g_hud_strangers) fprintf(g_hle_log, " %s %d", t.first.c_str(), t.second);
+        fprintf(g_hle_log, "; not still:%s%c", told.c_str(), 10);
+    }
+    g_hud_strangers.clear();
+    g_hud_draws.clear();
     g_hud_seen.swap(now);
     g_hud_prev.swap(now_verts);
 }
@@ -3581,6 +4694,12 @@ void native_end_frame()
     u32 falloff = LW(0x32f6d0);             // pTextureInfoSpecularFalloff
     g_frame.road_specular = falloff ? native_texture(falloff, g_frame_no) : nullptr;
     g_frame.road_mode = g_frame.road_specular ? native_tex_mode(*g_frame.road_specular) : 0;
+    // The blend of the race's sphere map pass over a gloss map (VU1's kick 0x31c) is five words the game keeps (0x32f70c on:
+    // A, B, C, D, FIX), put into ALPHA by eDisplayFrame's header (0x10b0a0). As the disc has them: 0, 2, 1, 1, 0x10, which is
+    // 0x58, Cs Ad + Cd: the map added by the gloss the first pass left. The Chrome Cars cheat (the game's render mode 12, a list
+    // of words it overwrites: pcsettings.cpp, cheat_words) makes them 2, 2, 1, 0, 0x80: (0 - 0) Ad + Cs, the map itself over the
+    // paint. The pass is the renderer's own here, so it has to ask (the user, 2026-11-24: "I see nothing of Chrome Cars").
+    g_frame.chrome = LW(0x32f70c) == LW(0x32f710) && LW(0x32f718) == 0;
     // eDisplayFrame's ESTAGE_FECARS: in the frontend (CurrentGameFlowState 3) the game downloads pTextureInfoCarSelectEnvMap to VRAM 10240 every
     // frame and the cars' environment pass reads it, not the sphere map a race left behind
     u32 car_env = LW(0x330544) == 3 ? LW(0x32f6d8) : 0;      // CurrentGameFlowState (gp-21420), pTextureInfoCarSelectEnvMap (gp-25112)
@@ -3618,9 +4737,18 @@ void native_end_frame()
     window_cursor_frame();
     native_texture_take_uploads(g_frame.uploads);
     g_frame.number = g_frame_no;
+    {   // the frame's length as the game has it: its real time step (gp-19596, set by PrepareRealTimestep from the ticker)
+        const u32 bits = LW(g_pc_ctx->r[28].w[0] - 19596);
+        memcpy(&g_frame.step_s, &bits, 4);
+    }
     g_frame.dumping = native_dumping_now();
     g_frame.epoch = g_seen_epoch;
-    g_frame.cache_top = g_cache_top;
+    idx_send();
+    geo_check_frame();
+    clip_check_frame();
+    g_frame.geo_indexed = g_geo;
+    g_frame.cache_top = cache_used();
+    depth_settle();                         // the sun's depth of the frame before, if StuffSun did not take it: before that frame's rects go
     hand_over();
     memwatch_frame();
     pc_heap_report(g_frame_no);
@@ -3637,15 +4765,22 @@ void native_end_frame()
     const u32 cap = native_vk_cache_vertices();
     const u32 margin = std::min<u32>(1536 * 1024, cap / 2);
     // emptied for want of room (not for a new size): the renderer hears of it with the next frame, and asks for a larger buffer
-    const u32 for_room = cap && cap == g_cache_cap && g_cache_top + margin > cap ? g_cache_top : 0;
-    if (cap != g_cache_cap || g_cache_top + margin > cap) {
-        if (g_cache_top || cap != g_cache_cap) cache_flush();
+    const u32 for_room = cap && cap == g_cache_cap && cache_used() + margin > cap ? cache_used() : 0;
+    // the strips by indices or not: by the setting and the GPU, changed between frames only, with the cache emptied
+    static const bool geo_wanted = (getenv("HP2_GEOINDEX") ? atoi(getenv("HP2_GEOINDEX")) != 0 : kGeoDefault) && g_ranged;
+    const bool geo = geo_wanted && native_vk_geo_ok();
+    if (cap != g_cache_cap || cache_used() + margin > cap || geo != g_geo) {
+        if (g_cache_top || cap != g_cache_cap || geo != g_geo) cache_flush();
+        g_geo = geo;
         g_cache_cap = cap;
     }
     g_frame.dyn_base = g_cache_cap;
     g_frame.uploads.clear();
     g_frame.indices.clear();
     g_frame.ranges.clear();
+    g_runs.clear();
+    g_run_ranges.clear();
+    g_run_strips.clear();
     g_frame.strip_vertices = 0;
     g_frame.cache_short = for_room;
     g_frame.fresh.clear();
@@ -3658,6 +4793,10 @@ void native_end_frame()
         memwatch_stats(&faults, &watched, &busy);
         fprintf(g_hle_log, "native: strips by address: %llu of the hits; %u pages watched, %u left alone, %llu watches taken off by writes\n",
                 (unsigned long long)g_seen_hits, watched, busy, (unsigned long long)faults);
+        fprintf(g_hle_log, "native: direct output%s: %llu strips in %llu runs so far, %llu runs gone the long way, %llu nodes of another frame\n", direct_on() ? "" : " (off)",
+                (unsigned long long)g_direct_strips, (unsigned long long)g_direct_runs, (unsigned long long)g_direct_slow, (unsigned long long)g_direct_stale);
+        if (g_direct_check) fprintf(g_hle_log, "native: directcheck: %llu runs compared, %llu not the same\n", (unsigned long long)g_direct_checked, (unsigned long long)g_direct_bad);
+        native_scenery_log();
         u64 tex_vouched, tex_summed, tex_bad;
         native_texture_watch_stats(&tex_vouched, &tex_summed, &tex_bad);
         fprintf(g_hle_log, "native: textures asked for: %llu known unchanged by their pages, %llu summed", (unsigned long long)tex_vouched, (unsigned long long)tex_summed);
@@ -3668,15 +4807,23 @@ void native_end_frame()
     g_frame_no++;
     g_frame.vertices.clear();
     g_frame.draws.clear();
+    g_frame.packs.clear();
     g_frame.casters.clear();
     g_frame.shadows.clear();
     g_frame.lights.clear();
     g_frame.fx.clear();
     g_packet_spans.clear();
+    g_packet_who.clear();
+    g_packet_edge.clear();
+    g_hud_times.clear();
+    g_hud_draws.clear();
     g_wide_2d.clear();
     g_light_ctx = g_light_mat = 0;
     g_light = -1;
     g_target = g_pack = g_local = g_mode = g_texture = 0;
+    g_pack_stale = true;
+    g_pack_slot = -1;
+    g_state_kept.have = false;
     g_clip_new = true;
     memset(&g_stat, 0, sizeof g_stat);
     memset(g_by_target, 0, sizeof g_by_target);
@@ -3753,7 +4900,7 @@ static NativeFx &add_fx(int kind, u32 target)
     return f;
 }
 
-// ---- Shadows: High and Maximum (Options > Graphics > Shadows; the user, 2026-11-15) ---------------------------------------
+// ---- Shadows: High, Very High and Ultra (Options > Graphics > Shadows; the user, 2026-11-15) -----------------------------
 // The game's two shadows of a car are polygons of CarRenderInfo::Render (0x120ef8), made anew every frame in the world's own space:
 //  - from the sun (texture SHADOWRAMP; 0x121d70 on): the corners of the car's collision box moved along the sun's ray to the car's
 //    height, their convex outline, each point of it dropped onto the terrain, the corners rounded (0x120c00), a fan and a soft rim.
@@ -3770,7 +4917,8 @@ static NativeFx &add_fx(int kind, u32 target)
 //  - the game's polygons of both kinds are then left out of the players' views and the mirror. A car there is no cell for (more
 //    than 32 at once), or one whose body was not drawn, keeps the game's.
 // The players' views get them at the place of the first such polygon in the lists (an effect over the picture, FX_SHADOW, as the
-// fog is one); the mirror after all the rest of it. Maximum is High with a map of twice the size.
+// fog is one); the mirror after all the rest of it. Very High (Maximum till 2026-11-26) is High with a map of twice the size and the
+// tunnels' lamps; Ultra twice that again.
 static int shadows_level()
 {
     static const char *env = getenv("HP2_SHADOWS");
@@ -3793,14 +4941,41 @@ struct ShadowCar {
     double light[16];                       // the world to the car's cell: x and y -1..1, the third 0..1 away from the sun
     double reach, deep;                     // the cell is so many metres either way of the car, and twice so many along the ray
     int cell;                               // -1: none left
-    u32 cast_target;                        // the target whose draws of the car go into the map; 0: none yet
+    u32 cast_verts[16];                     // by the target's number: the vertices of the car's draws there that can cast
     float strength;                         // 90 by the sunlight, over 128; below 0: not known yet
     u32 made;                               // by the target's number: its shadow from the sun is among the frame's
     int patch[16];                          // by the target's number: its patch among the frame's shadows, -1: none
     bool moves;                             // MidOwner's: where the car was a frame before
     float move[16];
+    double radius;                          // a ball about the car's middle (pose + half a metre up) that holds all of it
+    struct Lamp {                           // Very High and Ultra: one of its tunnel lamps ("the tunnels' lamps" below)
+        double clip[16];                    // the world to the lamp's cell: x, y -1..1 over w, the third K (z - n) over w = z
+        double n, k, tn, fade;              // the near distance, K, the half-width's tangent; where its shadow has faded out
+        double size;                        // how wide the lamp is, metres: the soft edge
+        double scale;                       // how much of its light counts (lamps_pick)
+        double at[3];                       // where it is
+        double cut[4];                      // where its shadow ends (lamp_cut), in the world: a x + b y + c z <= d; 0, 0, 0, 1: nowhere
+        int cell;                           // of the lamps' cells, 0..kLampCells-1
+    } lamp[4];                              // kLampsPerCar
+    int block;                              // its lamps' block in the frame's lights (lamps_pick); -1: none
+    int lamps;                              // how many of lamp[] there are
+    u32 lamp_made;                          // by the target's number: its lamps' shadows are among the frame's
+    float tunnel;                           // how much the sun is hidden from it, 0..1 (lamps_tunnel): its shadow is so much less
+    float roofed;                           // how much it is under a roof: the lamps' shadows are so much
+    bool roof_known;                        // its ground was found (else the lamps' shadows stay as they were)
 };
 static std::vector<ShadowCar> g_shadow_cars;        // this frame's, a car once whatever views draw it
+// Whose each of g_frame.casters is: the car and the view its draw is of. A car goes into its cell of the map once, by one view's
+// draws of it, and that used to be the first view that drew it. With two players the first is player 1's view, where player
+// 2's car and the traffic about it are far off: drawn in fewer triangles, or not at all in one frame and there in the next. So
+// the outline of the shadows in player 2's view changed with what player 1's view happened to draw (the user, 2026-11-23:
+// "in split screen the shadow flickers, for player 2"). Every view's draws are written down now, and at the frame's end the
+// map keeps, for each car, those of the view that drew most of it (shadow_end): the one it is nearest in.
+struct CasterOf {
+    u16 car;
+    u8 target;
+};
+static std::vector<CasterOf> g_caster_of;
 static bool g_shadow_fx[16];                        // by the target's number: its FX_SHADOW is queued
 static u32 g_shadow_rvm_at = ~0u;                   // the mirror: the draw its first shadow polygon stood before; ~0: none yet
 // A shadow's own space to the picture (the inverse of NativeShadow::to, made beside it in doubles), for the part of the view the
@@ -3821,6 +4996,7 @@ static struct {
 static void shadow_frame()
 {
     g_shadow_cars.clear();
+    g_caster_of.clear();
     g_shadow_from.clear();
     g_patch.shadow = -1;
     g_shadow_rvm_at = ~0u;
@@ -3831,6 +5007,543 @@ static inline void mul_d(double out[16], const double a[16], const double b[16])
 {
     for (int c = 0; c < 4; c++)
         for (int r = 0; r < 4; r++) out[c * 4 + r] = a[r] * b[c * 4] + a[4 + r] * b[c * 4 + 1] + a[8 + r] * b[c * 4 + 2] + a[12 + r] * b[c * 4 + 3];
+}
+
+// ---- The tunnels' lamps (Shadows: Very High and Ultra; the user, 2026-11-25, Very High since 2026-11-26) ------------------------
+// A car in a tunnel gets the shadows of the lamps that light it most, made the way the sun's is: the car's draws once more as
+// the lamp sees them, now in perspective, into a cell of the map's own rows for the lamps (native_vk.cpp), and the picture's pixels
+// further from the lamp than the car are in its shadow (native_shadow.frag, lamps). The sun's shadow is gone under a roof (lamps_tunnel).
+// The lamps are the ones on the tunnels' ceilings that one sees: the track's flares (LoaderLightList, 0x114f38, links each pack of
+// them into the list at gp - 24272: the count at +48, the flares listed from +56, 80 bytes each, its name at +16 and x y z at +48),
+// those named for a tunnel (EF_TunnelA, EF_TunnEL_A). They all face down. The game's own lights of kind 2 (the list at gp - 24264:
+// the pack's header has them at +20 and their count at +24, 96 bytes each, the kind at +36, the name at +0, x y z at +48) are no
+// lamps one sees: points the game lights a car's body by, two at most, 1 to 4 metres below and aside of the lamps, on two of the
+// locations one between the two lamps of a pair across the tunnel; and they reach 7 to 13 metres, so a shadow by their weight was
+// there only with the lamp all but over the car, falling under it (the user, 2026-11-25: "still very faint"). They are the lamps
+// only where a track has no tunnel flares.
+// How the shadows of several lamps lie over each other (the user, 2026-11-26: "the shadow jumps from one lamp to the next and
+// makes an ugly fan"; the shadows are to change fast, as in the tunnels of Hot Pursuit 2010, and lie over each other rightly).
+// A shadow is the light of one lamp that does not reach a place. Each place of the road has the light off the walls and the light
+// of every lamp near; the car hides some of them from it, and the place is darker by what it lost over what it had:
+//     darker by  lost / (walls + all the lamps' light),  lost = the sum of each lamp's light there times how much of it is hidden
+// So every lamp near casts its shadow at once, each as strong as its light at that place (how far the lamp is from the place, and
+// how the place faces it), where one lamp of three is hidden the place is a little darker, under the car where all are hidden it
+// is dark, and a lamp that comes into the set or leaves it has next to no light there then: no shadow jumps. One pass a car does
+// it all (native_shadow.frag, lamps): with its four lamps (the most light where the car is) the place's light is all theirs.
+// Before (2026-11-25): one shadow from the lamp of the most light, a second one only while they handed over, a pair of lamps across
+// the tunnel as one source in their middle; before that each lamp's shadow by its share of the light at the car alone.
+static const int kLampsPerCar = 4;
+static const int kLampCells = 64;                   // the map's rows for the lamps: 16 x 4 cells of half a car's cell (native_vk.cpp)
+static const double kLampAmbient = 0.0165;        // the light off the walls, as a lamp's at 7.8 metres: one lamp 4.5 metres over the
+                                                    // road casts a shadow 0.75 dark under the car (the sun's is 90 / 128)
+static const double kLampNear = 8.0, kLampFar = 20.0;
+static const double kLampSize = 0.4;                // how wide a lamp is, in metres: its shadow's soft edge
+static const double kLampPair = 0.0;                // two lamps nearer than this, each the other's nearest, are one: none now, each
+                                                    // lamp of a pair casts its own (it was 10.5 till 2026-11-26)
+static const double kLampFade = 12.0;               // how far beyond the car the shadow lies before it is gone, metres along the ray
+struct TunnelLamp {
+    double at[3];
+};
+static std::vector<TunnelLamp> g_lamps;
+struct LampSource {
+    double at[3];
+    double size;                                    // how wide, metres
+};
+static std::vector<LampSource> g_sources;           // what casts the shadows: g_lamps, the pairs as one
+// The roofs a track draws over its tunnels' road and its ground has not (track_roofs.h, made by tools/recomp/make_track_roofs.py:
+// location 4's cave, TRN_SECTION70_CAVERN and _MINE_PROP, over 17% of its tunnel road; the user, 2026-11-25): the set of the
+// location whose tunnel lamp the loaded track has. A triangle: its corners, its box across the ground, its plane (a x + b y + c z = d)
+struct DrawnRoof {
+    float v[9];
+    float box[4];
+    double plane[4];
+};
+static std::vector<DrawnRoof> g_drawn_roofs;
+static u32 g_lamps_sig = 0, g_lamps_frame = ~0u;
+
+static bool lamps_on()
+{
+    static const char *env = getenv("HP2_LAMPSHADOWS");
+    return shadows_level() >= 2 && !(env && atoi(env) == 0);     // Very High and Ultra (the user, 2026-11-26: Very High too)
+}
+
+static bool tunnel_name(u32 at)
+{
+    char name[33] = {};
+    memcpy(name, host(at), 32);
+    for (int k = 0; k + 5 <= 32 && name[k]; k++)
+        if (!_strnicmp(name + k, "unnel", 5)) return true;
+    return false;
+}
+
+// the lamps of the packs the game has: read anew when the packs change
+static void lamps_read(u32 gp)
+{
+    if (g_lamps_frame == g_frame_no) return;
+    g_lamps_frame = g_frame_no;
+    const auto ok = [](u32 a, u32 n) { return a >= 0x100000 && a < 0x2000000 && n < 0x2000000 - a && !(a & 3); };
+    const u32 lights = gp - 24264, flares = gp - 24272;
+    if (!ok(flares, 16)) return;
+    u32 sig = 0x9e3779b9u;
+    int guard = 0;
+    for (u32 h = LW(lights); h != lights && ok(h, 28) && guard < 64; h = LW(h), guard++) sig = sig * 31 + h + LW(h + 24) * 7;
+    guard = 0;
+    for (u32 h = LW(flares); h != flares && ok(h, 64) && guard < 64; h = LW(h), guard++) sig = sig * 31 + h + LW(h + 48) * 13;
+    if (sig == g_lamps_sig) return;
+    g_lamps_sig = sig;
+    g_lamps.clear();
+    const auto real = [](float v) { return v == v && fabsf(v) < 1.0e6f; };
+    guard = 0;
+    for (u32 h = LW(flares); h != flares && ok(h, 64) && guard < 64; h = LW(h), guard++) {
+        const u32 count = LW(h + 48), list = h + 56;
+        u32 node = LW(list);
+        for (u32 i = 0; i < count && i < 4096 && node != list && ok(node, 80); i++, node = LW(node)) {
+            float p[3];
+            memcpy(p, host(node + 48), 12);
+            if (real(p[0]) && real(p[1]) && real(p[2]) && tunnel_name(node + 16)) g_lamps.push_back({{p[0], p[1], p[2]}});
+        }
+    }
+    const size_t flared = g_lamps.size();
+    guard = 0;
+    for (u32 h = LW(lights); !flared && h != lights && ok(h, 28) && guard < 64; h = LW(h), guard++) {
+        const u32 at = LW(h + 20), count = LW(h + 24);
+        if (count > 8192 || !ok(at, count * 96)) continue;
+        for (u32 i = 0; i < count; i++) {
+            const u32 r = at + i * 96;
+            if (*(const u8 *)host(r + 36) != 2 || !tunnel_name(r)) continue;
+            float p[3];
+            memcpy(p, host(r + 48), 12);
+            if (real(p[0]) && real(p[1]) && real(p[2])) g_lamps.push_back({{p[0], p[1], p[2]}});
+        }
+    }
+    // the sources: a pair across is one, in its middle
+    g_sources.clear();
+    std::vector<int> nearest(g_lamps.size(), -1);
+    std::vector<double> nearest_d(g_lamps.size(), 1e30);
+    for (size_t i = 0; i < g_lamps.size(); i++)
+        for (size_t j = 0; j < g_lamps.size(); j++) {
+            if (j == i) continue;
+            const double dx = g_lamps[j].at[0] - g_lamps[i].at[0], dy = g_lamps[j].at[1] - g_lamps[i].at[1], dz = g_lamps[j].at[2] - g_lamps[i].at[2];
+            const double e = sqrt(dx * dx + dy * dy + dz * dz);
+            if (e < nearest_d[i]) nearest_d[i] = e, nearest[i] = (int)j;
+        }
+    for (size_t i = 0; i < g_lamps.size(); i++) {
+        const int j = nearest[i];
+        const bool pair = j >= 0 && nearest[j] == (int)i && nearest_d[i] < kLampPair;
+        if (pair && j < (int)i) continue;               // made with the first of the two
+        LampSource s;
+        s.size = kLampSize;
+        for (int k = 0; k < 3; k++) s.at[k] = g_lamps[i].at[k];
+        if (pair) {
+            for (int k = 0; k < 3; k++) s.at[k] = 0.5 * (g_lamps[i].at[k] + g_lamps[j].at[k]);
+            s.size = std::max(kLampSize, nearest_d[i]);
+        }
+        g_sources.push_back(s);
+    }
+    // the drawn roofs of this location, if any
+    g_drawn_roofs.clear();
+    for (int k = 0; k < kTrackRoofSets; k++) {
+        bool here = false;
+        for (const TunnelLamp &l : g_lamps)
+            if (fabs(l.at[0] - kTrackRoofs[k].lamp[0]) < 0.5 && fabs(l.at[1] - kTrackRoofs[k].lamp[1]) < 0.5 && fabs(l.at[2] - kTrackRoofs[k].lamp[2]) < 0.5)
+                here = true;
+        if (!here) continue;
+        for (int t = 0; t < kTrackRoofs[k].triangles; t++) {
+            DrawnRoof r;
+            memcpy(r.v, kTrackRoofs[k].corners + t * 9, sizeof r.v);
+            r.box[0] = std::min(std::min(r.v[0], r.v[3]), r.v[6]), r.box[1] = std::min(std::min(r.v[1], r.v[4]), r.v[7]);
+            r.box[2] = std::max(std::max(r.v[0], r.v[3]), r.v[6]), r.box[3] = std::max(std::max(r.v[1], r.v[4]), r.v[7]);
+            const double e1[3] = {r.v[3] - (double)r.v[0], r.v[4] - (double)r.v[1], r.v[5] - (double)r.v[2]};
+            const double e2[3] = {r.v[6] - (double)r.v[0], r.v[7] - (double)r.v[1], r.v[8] - (double)r.v[2]};
+            r.plane[0] = e1[1] * e2[2] - e1[2] * e2[1], r.plane[1] = e1[2] * e2[0] - e1[0] * e2[2], r.plane[2] = e1[0] * e2[1] - e1[1] * e2[0];
+            r.plane[3] = r.plane[0] * r.v[0] + r.plane[1] * r.v[1] + r.plane[2] * r.v[2];
+            const double l = sqrt(r.plane[0] * r.plane[0] + r.plane[1] * r.plane[1] + r.plane[2] * r.plane[2]);
+            if (!(l > 1e-9)) continue;
+            for (double &c : r.plane) c /= l;
+            g_drawn_roofs.push_back(r);
+        }
+    }
+    if (getenv("HP2_NATIVELOG"))
+        fprintf(stderr, "[native] tunnel lamps: %zu (%s), %zu sources, %zu drawn roofs\n", g_lamps.size(), flared ? "the flares" : "the lights",
+                g_sources.size(), g_drawn_roofs.size());
+}
+
+// What is over the car, for its shadows (Very High and Ultra; the user, 2026-11-25: "the sun's shadow is cast in the tunnels too", "for every
+// car, the traffic too"). The game's lighting has no roofs: the sunlight its zones give a car (ELAmbient_..., what the sun's shadow
+// goes by) is 0.7 in a tunnel as on the open road. The game's ground has them. Every car keeps the track's collision about it in
+// its TopologyCoordinate (the Car's +1312; the Car is the CarRenderInfo's first word): the box it was fetched for at +0 (x, y
+// least) and +8 (x, y most; GetElevation fetches anew outside it), and SetInterestBBox (0x151d30) fills it with up to 160 polygons
+// from +32, the ground first (flags at the polygon's +10 with neither 2 nor 8; their count at +676), the walls next (2; +680), what
+// is overhead last (8, the tunnels' ceilings; +684), all of them +672. A polygon (as GetElevation, 0x152070, reads it): its
+// corners' count at +9, its box at +20 (x, y least) and +28 (x, y most), its corners at +48 (x, y, z, w; 16 bytes each), its plane
+// at +112 (a, b, c, d: a x + b y + c z = d). A place is in it when no side has it outside: (y1 - y0)(x - x0) - (x1 - x0)(y - y0)
+// <= 0 for the sides 0-1, 1-2, 3-0, and 2-3 with four corners; a ceiling goes round the other way, >= 0 (the first build missed
+// that and found no roof in any tunnel). The ground under a place is the highest of the ground's polygons there no more than a
+// metre above the car (the game's own rule), and more the further the place is from the car, for a road going up (kRoofRise).
+// Only read: GetElevation itself keeps the polygon it found last (+688) and fetches the ground anew outside its box, so it is not
+// called here for cars the game does not call it for. A car whose polygons do not reach has no ground found and keeps its shadows.
+// The tracks' files (2026-11-25, all 30): on every route through a tunnel its ceilings are over all the road under its lamps but on
+// location 4's (93%); a route that goes round a tunnel has no road under its lamps at all.
+//  - The sun's shadow: a ray from a metre over the ground towards the sun (the ray the car's own shadow is cast along, 0x120d60),
+//    and anything of the ground or a ceiling it meets kRoofLeast metres or more up hides the sun. So at a tunnel's mouth the
+//    shadow goes on as far in as the sun shines, and under a bridge it is out only where the bridge's own shadow is. Where the ray
+//    leaves the car's box before it is as high as the roof straight above, what is past the box is not known: the roof straight
+//    above says then.
+//  - The lamps' shadows: only under a roof, straight above (the tunnel's), for out under the sky the day lights the road a hundred
+//    to a thousand times over what a lamp does (road luminance in sun some 3,000 to 8,000 cd/m2; a tunnel's interior 2 to 10).
+//    A tunnel lamp right over a place stands in for a ceiling, only for a car that has no ceilings at all in its box.
+// Five places, the car's middle and two metres to either side of it along both its axes, and each car's results eased in over a
+// sixth of a second, so a shadow fades as the car goes in and out and takes no steps.
+// Before this, the same day: the tunnels' lamps (the sun's shadow out within 6 to 12 metres of their chain; it went out a few
+// metres before a mouth, and not under a bridge), and the game's own reverb areas of its SoundScape (0x317c80, 124 bytes each, the
+// count at gp - 18084; dropped before a build: half of location 1's tunnels and all of location 2's lie in none, their outlines are
+// a few corners over hundreds of metres, some are under the open sky, and location 6's SA02_Tunnel has no triangles at all).
+static const double kRoofLeast = 2.5;               // metres above the ground: a car is no taller than that
+static const double kRoofMost = 60.0;               // and no roof is further up than this
+static const double kRoofLamp = 5.0;               // a tunnel lamp within this across the ground, over the place, is a roof too
+static const double kRoofRise = 0.25;              // the ground may be so much higher for each metre from the car (a road uphill)
+static const double kRoofEase = 0.1;               // of the way to the new result each frame: a sixth of a second at 60
+static struct RoofProbe {
+    u32 list = 0, all = 0, ground = 0, walls = 0, over = 0;
+    double carx = 0, cary = 0, carz = 0;
+    float box[4] = {};                              // what the car's polygons are known for: x, y least, x, y most
+    bool valid = false;
+    // a polygon's height at x, y, if x, y is in it
+    static bool at(u32 p, double x, double y, double &h)
+    {
+        float box[4], v[16], plane[4];
+        memcpy(box, host(p + 20), 16);
+        if (x < box[0] || x > box[2] || y < box[1] || y > box[3]) return false;
+        memcpy(v, host(p + 48), 64);
+        memcpy(plane, host(p + 112), 16);
+        const int corners = *(const s8 *)host(p + 9);
+        const auto side = [&](int i, int j) {
+            return ((double)v[j * 4 + 1] - v[i * 4 + 1]) * (x - v[i * 4]) - ((double)v[j * 4] - v[i * 4]) * (y - v[i * 4 + 1]);
+        };
+        const double s0 = side(0, 1), s1 = side(1, 2), s2 = side(3, 0), s3 = corners == 4 ? side(2, 3) : s0;
+        const double most = std::max(std::max(s0, s1), std::max(s2, s3)), least = std::min(std::min(s0, s1), std::min(s2, s3));
+        if (!(most <= 0.0 || least >= 0.0) || !(fabsf(plane[2]) > 0.05f)) return false;
+        h = ((double)plane[3] - plane[0] * x - plane[1] * y) / plane[2];
+        return h == h && fabs(h) < 1e6;
+    }
+    u32 polygon(u32 i) const { return LW(list + i * 4); }
+    // a drawn roof's height at x, y, if x, y is in it (and the roof is not standing up)
+    static bool drawn_at(const DrawnRoof &r, double x, double y, double &h)
+    {
+        if (x < r.box[0] || x > r.box[2] || y < r.box[1] || y > r.box[3] || !(fabs(r.plane[2]) > 0.05)) return false;
+        const float *v = r.v;
+        const double d1 = ((double)v[3] - v[0]) * (y - v[1]) - ((double)v[4] - v[1]) * (x - v[0]);
+        const double d2 = ((double)v[6] - v[3]) * (y - v[4]) - ((double)v[7] - v[4]) * (x - v[3]);
+        const double d3 = ((double)v[0] - v[6]) * (y - v[7]) - ((double)v[1] - v[7]) * (x - v[6]);
+        if (!((d1 >= 0 && d2 >= 0 && d3 >= 0) || (d1 <= 0 && d2 <= 0 && d3 <= 0))) return false;
+        h = (r.plane[3] - r.plane[0] * x - r.plane[1] * y) / r.plane[2];
+        return true;
+    }
+    bool wall(u32 i) const { return i >= ground && i < ground + walls; }
+    // the ground under x, y; false: none known there
+    bool floor_at(double x, double y, double &floor) const
+    {
+        if (!valid) return false;
+        const double rise = 1.0 + kRoofRise * sqrt((x - carx) * (x - carx) + (y - cary) * (y - cary));
+        floor = -1e30;
+        double h;
+        for (u32 i = 0; i < ground; i++)
+            if (at(polygon(i), x, y, h) && h < carz + rise && h > floor) floor = h;
+        return floor > -1e29;
+    }
+    // how high a roof is straight over x, y (the lowest), above the ground there; 0: none. `lamps`: a tunnel lamp right over it
+    // counts (only for a car with no ceilings in its box)
+    double roof_at(double x, double y, double floor, bool lamps) const
+    {
+        double lowest = 0, h;
+        for (u32 i = 0; i < all; i++)
+            if (!wall(i) && at(polygon(i), x, y, h) && h >= floor + kRoofLeast && h <= floor + kRoofMost && (!lowest || h - floor < lowest))
+                lowest = h - floor;
+        for (const DrawnRoof &r : g_drawn_roofs)
+            if (drawn_at(r, x, y, h) && h >= floor + kRoofLeast && h <= floor + kRoofMost && (!lowest || h - floor < lowest)) lowest = h - floor;
+        if (lamps && !over)
+            for (const TunnelLamp &l : g_lamps) {
+                const double dx = l.at[0] - x, dy = l.at[1] - y, dz = l.at[2] - floor;
+                if (dx * dx + dy * dy < kRoofLamp * kRoofLamp && dz >= kRoofLeast && dz <= 12.0 && (!lowest || dz < lowest)) lowest = dz;
+            }
+        return lowest;
+    }
+    // 1 or 0: whether the sun is hidden from a metre over the ground at x, y, along `sun` (towards it, unit)
+    int sun_hidden(double x, double y, double floor, const double sun[3]) const
+    {
+        const double o[3] = {x, y, floor + 1.0};
+        for (u32 i = 0; i < all; i++) {
+            if (wall(i)) continue;
+            const u32 p = polygon(i);
+            float plane[4];
+            memcpy(plane, host(p + 112), 16);
+            const double towards = plane[0] * sun[0] + plane[1] * sun[1] + plane[2] * sun[2];
+            if (!(fabs(towards) > 1e-6)) continue;
+            const double t = (plane[3] - (plane[0] * o[0] + plane[1] * o[1] + plane[2] * o[2])) / towards;
+            if (!(t > 0.2)) continue;
+            const double hx = o[0] + sun[0] * t, hy = o[1] + sun[1] * t, hz = o[2] + sun[2] * t, up = hz - floor;
+            double h;
+            if (up >= kRoofLeast && up <= kRoofMost && at(p, hx, hy, h)) return 1;
+        }
+        for (const DrawnRoof &r : g_drawn_roofs) {
+            const double towards = r.plane[0] * sun[0] + r.plane[1] * sun[1] + r.plane[2] * sun[2];
+            if (!(fabs(towards) > 1e-6)) continue;
+            const double t = (r.plane[3] - (r.plane[0] * o[0] + r.plane[1] * o[1] + r.plane[2] * o[2])) / towards;
+            if (!(t > 0.2)) continue;
+            const double hx = o[0] + sun[0] * t, hy = o[1] + sun[1] * t, up = o[2] + sun[2] * t - floor;
+            if (!(up >= kRoofLeast && up <= kRoofMost) || hx < r.box[0] || hx > r.box[2] || hy < r.box[1] || hy > r.box[3]) continue;
+            // the place the ray meets the triangle's plane: in the triangle? (by its own corners, so a wall of the cave counts too)
+            const float *v = r.v;
+            const double c1[3] = {v[3] - (double)v[0], v[4] - (double)v[1], v[5] - (double)v[2]};
+            const double c2[3] = {v[6] - (double)v[0], v[7] - (double)v[1], v[8] - (double)v[2]};
+            const double q[3] = {hx - v[0], hy - v[1], o[2] + sun[2] * t - v[2]};
+            const double d00 = c1[0] * c1[0] + c1[1] * c1[1] + c1[2] * c1[2], d01 = c1[0] * c2[0] + c1[1] * c2[1] + c1[2] * c2[2];
+            const double d11 = c2[0] * c2[0] + c2[1] * c2[1] + c2[2] * c2[2];
+            const double d20 = q[0] * c1[0] + q[1] * c1[1] + q[2] * c1[2], d21 = q[0] * c2[0] + q[1] * c2[1] + q[2] * c2[2];
+            const double den = d00 * d11 - d01 * d01;
+            if (!(fabs(den) > 1e-12)) continue;
+            const double b1 = (d11 * d20 - d01 * d21) / den, b2 = (d00 * d21 - d01 * d20) / den;
+            if (b1 >= 0 && b2 >= 0 && b1 + b2 <= 1) return 1;
+        }
+        // none met: but past the car's box nothing is known. Where the ray leaves it lower than the roof straight above, that says
+        const double roof = roof_at(x, y, floor, false);
+        if (!roof || !(sun[2] > 1e-3)) return 0;
+        const double across = sqrt(sun[0] * sun[0] + sun[1] * sun[1]);
+        if (across < 1e-6) return 0;
+        double leave = 1e30;                        // how far across the ground to the box's edge
+        for (int k = 0; k < 2; k++) {
+            if (sun[k] > 1e-9) leave = std::min(leave, (box[2 + k] - o[k]) / sun[k] * across);
+            else if (sun[k] < -1e-9) leave = std::min(leave, (box[k] - o[k]) / sun[k] * across);
+        }
+        const double height = 1.0 + std::max(leave, 0.0) * sun[2] / across;
+        return height < roof ? 1 : 0;
+    }
+} g_probe;
+
+// each car's results, eased (kRoofEase): by the CarRenderInfo
+struct RoofEased {
+    float lamps, sun;
+    u32 frame;
+};
+static std::unordered_map<u32, RoofEased> g_roof_eased;
+
+// How much the car is under a roof (`lamps`, for the lamps' shadows) and out of the sun (the return, for the sun's), both 0..1.
+// `known`: its ground was found (else the lamps' shadows stay as they were).
+static float lamps_tunnel(Ctx &c, u32 info, const float pose[16], const double away[3], float &lamps, bool &known)
+{
+    known = false;
+    lamps = 0.0f;
+    g_probe.valid = false;
+    if (!lamps_on()) return 0.0f;
+    lamps_read(c.r[28].w[0]);
+    const auto ok = [](u32 a, u32 n) { return a >= 0x100000 && a < 0x2000000 && n < 0x2000000 - a && !(a & 3); };
+    if (!ok(info, 4)) return 0.0f;
+    const u32 car = LW(info);
+    if (!ok(car, 1312 + 692)) return 0.0f;
+    const u32 topo = car + 1312;
+    const u32 all = LW(topo + 672), ground = LW(topo + 676), walls = LW(topo + 680), over = LW(topo + 684);
+    if (all > 160 || ground + walls + over != all || !all) return 0.0f;
+    float carpos[4];
+    memcpy(carpos, host(car + 96), 16);
+    if (!(fabsf(carpos[0]) < 1e6f && fabsf(carpos[1]) < 1e6f && fabsf(carpos[2]) < 1e6f)) return 0.0f;
+    const u32 list = topo + 32;
+    for (u32 i = 0; i < all; i++)
+        if (!ok(LW(list + i * 4), 128)) return 0.0f;
+    RoofProbe &g = g_probe;
+    g.list = list, g.all = all, g.ground = ground, g.walls = walls, g.over = over;
+    g.carx = carpos[0], g.cary = carpos[1], g.carz = carpos[2];
+    memcpy(g.box, host(topo), 16);
+    g.valid = true;
+    const double sun[3] = {-away[0], -away[1], -away[2]};
+    // the car's axes across the ground
+    double ax[2] = {pose[0], pose[1]}, ay[2] = {pose[4], pose[5]};
+    for (double *a : {ax, ay}) {
+        const double l = sqrt(a[0] * a[0] + a[1] * a[1]);
+        if (l > 1e-3) a[0] /= l, a[1] /= l;
+        else a[0] = 0, a[1] = 0;
+    }
+    const double off[5][2] = {{0, 0}, {2, 0}, {-2, 0}, {0, 2}, {0, -2}};
+    int roofed = 0, hidden = 0, places = 0;
+    for (const auto &o : off) {
+        const double x = carpos[0] + ax[0] * o[0] + ay[0] * o[1], y = carpos[1] + ax[1] * o[0] + ay[1] * o[1];
+        double floor;
+        if (!g.floor_at(x, y, floor)) continue;         // no ground known here
+        places++;
+        roofed += g.roof_at(x, y, floor, true) > 0;
+        hidden += g.sun_hidden(x, y, floor, sun);
+    }
+    if (!places) return 0.0f;
+    known = true;
+    float now_lamps = (float)roofed / places, now_sun = (float)hidden / places;
+    // eased by the car
+    auto it = g_roof_eased.find(info);
+    if (it == g_roof_eased.end() || g_frame_no - it->second.frame > 30) {
+        g_roof_eased[info] = {now_lamps, now_sun, g_frame_no};
+    } else if (g_frame_no != it->second.frame) {
+        const float k = 1.0f - powf(1.0f - (float)kRoofEase, (float)(g_frame_no - it->second.frame));
+        it->second.lamps += (now_lamps - it->second.lamps) * k;
+        it->second.sun += (now_sun - it->second.sun) * k;
+        it->second.frame = g_frame_no;
+        now_lamps = it->second.lamps, now_sun = it->second.sun;
+    } else {
+        now_lamps = it->second.lamps, now_sun = it->second.sun;
+    }
+    if (g_frame_no % 600 == 0)
+        for (auto e = g_roof_eased.begin(); e != g_roof_eased.end();)
+            e = g_frame_no - e->second.frame > 300 ? g_roof_eased.erase(e) : std::next(e);
+    lamps = now_lamps;
+    return now_sun;
+}
+
+// Where a lamp's shadow comes out from under the roof (the user, 2026-11-25: the lamps' shadows are not to stick out of the
+// tunnel; out there the day outshines a lamp a hundred times and more). It ends at the roof's edge: a wall standing up from the
+// ground across the way from the lamp through the car, at the first place on that way that has no roof (native_shadow.frag fades
+// it out over 0.3 metres either side). Only the ceilings and the ground count here, not the lamps standing in for one, and only
+// when the car's own place has a roof: else there is no edge to go by. The car's polygons reach some 8 metres about it; an edge
+// further than that is not found, and the shadow is as before.
+static bool lamp_cut(const double mid[3], const double from[3], double plane[4])
+{
+    double d[2] = {mid[0] - from[0], mid[1] - from[1]};
+    const double l = sqrt(d[0] * d[0] + d[1] * d[1]);
+    double floor;
+    if (l < 0.5 || !g_probe.floor_at(mid[0], mid[1], floor) || !(g_probe.roof_at(mid[0], mid[1], floor, false) > 0)) return false;
+    d[0] /= l, d[1] /= l;
+    // -1: no ground known; 0: open; 1: a roof
+    const auto test = [&](double t) {
+        const double x = mid[0] + d[0] * t, y = mid[1] + d[1] * t;
+        double f;
+        if (!g_probe.floor_at(x, y, f)) return -1;
+        return g_probe.roof_at(x, y, f, false) > 0 ? 1 : 0;
+    };
+    double roof = 0, open = -1;
+    for (double t = 1.0; t <= 14.0; t += 1.0) {
+        const int r = test(t);
+        if (r == 0) {
+            open = t;
+            break;
+        }
+        if (r == 1) roof = t;
+    }
+    if (open < 0) return false;
+    for (int i = 0; i < 4; i++) {                       // the edge to a quarter of a metre
+        const double t = 0.5 * (roof + open);
+        if (test(t) == 0) open = t;
+        else roof = t;
+    }
+    const double t = 0.5 * (roof + open);
+    plane[0] = d[0], plane[1] = d[1], plane[2] = 0;
+    plane[3] = d[0] * (mid[0] + d[0] * t) + d[1] * (mid[1] + d[1] * t);
+    return true;
+}
+
+// The car's lamps (kLampsPerCar at most) and each one's cell: how the lamp sees the ball that holds the car; and the block of the
+// frame's lights the shader reads them from (native_shadow.frag, lamps). The block, two NativeLights from s.block on, in quads:
+//   0      the count of lamps, the light off the walls (kLampAmbient), how much the car is under a roof, 0
+//   1 + 8 i, lamp i:  +0..+3 the world to its cell (u, v 0..1 over w, the third K (z - n) over w = z: the columns)
+//                     +4 its cell's number among the lamps' (native_vk.cpp), K, n, the tangent of the cell's half-width
+//                     +5 its width (the soft edge), where its shadow has faded out (metres along its ray), how much of it there
+//                        is (its scale, below), 0
+//                     +6 where it is, 0;  +7 where its shadow ends, the roof's edge (lamp_cut): a x + b y + c z <= d, or
+//                        0, 0, 0, 1 for nowhere
+static void lamps_pick(Ctx &c, ShadowCar &s, int index)
+{
+    s.lamps = 0;
+    s.block = -1;
+    if (!lamps_on() || s.cell < 0 || index >= kLampCells / kLampsPerCar) return;
+    lamps_read(c.r[28].w[0]);
+    if (g_sources.empty()) return;
+    // only under a roof (the user, 2026-11-25: the lamps' shadows are not to come out of the tunnel; a car on the road over a tunnel
+    // has its lamps below it and no roof); a car whose ground is not known keeps them
+    const double roofed = s.roof_known ? s.roofed : 1.0;
+    if (!(roofed > 0.01)) return;
+    const double mid[3] = {s.pose[12], s.pose[13], s.pose[14] + 0.5};
+    // the ones that give the car the most light where it is, and one more
+    int top[kLampsPerCar + 1];
+    double light[kLampsPerCar + 1];
+    for (int k = 0; k <= kLampsPerCar; k++) top[k] = -1, light[k] = 0;
+    for (size_t i = 0; i < g_sources.size(); i++) {
+        const double *at = g_sources[i].at;
+        const double dx = mid[0] - at[0], dy = mid[1] - at[1], dz = mid[2] - at[2];
+        const double d2 = dx * dx + dy * dy + dz * dz;
+        if (!(d2 < kLampFar * kLampFar)) continue;
+        const double t = std::min(std::max((sqrt(d2) - kLampNear) / (kLampFar - kLampNear), 0.0), 1.0);
+        const double l = (1.0 - t * t * (3.0 - 2.0 * t)) / std::max(d2, 9.0);
+        for (int k = 0; k <= kLampsPerCar; k++) {
+            if (l <= light[k]) continue;
+            for (int j = kLampsPerCar; j > k; j--) light[j] = light[j - 1], top[j] = top[j - 1];
+            light[k] = l, top[k] = (int)i;
+            break;
+        }
+    }
+    for (int k = 0; k < kLampsPerCar; k++) {
+        if (top[k] < 0 || !(light[k] > 0)) continue;
+        // A lamp is in the set while it is among the nearest, and goes as the next one comes in: so much of it is there as its
+        // light here is more than the one left out's. At the swap it is none, so its shadow is gone before it is dropped
+        double scale = (light[k] - light[kLampsPerCar]) / light[k];
+        const double *from = g_sources[top[k]].at;
+        double f[3] = {mid[0] - from[0], mid[1] - from[1], mid[2] - from[2]};
+        const double dist = sqrt(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]), rs = s.radius;
+        if (!(dist > rs * 1.15) || !(dist < 200.0)) continue;      // the lamp all but in the car: no shadow that means anything
+        // and fading in from there, so the shadow does not jump in or out as the lamp comes that near
+        const double near = std::min((dist - rs * 1.15) / (rs * 0.25), 1.0);
+        scale *= near * near * (3.0 - 2.0 * near);
+        if (!(scale > 0.02)) continue;
+        for (double &v : f) v /= dist;
+        double r[3] = {f[1], -f[0], 0};                         // across the ray, level
+        double rl = sqrt(r[0] * r[0] + r[1] * r[1]);
+        if (rl < 1e-3) r[0] = 1, r[1] = 0, rl = 1;
+        r[0] /= rl, r[1] /= rl;
+        const double up[3] = {r[1] * f[2] - r[2] * f[1], r[2] * f[0] - r[0] * f[2], r[0] * f[1] - r[1] * f[0]};
+        ShadowCar::Lamp &L = s.lamp[s.lamps];
+        L.tn = rs / sqrt(dist * dist - rs * rs);
+        L.n = dist - rs;
+        const double far = dist + rs;
+        L.k = far / (far - L.n);
+        L.fade = far + kLampFade;
+        L.scale = scale;
+        L.size = g_sources[top[k]].size;
+        for (int j = 0; j < 3; j++) L.at[j] = from[j];
+        L.cut[0] = L.cut[1] = L.cut[2] = 0, L.cut[3] = 1;
+        if (!lamp_cut(mid, from, L.cut)) L.cut[0] = L.cut[1] = L.cut[2] = 0, L.cut[3] = 1;
+        L.cell = index * kLampsPerCar + s.lamps;
+        const double sr = r[0] * from[0] + r[1] * from[1] + r[2] * from[2];
+        const double su = up[0] * from[0] + up[1] * from[1] + up[2] * from[2];
+        const double sf = f[0] * from[0] + f[1] * from[1] + f[2] * from[2];
+        double *m = L.clip;
+        for (int j = 0; j < 3; j++) {
+            m[j * 4 + 0] = r[j] / L.tn;
+            m[j * 4 + 1] = up[j] / L.tn;
+            m[j * 4 + 2] = L.k * f[j];
+            m[j * 4 + 3] = f[j];
+        }
+        m[12] = -sr / L.tn;
+        m[13] = -su / L.tn;
+        m[14] = L.k * (-sf - L.n);
+        m[15] = -sf;
+        s.lamps++;
+    }
+    if (!s.lamps) return;
+    // the block
+    const size_t first = g_frame.lights.size();
+    g_frame.lights.resize(first + 2);
+    float *q = &g_frame.lights[first].q[0][0];
+    memset(q, 0, 2 * sizeof(NativeLight));
+    q[0] = (float)s.lamps, q[1] = (float)kLampAmbient, q[2] = (float)roofed;
+    for (int i = 0; i < s.lamps; i++) {
+        const ShadowCar::Lamp &L = s.lamp[i];
+        float *o = q + 4 * (1 + 8 * i);
+        for (int k = 0; k < 4; k++) {               // the column k of the world to the cell
+            o[k * 4 + 0] = (float)(0.5 * L.clip[k * 4 + 0] + 0.5 * L.clip[k * 4 + 3]);
+            o[k * 4 + 1] = (float)(0.5 * L.clip[k * 4 + 1] + 0.5 * L.clip[k * 4 + 3]);
+            o[k * 4 + 2] = (float)L.clip[k * 4 + 2];
+            o[k * 4 + 3] = (float)L.clip[k * 4 + 3];
+        }
+        o[16] = (float)L.cell, o[17] = (float)L.k, o[18] = (float)L.n, o[19] = (float)L.tn;
+        o[20] = (float)L.size, o[21] = (float)L.fade, o[22] = (float)L.scale;
+        o[24] = (float)L.at[0], o[25] = (float)L.at[1], o[26] = (float)L.at[2];
+        for (int k = 0; k < 4; k++) o[28 + k] = (float)L.cut[k];
+    }
+    s.block = (int)first;
 }
 
 // CarRenderInfo::Render has run for a view (mid_car_end): the car's place among this frame's, and the sun's ray for it
@@ -3872,6 +5585,7 @@ static int shadow_car(Ctx &c, u32 info, const float pose[16], bool moves, const 
     // on: the Car is the CarRenderInfo's first word, its body at +52, the body's box at +8; the box has its count of points at +16
     // and the points at +32, 20 bytes each with x, y, z at +4 in the car's own space). Never smaller than it was for every car.
     double reach = kShadowReach, deep = kShadowDeep;
+    double car_across = 2.5, car_tall = 1.0;        // a car's, when its box cannot be read
     {
         const auto in_game = [](u32 a) { return a >= 0x100000 && a < 0x2000000 - 64 && !(a & 3); };
         const u32 car = in_game(info) ? LW(info) : 0, body = in_game(car) ? LW(car + 52) : 0, box = in_game(body) ? LW(body + 8) : 0;
@@ -3888,12 +5602,14 @@ static int shadow_car(Ctx &c, u32 info, const float pose[16], bool moves, const 
                 tall = std::max(tall, fabs((double)at[2] - 0.5));
             }
             if (sane) {
+                car_across = across, car_tall = tall;
                 reach = std::min(std::max(reach, across + tall + 0.3), 16.0);
                 deep = std::min(std::max(deep, sqrt(across * across + tall * tall) + 1.2), 18.0);
             }
         }
     }
     s.reach = reach, s.deep = deep;
+    s.radius = std::min(sqrt(car_across * car_across + car_tall * car_tall) + 0.3, 12.0);
     double *m = s.light;
     for (int k = 0; k < 3; k++) {
         m[k * 4 + 0] = right[k] / reach;
@@ -3905,6 +5621,8 @@ static int shadow_car(Ctx &c, u32 info, const float pose[16], bool moves, const 
     m[13] = -(mid[0] * up[0] + mid[1] * up[1] + mid[2] * up[2]) / reach;
     m[14] = (-(mid[0] * l[0] + mid[1] * l[1] + mid[2] * l[2]) + deep) / (2 * deep);
     m[15] = 1;
+    s.tunnel = lamps_tunnel(c, info, pose, l, s.roofed, s.roof_known);
+    lamps_pick(c, s, (int)g_shadow_cars.size());
     g_shadow_cars.push_back(s);
     return (int)g_shadow_cars.size() - 1;
 }
@@ -3989,10 +5707,50 @@ static void shadow_sun(ShadowCar &s, u32 id)
     n.soft = (float)(kShadowSoftMost * softer / (2.0 * s.reach));
     n.low = (float)(kShadowSoftLeast / (2.0 * s.reach));
     n.high = (float)(kShadowSoftRise * softer * s.deep / s.reach);      // a metre along the ray is 1 / (2 deep) of the third
+    n.metres[0] = (float)(2.0 * s.reach), n.metres[1] = (float)(2.0 * s.deep);   // the cell in metres (native_shadow.frag: what faces the sun)
     ShadowFrom from;
     if (!shadow_matrices(n, s, space, id, from)) {
         s.made &= ~(1u << id);
         return;
+    }
+    g_frame.shadows.push_back(n);
+    g_shadow_from.push_back(from);
+}
+
+static bool shadow_box(const double from[16], double z0, double z1, double box[4]);
+
+// this view's shadow of the car's tunnel lamps, once: the players' views and the mirror. Its `to` takes the picture to the world;
+// where it can fall is worked out here: the car and kLampFade metres about it, from 3 metres under it to 4 over
+static void shadow_lamps(ShadowCar &s, u32 id)
+{
+    if (s.block < 0 || (id != 1 && id != 2 && id != 7) || (s.lamp_made >> id) & 1) return;
+    s.lamp_made |= 1u << id;
+    static const double identity[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    NativeShadow n = {};
+    n.kind = 3;
+    n.block = (u32)s.block * 22;
+    ShadowFrom from;
+    if (!shadow_matrices(n, s, identity, id, from)) return;
+    const double r = s.radius + kLampFade, lo[3] = {s.pose[12] - r, s.pose[13] - r, s.pose[14] - 3.0};
+    double cube[16] = {2 * r, 0, 0, 0, 0, 2 * r, 0, 0, 0, 0, 7.0, 0, lo[0], lo[1], lo[2], 1};       // the unit cube to that box
+    double now_m[16], mid_m[16], now[4], mid[4];
+    n.box[0] = n.box[1] = -1, n.box[2] = n.box[3] = 1;
+    mul_d(now_m, from.now, cube);
+    if (shadow_box(now_m, 0.0, 1.0, now)) {
+        bool good = true;
+        if (from.has_mid) {
+            mul_d(mid_m, from.mid, cube);
+            good = shadow_box(mid_m, 0.0, 1.0, mid);
+            for (int k = 0; k < 4 && good; k++) {
+                const double before = 2 * mid[k] - now[k];
+                now[k] = k < 2 ? std::min(now[k], std::min(mid[k], before)) : std::max(now[k], std::max(mid[k], before));
+            }
+        }
+        if (good) {
+            const double mx = 0.02 + 0.05 * (now[2] - now[0]), my = 0.02 + 0.05 * (now[3] - now[1]);
+            n.box[0] = (float)std::max(now[0] - mx, -1.0), n.box[1] = (float)std::max(now[1] - my, -1.0);
+            n.box[2] = (float)std::min(now[2] + mx, 1.0), n.box[3] = (float)std::min(now[3] + my, 1.0);
+        }
     }
     g_frame.shadows.push_back(n);
     g_shadow_from.push_back(from);
@@ -4010,9 +5768,10 @@ static void shadow_caster()
         float sunlight;
         memcpy(&sunlight, host(g_light_ctx + 212), 4);
         const float amount = !(sunlight >= 0.4f) ? 0.0f : sunlight <= 1.0f ? (sunlight - 0.4f) / 0.6f : 1.0f;
-        s.strength = 90.0f * amount / 128.0f;
+        s.strength = 90.0f * amount / 128.0f * (1.0f - s.tunnel);      // none in a tunnel (Very High and Ultra: lamps_tunnel)
     }
     shadow_sun(s, id);
+    shadow_lamps(s, id);
     const NativeDraw &d = g_frame.draws.back();
     // Glass (2026-11-17, the user: the shadow could take the light through the glass into account). What blends over the picture
     // by its alpha is the car's glass: it casts too, into a half of the map of its own, and where a ray meets nothing of the car
@@ -4020,9 +5779,8 @@ static void shadow_caster()
     // body's shadow is all there is, as before.
     const bool glass = d.blend == NB_ALPHA;
     if (s.cell < 0 || (d.blend != NB_OPAQUE && !glass)) return;
-    if (!s.cast_target) s.cast_target = id;
-    if (s.cast_target != id) return;
-    NativeShadowCaster k;
+    g_caster_of.push_back({(u16)g_owner->car, (u8)id});      // (the draw has no vertices yet: counted at the frame's end)
+    NativeShadowCaster k = {};
     k.draw = (u32)g_frame.draws.size() - 1;
     k.cell = (u16)s.cell;
     k.glass = glass ? 1 : 0;
@@ -4031,11 +5789,35 @@ static void shadow_caster()
     mul_d(clip, s.light, local);
     for (int i = 0; i < 16; i++) k.clip[i] = (float)clip[i];
     g_frame.casters.push_back(k);
+    // and into the cells of its lamps (the body alone: no glass in them)
+    if (glass) return;
+    for (int i = 0; i < s.lamps; i++) {
+        g_caster_of.push_back({(u16)g_owner->car, (u8)id});
+        NativeShadowCaster q = {};
+        q.draw = k.draw;
+        q.cell = (u16)(kShadowCells + s.lamp[i].cell);
+        q.glass = 0;
+        mul_d(clip, s.lamp[i].clip, local);
+        for (int j = 0; j < 16; j++) q.clip[j] = (float)clip[j];
+        g_frame.casters.push_back(q);
+    }
 }
+
+// A test on the user's word (2026-11-26: "take away the static shadow's texture, to see what is there" under the car, with the
+// Ambient Occlusion on): the patch under a car (<car>_SHADOWIG) is left out of the race's views at every Shadows level, neither the
+// game's polygon nor the port's own. The sun's shadow stays. Back to false when the user says so (he did, the same day: the patch is
+// back; AO had given no shade under the car, so it was taken off round the cars and kept on their bodies, ПОРА111).
+static const bool kNoPatchTest = false;
 
 // A POLY3D node of the lists: one of a car's two shadows? True: the port draws it its own way, the polygon is left out.
 static bool shadow_poly(u32 node)
 {
+    if (kNoPatchTest && g_texture && g_target && pc_racing()) {
+        const u32 view = LW(g_target);
+        const char *name = (const char *)host(g_texture + 8);
+        const size_t len = strnlen(name, 40);
+        if ((view == 1 || view == 2 || view == 7) && len > 9 && len < 40 && !strcmp(name + len - 9, "_SHADOWIG")) return true;
+    }
     if (!shadows_level() || !g_texture || !g_target || !g_pack || !g_owner || g_owner->car < 0 || (size_t)g_owner->car >= g_shadow_cars.size()) return false;
     const u32 id = LW(g_target);
     if (id != 1 && id != 2 && id != 7) return false;
@@ -4192,6 +5974,30 @@ static bool shadow_box(const double from[16], double z0, double z1, double box[4
 static void shadow_end()
 {
     g_frame.shadow_level = (u8)shadows_level();
+    // each car into the map by one view's draws: the view with the most of it (g_caster_of); a player's view before the mirror
+    if (g_caster_of.size() == g_frame.casters.size()) {
+        // A draw is written down as it begins and gets its vertices after: they are counted here, with the frame all read.
+        // (Counted at the draw's start they were all 0: no view had "the most", every car's draws were dropped and no car
+        // had a shadow from the sun at all - the user, 2026-11-23, after the first version of this.)
+        for (ShadowCar &car : g_shadow_cars) memset(car.cast_verts, 0, sizeof car.cast_verts);
+        for (size_t i = 0; i < g_frame.casters.size(); i++) {
+            const CasterOf &of = g_caster_of[i];
+            const u32 draw = g_frame.casters[i].draw;
+            if (of.car < g_shadow_cars.size() && of.target < 16 && draw < g_frame.draws.size())
+                g_shadow_cars[of.car].cast_verts[of.target] += g_frame.draws[draw].count;
+        }
+        size_t kept = 0;
+        for (size_t i = 0; i < g_frame.casters.size(); i++) {
+            const CasterOf &of = g_caster_of[i];
+            if (of.car >= g_shadow_cars.size()) continue;
+            const ShadowCar &s = g_shadow_cars[of.car];
+            u32 best = 0;
+            for (u32 id : {1u, 2u, 7u})
+                if (s.cast_verts[id] > (best ? s.cast_verts[best] : 0u)) best = id;
+            if (of.target == best || !best) g_frame.casters[kept++] = g_frame.casters[i];
+        }
+        g_frame.casters.resize(kept);
+    }
     // the mirror's shadows: before the draw its first shadow polygon stood at; with no such polygon, before the first of its draws
     // that blends and writes no depth (the smoke, the flares, the glass); with none of those, after all of it
     g_frame.rvm_shadow_at = g_shadow_rvm_at;
@@ -4213,6 +6019,7 @@ static void shadow_end()
     const bool known = g_shadow_from.size() == g_frame.shadows.size();
     for (size_t i = 0; i < g_frame.shadows.size(); i++) {
         NativeShadow &s = g_frame.shadows[i];
+        if (s.kind == 3) continue;                  // the lamps': shadow_lamps has it
         s.box[0] = s.box[1] = -1, s.box[2] = s.box[3] = 1;
         if (!known) continue;
         const ShadowFrom &f = g_shadow_from[i];
@@ -4253,10 +6060,12 @@ static void shadow_end()
 // A race's views are shaded where surfaces meet, from the picture's own depth (native_ao.frag). It goes over the picture after the
 // last of a view's draws that are solid, before all that is transparent and before the cars' shadows: the smoke, the glass and
 // the shadows' edges are drawn over it, untouched by it. The first one (removed 2026-11-14) went over the finished picture.
+// Cars shade nothing round them (the user, 2026-11-26, code word ПОРА111: "a big halo round the car"; their bodies keep their
+// shade): at a view's first draw of a car's (NativeDraw::car) its depth is copied, FX_AO_WORLD, and the road and the walls are
+// shaded by that, a world with no car in it; a car's own pixels by the whole depth (native_ao.frag).
 static void ao_end()
 {
-    static const char *env = getenv("HP2_AO");
-    if (!(env ? atoi(env) : g_cfg.ao) || !pc_racing()) return;
+    if (!ao_on()) return;
     for (u32 id = 1; id <= 2; id++) {
         u32 at = 0;
         for (size_t i = 0; i < g_frame.draws.size(); i++) {
@@ -4294,6 +6103,21 @@ static void ao_end()
         f.rect[2] = (float)(s32)LW(target + 0x1c);
         f.rect[3] = (float)(s32)LW(target + 0x20);
         for (int i = 0; i < 16; i++) f.m[i] = (float)to[i];
+        // the world's depth, before the view's first car (a world draw after it counts as a car's: it is shaded, it shades nothing)
+        for (u32 i = 0; i < at; i++) {
+            const NativeDraw &d = g_frame.draws[i];
+            if (d.target != id || !d.count || !d.car) continue;
+            NativeFx w = {};
+            w.at = i;
+            w.kind = FX_AO_WORLD;
+            w.target = (u8)id;
+            memcpy(w.rect, f.rect, sizeof w.rect);
+            size_t before = 0;
+            while (before < g_frame.fx.size() && g_frame.fx[before].at < i) before++;
+            g_frame.fx.insert(g_frame.fx.begin() + before, w);
+            f.world = true;
+            break;
+        }
         size_t where = 0;                   // before what else is laid over the picture at that draw: the shadows, the fog
         while (where < g_frame.fx.size() && g_frame.fx[where].at < at) where++;
         g_frame.fx.insert(g_frame.fx.begin() + where, f);
@@ -4345,6 +6169,41 @@ void HOOK_eAttachBlackAndWhite__FP9eDmaChainUiUi(Ctx &c, void (*orig)(Ctx &))
 
 // The sun's flare looks at the Z buffer over the sun: the queue's rects go to where the game wants them, from the last frame's depth, as the
 // GS's frame was the last one by then too. The rest is FetchVRAM's own: the stage moves to the list of those done.
+//
+// When, 2026-11-26. On the PS2 FetchVRAM came from the render stage queue's interrupt, once the GS had drawn the frame, and the game
+// was at the next one meanwhile. Here it comes at the hand-over, and it waited there for the renderer's thread and then for the
+// GPU to finish the whole frame: the game and the card took turns, a frame's time was the one's and the other's added. But the words
+// are read by one function only, StuffSun (0x1252b0: it counts the sky's pixels of its view's 32 x 32 at 0x2e03d0 + 4112 a view,
+// then asks for the next rects; nothing else addresses that buffer), at the start of the player's view of the NEXT frame. So
+// FetchVRAM now only notes which rect goes where, and the words are fetched when StuffSun is about to read them (HOOK_StuffSun),
+// or at the latest before the next hand-over (native_end_frame: after it the renderer would put the next frame's rects in their
+// place). The same rects of the same frame into the same words as before, only later: the world's step, the culling, the
+// reflections' views run while the GPU draws. And the GPU says when the rects are copied, before the frame's last passes
+// (native_vk.cpp, depth_send_early), so that wait is shorter still.
+// HP2_DEPTHLATE=0: fetched here, as it was. The queue (hand_over) keeps its own way: no wait, the last frame the renderer has done.
+static const bool g_depth_late = !(getenv("HP2_DEPTHLATE") && atoi(getenv("HP2_DEPTHLATE")) == 0);
+struct DepthWant {
+    u32 to;                                 // where the game wants the words
+    NativeDepthRect r;
+};
+static std::vector<DepthWant> g_depth_wants;
+static u32 g_depth_want_of;                 // the frame they are of (NativeFrame::handed)
+
+static void depth_fill(const DepthWant &w, bool idle)
+{
+    static std::vector<uint32_t> words;
+    words.resize((size_t)w.r.w * w.r.h);
+    if (!words.empty() && native_vk_depth(w.r, words.data(), idle)) memcpy(host(w.to), words.data(), words.size() * 4);
+}
+
+static void depth_settle()
+{
+    if (g_depth_wants.empty()) return;
+    if (native_depth_wait(g_depth_want_of))
+        for (const DepthWant &w : g_depth_wants) depth_fill(w, true);
+    g_depth_wants.clear();
+}
+
 void HOOK_FetchVRAM__FP12eRenderStage(Ctx &c, void (*orig)(Ctx &))
 {
     (void)orig;
@@ -4358,12 +6217,28 @@ void HOOK_FetchVRAM__FP12eRenderStage(Ctx &c, void (*orig)(Ctx &))
         SW(done + 4, n);
         SW(n + 4, tail);
         SW(n, done);
-        NativeDepthRect r = {(int)LH(n + 20), (int)LH(n + 22), (int)LH(n + 24), (int)LH(n + 26)};
-        static std::vector<uint32_t> words;
-        words.resize((size_t)r.w * r.h);
-        native_render_wait();               // the last frame is the one handed over a moment ago: till it is with the GPU
-        if (!words.empty() && native_vk_depth(r, words.data())) memcpy(host(LW(n + 8)), words.data(), words.size() * 4);
+        const DepthWant w = {LW(n + 8), {(int)LH(n + 20), (int)LH(n + 22), (int)LH(n + 24), (int)LH(n + 26)}};
+        // With the queue (hand_over) the game does not wait for the renderer here: the depth is that of the last frame the renderer
+        // has done, a frame older
+        if (g_queue_now) {
+            depth_fill(w, false);
+        } else if (g_depth_late) {
+            if (g_depth_wants.empty()) g_depth_want_of = g_hand_count;
+            else if (g_depth_want_of != g_hand_count) depth_settle(), g_depth_want_of = g_hand_count;     // (not to be: settled at the hand-over)
+            g_depth_wants.push_back(w);
+        } else {
+            // the last frame is the one handed over a moment ago: till it is with the GPU
+            native_render_wait();
+            depth_fill(w, true);
+        }
     }
+}
+
+// the words StuffSun is about to read: fetched now (HOOK_FetchVRAM)
+void HOOK_StuffSun__FP5eView(Ctx &c, void (*orig)(Ctx &))
+{
+    depth_settle();
+    orig(c);
 }
 
 // A Flailer poly's box: the polys are a list at +36 of a strip, their vertices' x and y at +0x10 and +0x14 of each 16 bytes
@@ -4470,8 +6345,32 @@ void HOOK_Render__12FlailerStripP5eView(Ctx &c, void (*orig)(Ctx &))
     }
     for (StripSpan &s : g_strip_spans)
         if (s.whole > 1e8f) s.whole = (s.x0 + s.x1) / 2;   // a strip the lines did not see (drawn outside RenderLayer)
+    // whose packets these are (g_packet_who): the strip's object; a strip chained to this one renders inside this call and counts on
+    const u64 group_was = g_hud_group;
+    const u32 index_was = g_hud_index;
+    const bool outer = g_hud_strips++ == 0;
+    if (outer) {
+        const u32 object = LW(strip + 8);
+        g_hud_group = hud_group(1, object, g_hud_times[object]++);
+        g_hud_index = 0;
+        const u32 across = object ? LW(object + 48) : 0;
+        memcpy(&g_hud_x, &across, 4);
+    }
     orig(c);
+    g_hud_strips--;
+    if (outer) g_hud_group = group_was, g_hud_index = index_was;
     g_strip_spans.clear();
+}
+
+// TrackMap::Render (0x1bade8): the map on the HUD, its pieces and the cars' markers. Its packets are the map's (g_packet_who).
+void HOOK_Render__8TrackMap(Ctx &c, void (*orig)(Ctx &))
+{
+    const u64 group_was = g_hud_group;
+    const u32 index_was = g_hud_index;
+    g_hud_group = hud_group(2, c.r[4].w[0], 0);
+    g_hud_index = 0;
+    orig(c);
+    g_hud_group = group_was, g_hud_index = index_was;
 }
 
 static u32 g_added_strips;                  // strips handed to the lists: HP2_LODLOG takes a car's share of them
@@ -4480,7 +6379,16 @@ void HOOK_AddData__12eDmaDataListUsPvUsUs(Ctx &c, void (*orig)(Ctx &))
 {
     if ((c.r[5].w[0] & 0xffff) == EDMA_STRIP) g_added_strips++;
     if (!g_strip_spans.empty() && (c.r[5].w[0] & 0xffff) == EDMA_DIRECT) g_packet_spans[c.r[6].w[0]] = g_strip_spans;
+    if (g_hud_group && (c.r[5].w[0] & 0xffff) == EDMA_DIRECT) g_packet_who[c.r[6].w[0]] = {g_hud_group, g_hud_index++, g_hud_x};
+    if (g_printf_now && (c.r[5].w[0] & 0xffff) == EDMA_DIRECT) g_packet_edge[c.r[6].w[0]] = true;
     orig(c);
+}
+
+void HOOK_RenderScreenPrintf(Ctx &c, void (*orig)(Ctx &))
+{
+    g_printf_now = true;
+    orig(c);
+    g_printf_now = false;
 }
 
 // Wider than the PS2's: the projection takes less of x for the same pixels, and the clip volume, which the game culls by, takes more.
@@ -4542,6 +6450,24 @@ static inline void rs_set(u32 gp, u32 list, u32 field, u32 stat, u32 value, u32 
     rs_add_data(gp, list, type, value, qwords, parameter);
 }
 
+// a run's node: AddData's, of the port's kind. False: no room in the frame's memory
+static inline bool rs_add_run(u32 gp, u32 list, u32 run, u32 strips, u32 parameter)
+{
+    const u32 pos = LW(gp - 19388), end = LW(gp - 19384), next = pos + 16;
+    if (!((u64)(s64)(s32)next < (u64)(s64)(s32)end)) return false;
+    SW(gp - 19388, next);
+    const u32 tail = LW(list + 4);
+    SH(pos + 4, (u16)EDMA_RUN);
+    SW(tail, pos);
+    SH(pos + 6, (u16)parameter);
+    SH(pos + 8, (u16)strips);
+    SH(pos + 10, (u16)g_frame_no);
+    SW(pos + 12, run);
+    SW(list + 4, pos);
+    SW(pos, 0);
+    return true;
+}
+
 static void render_strips_native(Ctx &c)
 {
     const u32 self = c.r[4].w[0], local_world = c.r[5].w[0], light_context = c.r[6].w[0], flags = c.r[7].w[0], blend = c.r[8].w[0];
@@ -4577,6 +6503,33 @@ static void render_strips_native(Ctx &c)
     const u32 textures = LW(solid + 184);
     u32 run = 0x2d0c80, strip = LW(run), count = 0, last_active = 0;
     const u32 alpha_list = 0x2c94a8 + target_id * 12, list_off = (target_id << 5) + 16;
+    // The direct output (above): the strips known by their address, one after another into one list, are held back as a run (out)
+    // and handed out as one node when anything else is to go into that list, or a function of the game's is to run.
+    // A car's strips too (2026-11-24; HP2_DIRECTCARS=0: a node a strip, as before). All a car's draws need of the list is the
+    // node's address (whose car: mid_owner_of) and the draw itself (its shadow, its move between two pictures), and a run's node
+    // lies in the car's part of the frame's memory as its strips' nodes did. Not the player's own car in the player's view while
+    // its mirrors may show the mirror's picture: a glass is told from the other strips one by one as the list is read
+    // (mirror_glass_now).
+    static const bool cars_direct = !(getenv("HP2_DIRECTCARS") && atoi(getenv("HP2_DIRECTCARS")) == 0);
+    const bool glass_car = g_in_car_render && g_cfg.side_mirrors && g_cfg.reflections && target_id == 1 && g_car_now && g_car_now == pc_player_car() &&
+                           !pc_two_player_race();
+    const bool direct = direct_on() && !blend && (!g_in_car_render || (cars_direct && !glass_car));
+    DirectRun out = {};
+    u32 out_list = 0, out_parameter = 0;
+    const auto hand_out = [&] {
+        if (!out.strips) return;
+        if (rs_add_run(gp, out_list, (u32)g_runs.size(), out.strips, out_parameter)) {
+            g_runs.push_back(out);
+            g_added_strips += out.strips;
+            g_direct_strips += out.strips;
+            g_direct_runs++;
+        } else {                            // no room for the node: a node a strip, which says so the game's way
+            for (u32 i = 0; i < out.strips; i++) rs_add_data(gp, out_list, EDMA_STRIP, g_run_strips[out.strip0 + i].data, g_run_strips[out.strip0 + i].qwords, out_parameter);
+            g_run_strips.resize(out.strip0);
+            g_run_ranges.resize(out.range0);
+        }
+        out = {};
+    };
     while (strip) {
         const u32 info = LW(textures + ((u32)(s32)(s8)LB(strip) << 3) + 4);
         const u32 data = LW(strip + 8);
@@ -4593,11 +6546,13 @@ static void render_strips_native(Ctx &c)
             run += 8;
             next = LW(run);
         }
+        if (direct && next) __builtin_prefetch(strip_seen(LW(next + 8)));       // the next strip's line of the table by address
         bool draw = !(strip_flags & 1024);
         if (opaque_off && alpha) draw = false;
         if (alpha_only && !alpha) draw = false;
         if (draw) {
             u32 active = LW(info + 152);
+            if (!active || alpha) hand_out();
             if (!active) {
                 g_rs_made++;
                 rs_arg(c, 4, info);
@@ -4633,7 +6588,9 @@ static void render_strips_native(Ctx &c)
                 }
             }
             if (list) {
+                if (out.strips && list != out_list) hand_out();
                 if (active != last_active || alpha) {
+                    if (out.strips && (LW(list + 16) != local_world || (light_context && LW(list + 12) != light_context))) hand_out();
                     rs_set(gp, list, 16, 0x2c85f0, local_world, EDMA_SET_LOCAL_WORLD, 4, 840);
                     if (light_context) rs_set(gp, list, 12, 0x2c85e0, light_context, EDMA_LIGHTCONTEXT, 18, 860);
                     last_active = active;
@@ -4643,6 +6600,7 @@ static void render_strips_native(Ctx &c)
                     const s32 index = (s8)LB(strip + 31);
                     if (index >= 0 && index < (s32)(s16)LH(solid + 174)) material = LW(materials + ((u32)index << 3) + 4);
                 }
+                if (out.strips && LW(list + 8) != material) hand_out();
                 rs_set(gp, list, 8, 0x2c85d0, material, EDMA_LIGHTMATERIAL, 4, 852);
                 const u32 parameter = (strip_flags | tex_bit | (pass == 1 ? 512 : 0)) & ~mask;
                 if (blend) {
@@ -4668,6 +6626,34 @@ static void render_strips_native(Ctx &c)
                         SW(gp - 19372, 1);
                         SW(gp - 19368, failed + bytes);
                     }
+                } else if (direct && !alpha) {
+                    const StripSeen *seen = strip_seen(data);
+                    const u64 stamp = memwatch_stamp(data, qwords * 16);
+                    if (seen->fast && seen->data == data && seen->qwords == qwords && seen->generation == g_strip_generation && seen->stamp == stamp) {
+                        if (out.strips && (out_parameter != parameter || out.strips >= 60000)) hand_out();
+                        if (!out.strips) {
+                            out.range0 = (u32)g_run_ranges.size();
+                            out.strip0 = (u32)g_run_strips.size();
+                            out.generation = g_strip_generation;
+                            out_list = list;
+                            out_parameter = parameter;
+                        }
+                        const CachedStrip &at = seen->strip;
+                        if (out.ranges && g_run_ranges.back().first + g_run_ranges.back().count == at.base) {
+                            g_run_ranges.back().count += at.count;
+                        } else {
+                            g_run_ranges.push_back({at.base, at.count});
+                            out.ranges++;
+                        }
+                        g_run_strips.push_back({data, qwords});
+                        out.strips++;
+                        out.tris += at.count;
+                        out.verts += at.n;
+                        out.sum += (stamp >> 32) + (u32)stamp;
+                    } else {
+                        hand_out();
+                        rs_add_data(gp, list, EDMA_STRIP, data, qwords, parameter);
+                    }
                 } else {
                     rs_add_data(gp, list, EDMA_STRIP, data, qwords, parameter);
                 }
@@ -4677,6 +6663,7 @@ static void render_strips_native(Ctx &c)
         count++;
         if ((s32)count > 999998) break;
     }
+    hand_out();
     rs_arg(c, 29, sp + 256);
     c.r[31].d[0] = ra;
     rs_arg(c, 2, count);
@@ -5710,7 +7697,6 @@ static u64 g_lod_scenery, g_lod_scenery_bare;
 // high, and it goes dull in plain sight. With Level of Detail at Maximum the flag is taken off again, unless the caller of Render asked
 // for it itself (its own flags, the tenth argument).
 void F_00107600(Ctx &c);
-static bool g_in_car_render, g_car_asked_plain;
 static bool g_car_size_next;                // the next GetPixelSize is CarRenderInfo::Render's own, of the car
 
 // A car is not drawn under 4 pixels of the GS's (0x120f90). The draw distance takes the size as larger for the players' views, as it does
@@ -5740,12 +7726,15 @@ void HOOK_Render__6eModelP8bMatrix4P13eLightContextUi(Ctx &c, void (*orig)(Ctx &
 void HOOK_Render__13CarRenderInfoP5eViewPC8bVector3PC8bMatrix4P8bMatrix4T4Uii(Ctx &c, void (*orig)(Ctx &))
 {
     const bool was_in = g_in_car_render, was_plain = g_car_asked_plain;
+    const u32 was_car = g_car_now;
     g_in_car_render = true;
     g_car_asked_plain = (c.r[10].w[0] & 1) != 0;
+    g_car_now = c.r[4].w[0] ? LW(c.r[4].w[0]) : 0;
     struct Leave {
         bool in, plain;
-        ~Leave() { g_in_car_render = in, g_car_asked_plain = plain; }
-    } leave{was_in, was_plain};
+        u32 car;
+        ~Leave() { g_in_car_render = in, g_car_asked_plain = plain, g_car_now = car; }
+    } leave{was_in, was_plain, was_car};
     // 120 pictures a second: what this call adds to the lists is this car's (mid_car_end)
     struct Owned {
         Ctx &c;
@@ -6429,11 +8418,594 @@ static void vis_ahead(VisAhead &v, u32 view, int slot)
     v.ready = true;
 }
 
+// ---- the scenery handed out by the port's own loop, the models' strips worked out by the workers (change 2, 2026-11-24) ----------
+// StuffScenery (0x150eb8) goes through a view's draw table, an entry a model: a light context made for a lit one, then eModel::Render,
+// which asks which strips are in sight (DetermineVisibleStrips) and hands them to the lists (RenderStrips). Three thousand models a
+// frame, one after another on the game's thread, though what a model hands out depends on nothing the others do.
+// So the loop is the port's here, in three steps. The table is read (the models that can be done this way: no animation, no back
+// face cone, no replaced textures). Then the workers make each model's plan, reading only: the strips in sight, as vis_ahead does,
+// and what render_strips_native would do with each, as items in the strips' order: a run of strips known by their address (the
+// direct output's, with its ranges of the vertex cache), a strip not known yet, an alpha strip. Then the game's thread goes through
+// the table as the game does, makes the light contexts, and for a planned model puts the plan's items into the lists: the list of
+// each item's texture, the state's nodes, the node. Everything the game's memory gets is what the game's loop with the direct output
+// leaves there, to the byte (HP2_STUFFCHECK=<n>: every n-th call is done both ways on the same memory and compared whole).
+// The other models (animated ones, a few) go through the game's eModel::Render where they stand in the table.
+// HP2_SCENERY=0: the game's loop. HP2_THREADS=0 or a short table: the plans are made on the game's thread, by the same code.
+void F_0010dc80(Ctx &c);                    // eModel::Render(matrix, light context, flags)
+void F_00115978(Ctx &c);                    // elSetupLightContext(context, matrix, world lights, view's position, view)
+
+enum { PLAN_RUN, PLAN_STRIP, PLAN_ALPHA };
+struct PlanItem {
+    u8 kind;
+    u16 parameter;                          // the node's
+    u32 info, material;                     // the strips' TextureInfo and eLightMaterial
+    u32 strip, data, qwords;                // a strip of its own: its record, its packet
+    DirectRun run;                          // a run: range0 and strip0 are places in the slot's arrays
+};
+struct PlanSlot {                           // a worker's own, or the game's thread's
+    std::vector<PlanItem> items;
+    std::vector<NativeRange> ranges;
+    std::vector<RunStrip> strips;
+    std::vector<VisRun> vis;
+};
+struct ScModel {
+    u32 model, matrix, flags;               // the table's entry: the matrix 0 is the world's own, the flags eModel::Render's
+    bool lit, planned;
+    u8 result;                              // DetermineVisibleStrips's
+    u16 slot;
+    u32 item0, items, vis0, vis_n, strips;
+};
+struct PlanEnv {
+    u32 view, culling_off, opaque_off, default_material;
+};
+static std::vector<PlanSlot> g_plan;
+static std::vector<ScModel> g_sc;
+static u64 g_sc_calls, g_sc_models, g_sc_planned, g_sc_checked, g_sc_bad;
+static const bool kSceneryDefault = true;   // on since 2026-11-24: the five demos in step, 455 calls the same as the game's loop to the byte
+
+static bool scenery_on()
+{
+    static const bool on = getenv("HP2_SCENERY") ? atoi(getenv("HP2_SCENERY")) != 0 : kSceneryDefault;
+    return on && direct_on();
+}
+
+// A model's plan. Reads the game's memory and the tables by address, writes its slot only.
+static void plan_model(ScModel &m, const PlanEnv &env, int slot)
+{
+    PlanSlot &ps = g_plan[(size_t)slot];
+    m.slot = (u16)slot;
+    m.item0 = (u32)ps.items.size();
+    m.vis0 = (u32)ps.vis.size();
+    m.items = m.vis_n = m.strips = 0;
+    m.result = 0;
+    const u32 solid = LW(m.model + 12);
+    const s32 n = (s32)(s16)LH(solid + 52);
+    if (m.flags & 4) {
+        // DetermineVisibleStrips(.., 2): SetAllStripsVisible, one run of them all
+        ps.vis.push_back({n ? LW(solid + 176) : 0, 2, (u16)n});
+        m.result = 1;
+    } else {
+        // DetermineVisibleStrips(.., 1), as vis_ahead has it
+        const u32 matrix = m.matrix ? m.matrix : 0x2dc380u;
+        float lo[3], hi[3], screen[16];
+        memcpy(lo, host(solid + 64), 12);
+        memcpy(hi, host(solid + 80), 12);
+        hot_mul_matrix(screen, matrix, LW(env.view + 80));
+        u32 klass = hot_classify_aabb_host(lo, hi, screen);
+        if (klass == 1) {
+            float clip[16];
+            hot_mul_matrix(clip, matrix, LW(env.view + 72));
+            klass = hot_classify_aabb_host(lo, hi, clip);
+        }
+        if (klass == 2) {
+            ps.vis.push_back({n ? LW(solid + 176) : 0, 2, (u16)n});
+            m.result = 1;
+        } else if (klass == 1) {
+            u32 strip = LW(solid + 176);
+            for (s32 i = 0; i < n; i++, strip += 64) {
+                float slo[3], shi[3];
+                memcpy(slo, host(strip + 16), 12);
+                memcpy(shi, host(strip + 32), 12);
+                const u32 c = hot_classify_aabb_host(slo, shi, screen);
+                if (c) ps.vis.push_back({strip, (u16)c, 1});
+            }
+            m.result = 1;
+        }
+    }
+    m.vis_n = (u32)ps.vis.size() - m.vis0;
+    if (!m.result) return;
+    // RenderStrips, what it decides of each strip (render_strips_native, statement for statement; the flags here are 0 or 4, no blend)
+    u32 mask = env.culling_off ? 256 : 0;
+    if (!m.lit) mask |= 448;
+    const u32 textures = LW(solid + 184), materials = LW(solid + 188);
+    const s32 material_n = (s32)(s16)LH(solid + 174);
+    for (u32 r = 0; r < m.vis_n; r++) {
+        const VisRun run = ps.vis[m.vis0 + r];
+        if (!run.strip) break;
+        for (u32 k = 0; k < run.count; k++) {
+            const u32 strip = run.strip + k * 64;
+            m.strips++;
+            if (k + 1 < run.count) __builtin_prefetch(strip_seen(LW(strip + 64 + 8)));
+            const u32 info = LW(textures + ((u32)(s32)(s8)LB(strip) << 3) + 4);
+            const u32 data = LW(strip + 8);
+            const u32 strip_flags = LH(strip + 14), qwords = LH(strip + 12);
+            const bool alpha = (s8)LB(info + 77) != 0;
+            const u32 tex_bit = (s8)LB(info + 116) ? 4 : 0;
+            if (strip_flags & 1024) continue;
+            if (env.opaque_off && alpha) continue;
+            u32 material = env.default_material;
+            if (materials) {
+                const s32 index = (s8)LB(strip + 31);
+                if (index >= 0 && index < material_n) material = LW(materials + ((u32)index << 3) + 4);
+            }
+            const u32 parameter = (strip_flags | tex_bit | (run.klass == 1 ? 512 : 0)) & ~mask;
+            PlanItem it = {};
+            it.parameter = (u16)parameter;
+            it.info = info;
+            it.material = material;
+            it.strip = strip;
+            it.data = data;
+            it.qwords = qwords;
+            if (alpha) {
+                it.kind = PLAN_ALPHA;
+                ps.items.push_back(it);
+                continue;
+            }
+            const StripSeen *seen = strip_seen(data);
+            const u64 stamp = memwatch_stamp(data, qwords * 16);
+            if (!(seen->fast && seen->data == data && seen->qwords == qwords && seen->generation == g_strip_generation && seen->stamp == stamp)) {
+                it.kind = PLAN_STRIP;
+                ps.items.push_back(it);
+                continue;
+            }
+            PlanItem *last = ps.items.size() > m.item0 ? &ps.items.back() : nullptr;
+            if (!last || last->kind != PLAN_RUN || last->info != info || last->material != material || last->parameter != (u16)parameter || last->run.strips >= 60000) {
+                it.kind = PLAN_RUN;
+                it.run.range0 = (u32)ps.ranges.size();
+                it.run.strip0 = (u32)ps.strips.size();
+                it.run.generation = g_strip_generation;
+                ps.items.push_back(it);
+                last = &ps.items.back();
+            }
+            DirectRun &out = last->run;
+            const CachedStrip &at = seen->strip;
+            if (out.ranges && ps.ranges.back().first + ps.ranges.back().count == at.base) {
+                ps.ranges.back().count += at.count;
+            } else {
+                ps.ranges.push_back({at.base, at.count});
+                out.ranges++;
+            }
+            ps.strips.push_back({data, qwords});
+            out.strips++;
+            out.tris += at.count;
+            out.verts += at.n;
+            out.sum += (stamp >> 32) + (u32)stamp;
+        }
+    }
+    m.items = (u32)ps.items.size() - m.item0;
+}
+
+// A planned model into the lists: what DetermineVisibleStrips and RenderStrips leave in the game's memory for it.
+static void replay_model(Ctx &c, const ScModel &m, u32 local_world, u32 light_context, u32 target_id, u32 view_matrix, u32 sp)
+{
+    const u32 gp = c.r[28].w[0];
+    const PlanSlot &ps = g_plan[m.slot];
+    // the table of the strips in sight, as RenderStrips leaves it: each run gone through, its count at 0
+    const u32 table = 0x2d0c80;
+    if (!m.result) {
+        SW(table, 0);
+        return;
+    }
+    const VisRun *vis = ps.vis.data() + m.vis0;
+    for (u32 i = 0; i < m.vis_n; i++) {
+        SW(table + i * 8, vis[i].strip);
+        SH(table + i * 8 + 4, vis[i].klass);
+        SH(table + i * 8 + 6, vis[i].strip ? 0 : vis[i].count);
+    }
+    SW(table + m.vis_n * 8, 0);
+    const u32 alpha_list = 0x2c94a8 + target_id * 12, list_off = (target_id << 5) + 16;
+    u32 last_active = 0;
+    const PlanItem *items = ps.items.data() + m.item0;
+    for (u32 i = 0; i < m.items; i++) {
+        const PlanItem &it = items[i];
+        const bool alpha = it.kind == PLAN_ALPHA;
+        u32 active = LW(it.info + 152);
+        if (!active) {
+            g_rs_made++;
+            rs_arg(c, 4, it.info);
+            c.r[31].d[0] = 0x10df6c;
+            F_00104df0(c);
+            active = c.r[2].w[0];
+        }
+        u32 list = active + list_off;
+        if (alpha) {
+            c.r[31].d[0] = 0x10df84;
+            F_00105158(c);
+            const u32 key = c.r[2].w[0];
+            if (key) {
+                g_rs_alpha++;
+                rs_arg(c, 4, sp);
+                rs_arg(c, 5, it.strip + 16);
+                rs_arg(c, 6, it.strip + 32);
+                rs_arg(c, 7, local_world);
+                rs_arg(c, 8, view_matrix);
+                c.r[31].d[0] = 0x10dfa4;
+                F_0010cbf8(c);
+                const u32 tail = LW(alpha_list + 4), keys = LW(alpha_list + 8), depth = LW(sp);
+                SW(tail, key);
+                SW(key + 12, depth);
+                SW(alpha_list + 8, keys + 1);
+                list = LW(key + 4);
+                SW(key + 8, active);
+                SW(key, 0);
+                SW(alpha_list + 4, key);
+            } else {
+                g_rs_no_key++;
+                list = 0;
+            }
+        }
+        if (!list) continue;
+        if (active != last_active || alpha) {
+            rs_set(gp, list, 16, 0x2c85f0, local_world, EDMA_SET_LOCAL_WORLD, 4, 840);
+            if (light_context) rs_set(gp, list, 12, 0x2c85e0, light_context, EDMA_LIGHTCONTEXT, 18, 860);
+            last_active = active;
+        }
+        rs_set(gp, list, 8, 0x2c85d0, it.material, EDMA_LIGHTMATERIAL, 4, 852);
+        if (it.kind != PLAN_RUN) {
+            rs_add_data(gp, list, EDMA_STRIP, it.data, it.qwords, it.parameter);
+            continue;
+        }
+        // the run's other strips asked for the same material, each a call and a hit of SetLightMaterial's counters
+        const u32 more = it.run.strips - 1;
+        SW(0x2c85d0, LW(0x2c85d0) + more);
+        SW(0x2c85d4, LW(0x2c85d4) + more);
+        const RunStrip *strips = ps.strips.data() + it.run.strip0;
+        if (rs_add_run(gp, list, (u32)g_runs.size(), it.run.strips, it.parameter)) {
+            DirectRun run = it.run;
+            run.range0 = (u32)g_run_ranges.size();
+            run.strip0 = (u32)g_run_strips.size();
+            g_run_ranges.insert(g_run_ranges.end(), ps.ranges.begin() + it.run.range0, ps.ranges.begin() + it.run.range0 + it.run.ranges);
+            g_run_strips.insert(g_run_strips.end(), strips, strips + it.run.strips);
+            g_runs.push_back(run);
+            g_added_strips += it.run.strips;
+            g_direct_strips += it.run.strips;
+            g_direct_runs++;
+        } else {
+            for (u32 k = 0; k < it.run.strips; k++) rs_add_data(gp, list, EDMA_STRIP, strips[k].data, strips[k].qwords, it.parameter);
+        }
+    }
+}
+
+static void stuff_scenery_native(Ctx &c)
+{
+    const u32 self = c.r[4].w[0], view = c.r[5].w[0], gp = c.r[28].w[0], sp0 = c.r[29].w[0];
+    const u64 ra = c.r[31].d[0];
+    g_sc_calls++;
+    // the view's part of the table: the cull info whose view this is, the first of them
+    u32 from = 0, to = 0;
+    const s32 infos = (s32)LW(self + 2080);
+    for (s32 i = 0; i < infos; i++) {
+        const u32 info = self + (u32)i * 208;
+        if (LW(info + 128) != view) continue;
+        from = LW(info + 136);
+        to = LW(info + 140);
+        break;
+    }
+    if (from >= to) return;
+    rs_arg(c, 29, sp0 - 160);               // the game's frame: what is called stands under it
+    c.r[31].d[0] = 0x10de08;
+    F_00105838(c);                          // eGetCurrentRenderTarget
+    const u32 target = c.r[2].w[0], target_id = LW(target);
+    c.r[31].d[0] = 0x10de48;
+    F_00107ca8(c);                          // eGetCurrentView
+    const u32 view_matrix = LW(c.r[2].w[0] + 68);
+    c.r[31].d[0] = 0x10de54;
+    F_00116a68(c);                          // elGetDefaultLightMaterial
+    PlanEnv env;
+    env.view = view;
+    env.culling_off = !LW(gp - 25040);
+    env.opaque_off = LW(target + 84);
+    env.default_material = c.r[2].w[0];
+    const u32 world_light = LW(view + 112), eye = LW(view + 56);
+    // 1. the table
+    g_sc.clear();
+    for (u32 e = from; e < to; e += 8) {
+        const u32 word = LW(e);
+        ScModel m = {};
+        m.model = word & ~3u;
+        m.matrix = LW(e + 4);
+        m.flags = (word & 3) == 2 ? 4 : 0;
+        const u32 solid = LW(m.model + 12);
+        m.lit = !m.matrix ? world_light != 0 : solid && (LH(solid + 50) & 0x1c0);
+        m.planned = solid && !(LW(solid + 168) && LH(m.model + 22)) && !LW(solid + 44) && !(LH(solid + 50) & 4096) && !LW(m.model + 16);
+        g_sc.push_back(m);
+    }
+    // 2. the plans
+    const size_t n = g_sc.size(), slots = (size_t)cores_workers() + 1;
+    if (g_plan.size() < slots) g_plan.resize(slots);
+    for (PlanSlot &ps : g_plan) ps.items.clear(), ps.ranges.clear(), ps.strips.clear(), ps.vis.clear();
+    if (g_strip_seen.empty()) strip_seen(0);        // the table made here, not by two workers at once
+    if (n >= 48 && cores_workers()) {
+        const size_t piece = 24;
+        jobs_each((int)((n + piece - 1) / piece), [&](int at, int slot) {
+            for (size_t k = (size_t)at * piece, end = std::min(n, k + piece); k < end; k++)
+                if (g_sc[k].planned) plan_model(g_sc[k], env, slot);
+        });
+    } else {
+        for (ScModel &m : g_sc)
+            if (m.planned) plan_model(m, env, 0);
+    }
+    // The textures the plans name that nothing has asked for lately (a race's first frame: every texture of the track at once,
+    // decoded one after another as the lists were read, 50 ms for 179 of them): decoded by the workers now (native_tex.cpp)
+    {
+        static std::vector<uint32_t> fresh;
+        fresh.clear();
+        for (const ScModel &m : g_sc) {
+            if (!m.planned) continue;
+            const PlanItem *items = g_plan[m.slot].items.data() + m.item0;
+            for (u32 i = 0; i < m.items; i++) {
+                const u32 info = items[i].info;
+                if (native_texture_recent(info, g_frame_no) || fresh.size() >= 1024) continue;
+                bool had = false;
+                for (size_t k = fresh.size(); k-- > 0 && !had;) had = fresh[k] == info;
+                if (!had) fresh.push_back(info);
+            }
+        }
+        if (fresh.size() >= 8) native_textures_ahead(fresh.data(), fresh.size(), g_frame_no);
+    }
+    // 3. the table's order: the light context of a lit model with a matrix of its own, then the model
+    for (const ScModel &m : g_sc) {
+        u32 local = m.matrix, light = 0;
+        if (!m.matrix) {
+            local = 0x2dc380;
+            light = world_light;
+        } else if (m.lit) {
+            const u32 pos = LW(gp - 19388), end = LW(gp - 19384), next = pos + 288;
+            if (!((u64)(s64)(s32)next < (u64)(s64)(s32)end)) {      // FRAME_MALLOC's failure: the model is left out
+                SW(gp - 19372, 1);
+                SW(gp - 19368, LW(gp - 19368) + 288);
+                continue;
+            }
+            SW(gp - 19388, next);
+            if (!pos) continue;
+            rs_arg(c, 4, pos);
+            rs_arg(c, 5, m.matrix);
+            rs_arg(c, 6, 0x2d70f0);
+            rs_arg(c, 7, eye + 64);
+            rs_arg(c, 8, view);
+            c.r[31].d[0] = 0x150fcc;
+            F_00115978(c);
+            light = pos;
+        }
+        g_sc_models++;
+        if (m.planned) {
+            g_sc_planned++;
+            rs_arg(c, 29, sp0 - 160 - 80 - 256);        // RenderStrips's frame under eModel::Render's: its room for a depth
+            replay_model(c, m, local, light, target_id, view_matrix, sp0 - 160 - 80 - 256);
+            rs_arg(c, 29, sp0 - 160);
+        } else {
+            rs_arg(c, 4, m.model);
+            rs_arg(c, 5, local);
+            rs_arg(c, 6, light);
+            rs_arg(c, 7, m.flags);
+            c.r[31].d[0] = 0x150fe0;
+            F_0010dc80(c);
+        }
+    }
+    rs_arg(c, 29, sp0);
+    c.r[31].d[0] = ra;
+}
+
+static void native_scenery_log()
+{
+    fprintf(g_hle_log, "native: scenery by the port's loop%s: %llu calls, %llu models, %llu of them planned (workers: %d); stuffcheck: %llu compared, %llu not the same\n",
+            scenery_on() ? "" : " (off)", (unsigned long long)g_sc_calls, (unsigned long long)g_sc_models, (unsigned long long)g_sc_planned, cores_workers(),
+            (unsigned long long)g_sc_checked, (unsigned long long)g_sc_bad);
+}
+
+// Both loops on the same memory (as render_strips_check): the game's with the direct output first, everything put back, then the
+// port's; the game's 32 MB, the PC's memory past them, the scratchpad and the runs they made compared whole.
+// The game's memory as it was, the pages that differ only: a page written though it is the same would lose its watch (memwatch.h),
+// and every strip on it would be unknown by its address to whatever runs next.
+static void put_back(const u8 *from, size_t total)
+{
+    for (size_t at = 0; at < total; at += 4096) {
+        const size_t n = std::min<size_t>(4096, total - at);
+        if (memcmp(g_ram + at, from + at, n)) memcpy(g_ram + at, from + at, n);
+    }
+}
+
+static void stuff_scenery_check(Ctx &c, void (*orig)(Ctx &))
+{
+    static std::vector<u8> before, after;
+    static u8 spr_before[0x4000], spr_after[0x4000];
+    const size_t total = 0x02000000 + (size_t)g_ext_size;
+    before.resize(total);
+    after.resize(total);
+    const Ctx c0 = c;
+    const u32 sp = c.r[29].w[0], strips0 = g_added_strips;
+    const size_t runs0 = g_runs.size(), ranges0 = g_run_ranges.size(), rstrips0 = g_run_strips.size();
+    const u64 dstrips0 = g_direct_strips, druns0 = g_direct_runs;
+    const bool eie = g_eie;
+    g_eie = false;
+    memcpy(before.data(), g_ram, total);
+    memcpy(spr_before, g_spr, sizeof spr_before);
+    orig(c);
+    const Ctx c1 = c;
+    memcpy(after.data(), g_ram, total);
+    memcpy(spr_after, g_spr, sizeof spr_after);
+    const std::vector<DirectRun> runs(g_runs.begin() + (long long)runs0, g_runs.end());
+    const std::vector<NativeRange> ranges(g_run_ranges.begin() + (long long)ranges0, g_run_ranges.end());
+    const std::vector<RunStrip> rstrips(g_run_strips.begin() + (long long)rstrips0, g_run_strips.end());
+    const u32 strips1 = g_added_strips;
+    const u64 dstrips1 = g_direct_strips, druns1 = g_direct_runs;
+    put_back(before.data(), total);
+    memcpy(g_spr, spr_before, sizeof spr_before);
+    g_runs.resize(runs0);
+    g_run_ranges.resize(ranges0);
+    g_run_strips.resize(rstrips0);
+    g_added_strips = strips0;
+    g_direct_strips = dstrips0;
+    g_direct_runs = druns0;
+    c = c0;
+    stuff_scenery_native(c);
+    g_sc_checked++;
+    const u8 *stack = host(sp);
+    auto dead = [&](const u8 *p) { return stack && p < stack && p >= stack - 0x1800; };
+    u32 differ = 0;
+    auto compare = [&](const u8 *mine, const u8 *game, size_t bytes, u32 guest, const char *name) {
+        if (!memcmp(mine, game, bytes)) return;
+        for (size_t i = 0; i < bytes; i += 4) {
+            if (!memcmp(mine + i, game + i, 4) || dead(mine + i)) continue;
+            if (differ++ < 8) {
+                u32 a, b;
+                memcpy(&a, mine + i, 4), memcpy(&b, game + i, 4);
+                fprintf(g_hle_log, "stuffcheck: %s %08x: the port's %08x, the game's %08x\n", name, guest + (u32)i, a, b);
+            }
+        }
+    };
+    compare(g_ram, after.data(), total, 0, "memory");
+    compare(g_spr, spr_after, sizeof spr_after, 0x70000000, "scratchpad");
+    for (int r : {16, 17, 18, 19, 20, 21, 22, 23, 28, 29, 30, 31})
+        if (c.r[r].d[0] != c1.r[r].d[0]) differ++, fprintf(g_hle_log, "stuffcheck: register %d: the port's %08x, the game's %08x\n", r, c.r[r].w[0], c1.r[r].w[0]);
+    bool same = g_runs.size() - runs0 == runs.size() && g_run_ranges.size() - ranges0 == ranges.size() && g_run_strips.size() - rstrips0 == rstrips.size() &&
+                g_added_strips == strips1 && g_direct_strips == dstrips1 && g_direct_runs == druns1;
+    for (size_t i = 0; same && i < runs.size(); i++) {
+        const DirectRun &a = g_runs[runs0 + i], &b = runs[i];
+        same = a.range0 == b.range0 && a.ranges == b.ranges && a.strip0 == b.strip0 && a.strips == b.strips && a.tris == b.tris && a.verts == b.verts &&
+               a.generation == b.generation && a.sum == b.sum;
+    }
+    for (size_t i = 0; same && i < ranges.size(); i++) same = g_run_ranges[ranges0 + i].first == ranges[i].first && g_run_ranges[ranges0 + i].count == ranges[i].count;
+    for (size_t i = 0; same && i < rstrips.size(); i++) same = g_run_strips[rstrips0 + i].data == rstrips[i].data && g_run_strips[rstrips0 + i].qwords == rstrips[i].qwords;
+    if (!same) differ++, fprintf(g_hle_log, "stuffcheck: the runs: the port's %zu with %zu ranges, the game's loop's %zu with %zu\n", g_runs.size() - runs0,
+                                 g_run_ranges.size() - ranges0, runs.size(), ranges.size());
+    if (differ) g_sc_bad++;
+    if (differ || g_sc_checked % 200 == 0)
+        fprintf(g_hle_log, "stuffcheck: %llu calls compared, %llu not the same (this one: %u differences, %zu models, %zu runs)\n", (unsigned long long)g_sc_checked,
+                (unsigned long long)g_sc_bad, differ, g_sc.size(), runs.size()),
+            fflush(g_hle_log);
+    // the game goes on with its own loop's outcome
+    put_back(after.data(), total);
+    memcpy(g_spr, spr_after, sizeof spr_after);
+    g_runs.resize(runs0);
+    g_run_ranges.resize(ranges0);
+    g_run_strips.resize(rstrips0);
+    g_runs.insert(g_runs.end(), runs.begin(), runs.end());
+    g_run_ranges.insert(g_run_ranges.end(), ranges.begin(), ranges.end());
+    g_run_strips.insert(g_run_strips.end(), rstrips.begin(), rstrips.end());
+    g_added_strips = strips1;
+    g_direct_strips = dstrips1;
+    g_direct_runs = druns1;
+    c = c1;
+    g_eie = eie;
+}
+
+// ---- do the cars depend on one another within a phase of the world's step? (a diagnostic, 2026-11-24) -------------------------
+// World::DoTimestep (0x14dcd8) runs each of its phases as a loop over the cars: Car::Think, Drive, BeginMovement, FinishMovement.
+// Whether such a loop could be given to several threads is first of all whether its calls depend on their order. HP2_ORDERCHECK=<n>:
+// every n-th step, when a phase's loop comes to its first car, the whole loop is run here in the game's order, the memory put back,
+// run again in the reverse order, and the two outcomes compared: every word that differs is something one car's call leaves for
+// another's, or a place they all write (a scratch buffer, a counter). The memory is put back once more and the game runs its loop
+// as ever. The words are counted by address and written to the log at the end of each 20 comparisons.
+// The port's own state outside the game's memory (the hooks' statics, the sound's queue) is not put back: the run is a
+// diagnostic's, its replay may go out of step.
+void native_order_check(Ctx &c, void (*orig)(Ctx &), int which)
+{
+    static const int every = getenv("HP2_ORDERCHECK") ? atoi(getenv("HP2_ORDERCHECK")) : 0;
+    if (every <= 0) return;
+    static bool inside;
+    if (inside) return;
+    const u32 world = c.r[17].w[0];         // the caller's s1
+    if (!world || world >= 0x02000000) return;
+    // the cars of the phase, in the loop's order: Think goes by four parts of the list (+32, +36, +40), the others from 0 to +28
+    const s32 all = (s32)LW(world + 28), a = (s32)LW(world + 32), b = (s32)LW(world + 36), d = (s32)LW(world + 40);
+    if (all < 2 || all > 256) return;
+    std::vector<u32> cars;
+    auto take = [&](s32 from, s32 to) {
+        for (s32 i = from; i < to; i++) cars.push_back(LW(world + 44 + (u32)i * 4));
+    };
+    if (which == 0) take(a, b), take(d, all), take(0, a), take(b, d);
+    else take(0, all);
+    if (cars.size() < 2 || c.r[4].w[0] != cars[0]) return;
+    static const char *const kName[4] = {"Think", "Drive", "BeginMovement", "FinishMovement"};
+    static u64 steps[4], done[4], differed[4];
+    if (steps[which]++ % (u64)every) return;
+    static std::unordered_map<u32, u32> places[4];
+    static std::vector<u8> before, forward;
+    static u8 spr_before[0x4000], spr_forward[0x4000];
+    const size_t total = 0x02000000 + (size_t)g_ext_size;
+    before.resize(total);
+    forward.resize(total);
+    const Ctx c0 = c;
+    const bool eie = g_eie;
+    g_eie = false;
+    inside = true;
+    memcpy(before.data(), g_ram, total);
+    memcpy(spr_before, g_spr, sizeof spr_before);
+    for (size_t i = 0; i < cars.size(); i++) {
+        c = c0;
+        c.r[4].d[0] = (u64)(s64)(s32)cars[i];
+        orig(c);
+    }
+    memcpy(forward.data(), g_ram, total);
+    memcpy(spr_forward, g_spr, sizeof spr_forward);
+    put_back(before.data(), total);
+    memcpy(g_spr, spr_before, sizeof spr_before);
+    for (size_t i = cars.size(); i-- > 0;) {
+        c = c0;
+        c.r[4].d[0] = (u64)(s64)(s32)cars[i];
+        orig(c);
+    }
+    const u8 *stack = host(c0.r[29].w[0]);
+    u32 differ = 0;
+    for (size_t at = 0; at < total; at += 4096) {
+        if (!memcmp(g_ram + at, forward.data() + at, std::min<size_t>(4096, total - at))) continue;
+        for (size_t i = at; i < at + 4096 && i < total; i += 4) {
+            if (!memcmp(g_ram + i, forward.data() + i, 4)) continue;
+            if (stack && g_ram + i < stack && g_ram + i >= stack - 0x4000) continue;       // the dead stack under the caller
+            differ++;
+            if (places[which].size() < 20000 || places[which].count((u32)i)) places[which][(u32)i]++;
+        }
+    }
+    for (size_t i = 0; i < sizeof spr_before; i += 4)
+        if (memcmp(g_spr + i, spr_forward + i, 4) && !(stack && g_spr + i < stack && g_spr + i >= stack - 0x4000)) differ++, places[which][0x70000000u + (u32)i]++;
+    done[which]++;
+    differed[which] += differ != 0;
+    put_back(before.data(), total);
+    memcpy(g_spr, spr_before, sizeof spr_before);
+    c = c0;
+    g_eie = eie;
+    inside = false;
+    if (done[which] % 20 == 0) {
+        fprintf(g_hle_log, "ordercheck: %s: %llu loops of %zu cars run both ways, %llu came out differently; %zu places in all (this loop: %u words)\n", kName[which],
+                (unsigned long long)done[which], cars.size(), (unsigned long long)differed[which], places[which].size(), differ);
+        std::vector<std::pair<u32, u32>> top(places[which].begin(), places[which].end());
+        std::sort(top.begin(), top.end(), [](const std::pair<u32, u32> &x, const std::pair<u32, u32> &y) { return x.second > y.second; });
+        const u32 gp = c.r[28].w[0];
+        for (size_t i = 0; i < top.size() && i < 60; i++) {
+            const u32 at = top[i].first;
+            char what[64] = "";
+            for (size_t k = 0; k < cars.size(); k++)
+                if (at >= cars[k] && at < cars[k] + 0x900) snprintf(what, sizeof what, " (car %zu +%u)", k, at - cars[k]);
+            if (!what[0] && at + 0x8000 >= gp && at < gp + 0x8000) snprintf(what, sizeof what, " (gp%+d)", (int)(at - gp));
+            fprintf(g_hle_log, "ordercheck: %s:   %08x%s  %u times\n", kName[which], at, what, top[i].second);
+        }
+        fflush(g_hle_log);
+    }
+}
+
 void HOOK_StuffScenery__20GrandSceneryCullInfoP5eView(Ctx &c, void (*orig)(Ctx &))
 {
     static const bool off = getenv("HP2_NOVISAHEAD") != nullptr;
     Phase timed(PH_SCENERY);
     g_vis_on = false;
+    if (scenery_on()) {
+        static const int check = getenv("HP2_STUFFCHECK") ? atoi(getenv("HP2_STUFFCHECK")) : 0;
+        static u64 calls;
+        if (check > 0 && ++calls % (u64)check == 0) stuff_scenery_check(c, orig);
+        else stuff_scenery_native(c);
+        return;
+    }
     if (!off && cores_workers()) {
         const u32 self = c.r[4].w[0], view = c.r[5].w[0], gp = c.r[28].w[0];
         g_vis.clear();

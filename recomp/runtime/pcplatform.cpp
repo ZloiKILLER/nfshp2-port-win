@@ -7,6 +7,7 @@
 #include "pclang.h"
 #include "pcmenu.h"
 #include "hw.h"
+#include "pad.h"
 #include "pcconfig.h"
 #include "phase.h"
 
@@ -154,6 +155,15 @@ static bool g_layout_keys[2];
 // layout (the throttle's key braking) until the type happened to be read anew, seconds into the race. So when the word is changed
 // here the port's handlers are tied again, by the game's own function, before the next events are made (HOOK_GenerateJoyEvents).
 static bool g_layout_changed[2];
+// A layout of the player's own made anew (pc_custom_changed, below) is not a change of the word: only the handlers of the events
+// that layout answers itself (custom::mine, the race's) are tied again. Tying them all was a bug of the page of that layout
+// (the user, 2026-11-25: "one press of Left or Right turns a selector several times"): a tie puts a handler back to "never
+// read" (+24 = 0, +28 = 1), and the scanner of the menus' directions (0x154a90, events 3..6: a press, then repeats after 25
+// and every 6 ticks) takes a button that is down then for a new press. So a change made by Left or Right tied the menus'
+// handlers, the button still held was pressed again the next frame, that changed the row and tied them again, and so on
+// until the button was let go.
+static bool g_custom_rebuilt[2];
+namespace custom { bool mine(u32 event); }
 
 void pc_keyboard_layout(int port, bool keys)
 {
@@ -173,21 +183,657 @@ void pc_keyboard_layout(int port, bool keys)
     }
 }
 
+// ---- a DualSense's adaptive triggers ---------------------------------------------------------------------------------
+// The user, 2026-11-25: "let us first try to make the triggers adaptive for the DualSense". The pedal's trigger resists the
+// finger: the brake's harder than the throttle's. Which trigger is which pedal is the layout's to say, whichever layout the
+// player has (the game's, the modern one, the player's own): the game's own table of buttons is asked, by its own function
+// (FindScannerConfig, 0x155138: the event, the pad's type, the layout chosen), for the throttle's button (the events 114 its
+// pressure and 113 the button) and the brake's (117, 116), and a button is a trigger by its picture in the entry (+24: 140
+// L2, 141 R2, the left and the right trigger of a PC gamepad). A pedal on another button leaves the triggers loose, and so
+// does everything that is not driving: the menus, the pause, a replay, a wheel on the port (its type is not a gamepad's).
+// The setting, the gamepad's kind and whose it is are window.cpp's (window_triggers); the packet is pad.cpp's.
+// What the triggers go by besides the layout (the user, 2026-11-25: the kerbs, a blown tyre, the brake by the speed; and "the
+// triggers are heavy all the time now, let us make them lighter"). The car's own numbers, read where the game reads them
+// for the gamepad's motors: Car::MaybeRumble (0x134378), once a world step for each car a player drives, never in a replay
+// or a demo. The car's player is at +24 and the player's port at +8; the function goes no further with no player, or with
+// a driver (+28) whose word at +18 is set, and neither is taken here. Of the car:
+//  - the speed, +964 (what the game compares with 5 and 13 for a kerb's one bump or two);
+//  - the ground under each wheel, four words from +868: 30 and 31 are the kinds the game gives its road bumps for, the
+//    kerbs and the rumble strips;
+//  - blown tyres, the byte at +2125 (more than 0), and when, +2128, by the world's timer (0x330c78, 1/4000 s): the game's own
+//    shake of them fades in 7 s (0.00025 * 1/7 a tick).
+struct TriggerCar {
+    unsigned long long seen = 0;    // the frame it was read in (g_trigger_frame)
+    float speed = 0, blown_fresh = 0;       // (1 as the tyre goes, 0 from 7 s after)
+    float rpm = 0, redline = 0, rpm_top = 0;        // the engine's speed, its red line and its top (0: not known)
+    int gear = -1;                          // the gear the car is in (-1: not known)
+    bool kerb = false, blown = false;
+};
+static TriggerCar g_trigger_car[2];
+static unsigned long long g_trigger_frame = 8;
+
+void HOOK_MaybeRumble__3Car(Ctx &c, void (*orig)(Ctx &))
+{
+    const u32 car = c.r[4].w[0], player = LW(car + 24), driver = LW(car + 28);
+    if (player && !(driver && (LH(driver + 18) & 0xffff))) {
+        const u32 port = LW(player + 8);
+        if (port < 2) {
+            TriggerCar &t = g_trigger_car[port];
+            const auto real = [](u32 at) {
+                const u32 w = LW(at);
+                float f;
+                memcpy(&f, &w, sizeof f);
+                return f;
+            };
+            t.seen = g_trigger_frame;
+            t.speed = fabsf(real(car + 964));
+            t.kerb = false;
+            for (u32 wheel = 0; wheel < 4; wheel++) t.kerb = t.kerb || LW(car + 868 + wheel * 4) - 30 < 2;
+            t.blown = (s8)LB(car + 2125) > 0;
+            const u32 since = LW(car + 2128);
+            const float fresh = since && since != 0x7fffffff ? 1.0f - (float)(s32)(LW(c.r[28].w[0] - 19576) - since) * 0.00025f / 7.0f : 0.0f;
+            t.blown_fresh = fresh < 0 ? 0 : fresh > 1 ? 1 : fresh;
+            // The engine's speed as the car's sound has it, +980 (PlayerEngineSound::UpdateToRedLineRPM, 0x210880, writes it
+            // there each frame), and the red line the same function reads for a car of kind 1 (+36): +48, its +68 the
+            // DriveTrain, its +20 the Engine, its +16 the EngineInfo {idle, red line, top}.
+            // The gear: the DriveTrain's +48 (GetCurrentGear, 0x18c128; +44 is the gear wanted, +52 the one before, +56 the
+            // clutch). The same function counts 0 and 1 as no gear to rev out (reverse and neutral), 2 the first.
+            t.rpm = real(car + 980);
+            t.redline = t.rpm_top = 0;
+            t.gear = -1;
+            if (LW(car + 36) == 1)
+                if (const u32 body = LW(car + 48))
+                    if (const u32 train = LW(body + 68)) {
+                        t.gear = (int)LW(train + 48);
+                        if (const u32 engine = LW(train + 20))
+                            if (const u32 info = LW(engine + 16)) t.redline = real(info + 4), t.rpm_top = real(info + 8);
+                    }
+        }
+    }
+    orig(c);
+}
+
+// The effects, by the car (nothing of this was felt by me; the numbers are the user's to set by his hand):
+//  - ordinary driving: the triggers are loose, both of them;
+//  - a blown tyre: both pedals' triggers resist, the brake's harder, for as long as the tyre is blown;
+//  - a gear change: a short kick in both pedals' triggers (below);
+// That is all there is now. The car's speed, its engine's speed and the kerbs under its wheels are still read above and not
+// used: builds of the same day had the brake by the speed, a shake of the throttle at high revs and a drumming on kerbs, and
+// the user took each of them out.
+static void adaptive_triggers(Ctx &c)
+{
+    static const bool off = getenv("HP2_NOTRIGGERS") != nullptr;
+    unsigned want[2][2] = {};
+    g_pc_ctx = &c;
+    for (int port = 0; port < 2 && !off; port++) {
+        if (!g_cfg.pad_adaptive[port] || !window_pad_dualsense(port)) continue;
+        if (!pc_car_input_port(port) || pc_replay_playing()) continue;
+        if (LB(0x330350 + (u32)port) != 0x79) continue;                 // CurrentJoystickTypes: a DualShock 2 in analog mode
+        const u32 layout = LW(0x2f9530 + (u32)port * 0xcc + 0xc8);
+        const auto trigger_of = [layout](u32 pressure, u32 button) {    // 0 the left trigger, 1 the right, -1 neither
+            for (u32 event : {pressure, button})
+                if (const u32 entry = pc_call(0x155138, event, 0x79, layout)) {
+                    const u32 picture = LW(entry + 24);
+                    if (picture == 140 || picture == 141) return (int)(picture - 140);
+                }
+            return -1;
+        };
+        const int throttle = trigger_of(114, 113), brake = trigger_of(117, 116);
+        static int told[2] = {-2, -2};
+        if (told[port] != throttle * 4 + brake) {
+            told[port] = throttle * 4 + brake;
+            fprintf(stderr, "triggers: port %d, layout %x: the throttle is %s, the brake is %s\n", port, layout,
+                    throttle < 0 ? "no trigger" : throttle ? "the right trigger" : "the left trigger",
+                    brake < 0 ? "no trigger" : brake ? "the right trigger" : "the left trigger");
+        }
+        // the car, if the game has just read it (a step or two may pass with none: the picture's frames between the world's)
+        const TriggerCar &car = g_trigger_car[port];
+        const bool known = g_trigger_frame - car.seen <= 3;
+        // The user's words of 2026-11-25, build by build: a resistance in ordinary driving was "heavy all the time" (70 / 150 of
+        // 255, then 28 / 40..110); "take the triggers' resistance out of the ordinary driving; let there be a resistance only
+        // when a tyre is punctured"; then, after a build with a light shake of the throttle at high revs and a drumming on the
+        // kerbs: "take all the effects off the triggers but the resistance with a punctured tyre, and make that resistance
+        // 40 percent less if that can be done" (it was 90 and 120).
+        unsigned gas = 0, stop = 0;
+        if (known && car.blown) gas = pad_trigger_resistance(24, 54), stop = pad_trigger_resistance(24, 72);
+        // A gear change (the user, 2026-11-26: "a light click on the adaptive triggers when the gears change"; of my questions:
+        // the throttle's trigger, at every change, up and down, by hand or by the automatic box, "a short kick"). The trigger's
+        // own click, the "weapon" effect, is a stiff stretch of the travel that gives way as the finger goes through it: it
+        // answers the finger's move, and a gear changes with the finger still. So the kick is made of time: for 80 ms the
+        // trigger resists over all of its travel, wherever the finger holds it, and then is as it was. A gear is one that
+        // drives (reverse 0, the first 2 and up); into neutral is no kick, so a change that passes through it is one kick
+        // and not two, and no two kicks are nearer than 150 ms.
+        static int gear_was[2] = {-1, -1};
+        static unsigned long long kick_until[2], kick_last[2];
+        const unsigned long long now = GetTickCount64();
+        if (known && car.gear >= 0) {
+            if (gear_was[port] >= 0 && car.gear != gear_was[port] && car.gear != 1 && now - kick_last[port] >= 150)
+                kick_until[port] = now + 80, kick_last[port] = now;
+            gear_was[port] = car.gear;
+        } else {
+            gear_was[port] = -1;
+        }
+        // (Three builds of 2026-11-26 had the throttle's trigger grow heavy near the engine's top: from the red line, 30 to 110;
+        // over the last 20 % of the revs, 70 to 253; over the last 10 %, 50 to 100. The user took it out: "its effect and the
+        // gear change lie on top of one another; better leave only the gear change". The engine's speed and its top are
+        // still read above and not used.)
+        // The kick, by the user's hand, build by build: 130 for 60 ms, 70, 40 for 40 ms, 30 for 60 ms, 20, 15 ("too little"), 20
+        // on both pedals' triggers, 18, and now 20 for 80 ms. It does not lighten a trigger that resists more already.
+        if (now < kick_until[port]) {
+            const unsigned kick = pad_trigger_resistance(0, 20);
+            if ((gas >> 16 & 255) < 20) gas = kick;
+            if ((stop >> 16 & 255) < 20) stop = kick;
+        }
+        if (throttle >= 0) want[port][throttle] = gas;
+        if (brake >= 0 && brake != throttle) want[port][brake] = stop;
+    }
+    g_trigger_frame++;
+    window_triggers(want);
+}
+
 // GenerateJoyEvents (0x153e48), once a frame: the handlers of a port whose layout word the port has changed, tied to their buttons anew
 // (the list is the Joystick's own: head at +0, each node's next at +0, the Joystick itself its end). HP2_NOLAYOUTTIE=1: as it was.
 void HOOK_GenerateJoyEvents__Fv(Ctx &c, void (*orig)(Ctx &))
 {
     static const bool off = getenv("HP2_NOLAYOUTTIE") != nullptr;
     for (int port = 0; port < 2; port++) {
-        if (!g_layout_changed[port]) continue;
-        g_layout_changed[port] = false;
+        if (!g_layout_changed[port] && !g_custom_rebuilt[port]) continue;
+        const bool all = g_layout_changed[port];        // the word is another: every handler; else the own layout's events alone
+        g_layout_changed[port] = g_custom_rebuilt[port] = false;
         if (off) continue;
         g_pc_ctx = &c;
         const u32 joy = 0x2f9530 + (u32)port * 0xcc;
-        int n = 0;
-        for (u32 node = LW(joy); node && node != joy && n < 256; node = LW(node), n++) pc_call(0x153c50, joy, node);
+        int n = 0, tied = 0;
+        for (u32 node = LW(joy); node && node != joy && n < 256; node = LW(node), n++)
+            if (all || custom::mine(LW(node + 8))) pc_call(0x153c50, joy, node), tied++;       // (+8: the handler's event)
         static int told;
-        if (told < 8) told++, fprintf(stderr, "layout: port %d has configuration %x now, %d handlers tied to it\n", port, LW(joy + 0xc8), n);
+        if (told < 8) told++, fprintf(stderr, "layout: port %d has configuration %x now, %d handlers of %d tied to it\n", port, LW(joy + 0xc8), tied, n);
+    }
+    adaptive_triggers(c);
+    window_radio_frame();
+    orig(c);
+}
+
+// ---- the gamepad's motors: as soon as the game has set them, and not over the pause menu ------------------------------
+// The user, 2026-11-25: "why is the vibration late, and why does it play when the pause menu is open already?"
+//
+// The game works a pad's two motors out once a frame (UpdatePortRumblers, 0x155d40, from MainLoop after the world's step: two
+// tRumblers a port, 20 bytes each at 0x2fa7c8 {envelope, time, scale, value, value before}, each playing its envelope by the
+// real time step), and SetRumble (0x11d3d8) only notes the two numbers: six bytes a port at 0x2de608 and a "to be sent" word a
+// port at gp-23784. They go to the pad from PrepareToGetJoystickData (0x11ca78), which is the next frame's: a frame late.
+// Here they go as soon as they are worked out, 1/60 s sooner. The game sends them again a frame later, the same numbers,
+// which the pad's thread takes as nothing new.
+//
+// And an envelope goes on by the real time while the race is paused: a hard hit is up to 1.6 s long (0.8 by twice the
+// length), the road's noise and the suspension's sway up to 1.8 s, so the pad went on shaking over the pause menu. When the
+// pause comes (the RaceCoordinator's state 6: IsGameFlowPaused, 0x1680b8) the rumblers are emptied and the motors are told
+// to stop, as the game's own stop of a port does (0x155e40). What starts in the pause plays as it did: the Controller
+// screen's test of the vibration. HP2_RUMBLEASIS=1: the game's own way, for a comparison.
+// ---- the motors by the car itself ("Responsive") --------------------------------------------------------------------
+// The user, 2026-11-25: "something is still wrong with the vibration ... it does not answer the game's behaviour".
+// What the game does with what the car tells it (PortRumble, 0x155e88: the port, a number x of the car's, four numbers
+// {threshold, top, scale at the threshold, scale at the top}, an envelope of (time, value) points, and whether it is a hit):
+// the heavy motor has ONE player of envelopes a port, the scale stretches an envelope in strength and in time alike, a
+// hit takes the player over whatever it plays, and the two that go on (the suspension's sway, the road's noise) are let
+// in only if their scale is no less than the one playing. So what was strong a moment ago plays on by itself, 1.2 to 1.8 s
+// of fading, and what the car does meanwhile is not heard; a hard crash is 1.6 s; a kerb's bump cuts a crash's fading
+// off. On a DualShock 2's slow motor that passed for inertia; a modern pad plays every bit of it.
+//
+// Here the same calls are taken as they come and worked out anew, with the game's own numbers:
+//  - the sway, the noise and a blown tyre's shake are levels: each is what the game's envelope starts at for the car's x now
+//    (scale times the first point: for the two the game writes that point itself, 45 or 60 to 200), at once when it rises, and
+//    falling to what it is now, or to nothing when the game says no more of it, in 0.15 s of a full motor;
+//  - a hit (a crash, the suspension's bottom, a kerb's bump) is the game's envelope played by itself: the strength by the
+//    scale, the time by it too but not beyond the envelope's own length when that is half a second or more (a crash: 0.8 s);
+//  - all of them together are the largest of them, so one does not cut another off;
+//  - the light motor is the game's: 0.15 s of it when a hit's x is over the top.
+// The game's own conditions hold: only in a race or its pause, only with the player's Vibration on. The game's player of
+// envelopes runs on beside this and its two numbers are not taken (window_rumble_owner). Calibration > Vibration Mode;
+// "Original" is the game's own way, with what the block below does for it.
+namespace rumble {
+
+const u32 kSway = 0x2b1310, kNoise = 0x2b1320, kBlown = 0x2b1340;      // pRumbleDebugName (gp-21840): which of the car's it is
+struct Pulse {
+    u32 points = 0, name = 0;
+    int count = 0;
+    float t = 0, strength = 0, length = 1;
+};
+struct Port {
+    float level[3] = {}, target[3] = {};    // the sway, the noise, a blown tyre
+    int quiet[3] = {3, 3, 3};               // frames since the game last said anything of it
+    Pulse pulse[4];
+    float small = 0;                        // seconds of the light motor left
+};
+Port g_port[2];
+
+float real(u32 at)
+{
+    const u32 w = LW(at);
+    float f;
+    memcpy(&f, &w, sizeof f);
+    return f;
+}
+bool responsive(u32 port)
+{
+    static const bool as_is = getenv("HP2_RUMBLEASIS") != nullptr;
+    return !as_is && port < 2 && g_cfg.pad_vibration_mode[port] != 0;
+}
+// an envelope's value at a time: straight lines between its points, nothing outside them
+float value(const Pulse &p, float at)
+{
+    for (int i = 0; i + 1 < p.count; i++) {
+        const float t0 = real(p.points + (u32)i * 8), t1 = real(p.points + (u32)i * 8 + 8);
+        if (at < t0 || at >= t1 || t1 <= t0) continue;
+        const float v0 = real(p.points + (u32)i * 8 + 4), v1 = real(p.points + (u32)i * 8 + 12);
+        return v0 + (v1 - v0) * (at - t0) / (t1 - t0);
+    }
+    return -1;
+}
+
+}   // namespace rumble
+
+void HOOK_PortRumble__FifPCfP9tEnvelopeb(Ctx &c, void (*orig)(Ctx &))
+{
+    using namespace rumble;
+    const u32 port = c.r[4].w[0], coeffs = c.r[5].w[0], envelope = c.r[6].w[0], gp = c.r[28].w[0];
+    const bool hit = c.r[7].w[0] != 0;
+    const float x = c.f[12].f;
+    const u32 name = LW(gp - 21840);
+    orig(c);
+    if (!responsive(port)) return;
+    if (LW(gp - 21424)) {                       // InGameFlag: then only the race itself (3) and its pause (6)
+        const u32 coordinator = LW(gp - 22216), state = coordinator ? LW(coordinator) : 0;
+        if (state != 3 && state != 6) return;
+    }
+    bool on;                                    // the player's Vibration: the race's player, or the menus' settings (Fred)
+    if (LW(gp - 21420) != 3) {
+        const u32 player = LW(gp - 20936 + (port ? 4u : 0u));
+        on = player && LB(player + 33) != 0;
+    } else {
+        on = LB(0x2fc050 + (port ? 1744u : 0u) + 0x10738 + 1605) != 0;
+    }
+    Port &p = g_port[port];
+    const int channel = name == kSway ? 0 : name == kNoise ? 1 : name == kBlown ? 2 : -1;
+    const float c0 = real(coeffs), c1 = real(coeffs + 4), c2 = real(coeffs + 8), c3 = real(coeffs + 12);
+    const u32 points = LW(envelope);
+    const int count = (int)LW(envelope + 4);
+    if (!on || x < c0 || c1 <= c0 || !points || count < 2 || count > 16) {
+        if (channel >= 0) p.target[channel] = 0, p.quiet[channel] = 0;
+        return;
+    }
+    const float scale = ((x > c1 ? c1 : x) - c0) / (c1 - c0) * (c3 - c2) + c2;
+    if (hit && x > c1) p.small = 0.15f;
+    if (channel >= 0) {
+        const float v = scale * real(points + 4);
+        p.target[channel] = v > 255 ? 255 : v < 0 ? 0 : v;
+        p.quiet[channel] = 0;
+        return;
+    }
+    Pulse *slot = &p.pulse[0];                  // the one of this name, else a free one, else the one furthest through
+    for (Pulse &q : p.pulse) {
+        if (q.points && q.name == name) {
+            slot = &q;
+            break;
+        }
+        if (!q.points ? slot->points != 0 : slot->points && q.t / q.length > slot->t / slot->length) slot = &q;
+    }
+    slot->points = points, slot->count = count, slot->name = name;
+    slot->t = 0, slot->strength = scale;
+    slot->length = real(points + (u32)(count - 1) * 8) >= 0.5f && scale > 1.0f ? 1.0f : scale;
+    if (slot->length < 0.05f) slot->length = 0.05f;
+}
+
+// ---- the gamepad's motors: as soon as the game has set them, and not over the pause menu ------------------------------
+// (the comment above this block, of the morning of 2026-11-25, tells the game's own way: UpdatePortRumblers once a frame by the
+// real time step, SetRumble's two numbers and its "to be sent" word, a frame late through PrepareToGetJoystickData.)
+// For a player whose Vibration Mode is Original the game's numbers go to the pad as soon as they are worked out, and the
+// game's rumblers are emptied when the pause comes. For a player whose mode is Responsive the motors are worked out here
+// from what HOOK_PortRumble took, by the same real time step, and stop with the pause the same way.
+void HOOK_UpdatePortRumblers__Fv(Ctx &c, void (*orig)(Ctx &))
+{
+    using namespace rumble;
+    static const bool as_is = getenv("HP2_RUMBLEASIS") != nullptr;
+    if (as_is) {
+        window_rumble_owner(0, false);
+        window_rumble_owner(1, false);
+        orig(c);
+        return;
+    }
+    const u32 gp = c.r[28].w[0], kRumblers = 0x2fa7c8, kMotors = 0x2de608, pending = gp - 23784;
+    const u32 coordinator = LW(gp - 22216);
+    const bool paused = coordinator && LW(coordinator) == 6;
+    static bool was_paused;
+    if (paused && !was_paused)
+        for (u32 port = 0; port < 2; port++) {
+            for (u32 r = kRumblers + port * 40; r < kRumblers + port * 40 + 40; r += 20) SW(r, 0), SW(r + 12, 0), SW(r + 16, 0);
+            SB(kMotors + port * 6, 0);          // SetRumble(port, 0, 0)
+            SB(kMotors + port * 6 + 1, 0);
+            SW(pending + port * 4, 1);
+            g_port[port] = Port();
+        }
+    was_paused = paused;
+    orig(c);
+    float dt = real(gp - 19596);                // RealTimeElapsed
+    if (!(dt > 0)) dt = 0;
+    if (dt > 0.1f) dt = 0.1f;
+    for (u32 port = 0; port < 2; port++) {
+        const bool own = responsive(port);
+        window_rumble_owner((int)port, own);
+        if (!own) {
+            g_port[port] = Port();
+            if (LW(pending + port * 4)) window_rumble_port((int)port, LB(kMotors + port * 6), LB(kMotors + port * 6 + 1));
+            continue;
+        }
+        Port &p = g_port[port];
+        float big = 0;
+        for (int k = 0; k < 3; k++) {
+            if (p.quiet[k] < 3) p.quiet[k]++;
+            else p.target[k] = 0;               // the game says nothing of it any more
+            const float down = p.level[k] - dt * (255.0f / 0.15f);
+            p.level[k] = p.target[k] > down ? p.target[k] : down;
+            if (p.level[k] > big) big = p.level[k];
+        }
+        for (Pulse &q : p.pulse) {
+            if (!q.points) continue;
+            const float v = value(q, q.t / q.length);
+            if (v < 0) {
+                q.points = 0;                   // played through
+                continue;
+            }
+            if (v * q.strength > big) big = v * q.strength;
+            q.t += dt;
+        }
+        const bool small = p.small > 0;
+        if (small) p.small -= dt;
+        const u32 type = LB(0x330350 + port);   // CurrentJoystickTypes: the motors are a DualShock's (CanRumble, 0x11d3b0)
+        if (type != 0x73 && type != 0x79) big = 0;
+        window_rumble_own((int)port, small && big >= 0 && (type == 0x73 || type == 0x79) ? 255 : 0, big > 255 ? 255 : (int)big);
+    }
+}
+
+// ---- a layout of the player's own ("Custom") ---------------------------------------------------------------------------
+// The user, 2026-11-25: "a Manual layout for every gamepad, so that the players set the controls themselves ... in
+// Configuration, at the end, after all the layouts ... when the editing is done the buttons are shown on that layout".
+//
+// A layout of the game's is nothing but its number in the table of scanners (ScannerConfig, 36 bytes, 230 of them at 0x2dc500:
+// work/input_rework/docs/joystick_module.md): each entry says "for these layouts this event is that button, read this way", and
+// FindScannerConfig (0x155138: the event, the pad's type, the layout chosen) gives the first entry of an event that holds the
+// layout. The table is full and has no room, so the two new layouts (0x3c player 1's, 0x3d player 2's: ps2.cpp puts them
+// last in the DualShock 2's list, and the Configuration screen comes to them after the game's own) have their entries here,
+// in memory of the port's, made from what the player chose (hp2.ini, pcconfig.h); FindScannerConfig is answered from them for
+// the race's events, and for everything else (the menus, the replay's buttons) as layout A is. So the game's own scanners read
+// the player's buttons, by the game's own rules: the handlers, the replays and the demos know no difference, and the
+// Configuration screen and the hints draw the buttons of this layout as they draw any other's (the glyph is in the entry).
+//
+// What an entry is, by what the thing is (the scanners: Analog 0x154e48, DigitalUpOrDown 0x1547e8, DigitalDown 0x1546b0,
+// DigitalSteer 0x154be8; the events' numbers are the game's):
+//  - steering: the left stick, STEER_ANALOG (112) as layout A has it; or two buttons, STEER (111), the D-pad's scanner; or
+//    both at once, as the game's own layouts have the stick and the D-pad;
+//  - the right stick, by the page's Right Stick row: the pedals, the game's "alternate" throttle and brake (115, 118: its
+//    upper and lower half); or the camera, which is no event of the game's at all (the stick camera, below); or nothing;
+//  - throttle, brake: analog, one of the two triggers each, its pressure byte through the analog scanner (114, 117: how far
+//    it is pressed), or, digital, any button, the button itself (113, 116, value 255). The page keeps analog pedals on
+//    the triggers (pcsettings.cpp); a button with no pressure byte (R3, L3, Select) would be digital whatever is chosen;
+//  - the handbrake: the button itself, all or nothing (121, value 255), whatever the pedals are (the user, 2026-11-25: "the
+//    handbrake is always a button pressed all the way");
+//  - held things (the gears 123 / 124, look back 94, the horn 126, reset 125) and presses (the view 93, boost 127, the HUD 130):
+//    the button alone;
+//  - the zone cameras (95 / 96, and a cop's calls 129 / 128 on the same): the game's way, as its layouts with the stick and the
+//    D-pad both steering have it, Change View's button held and then a gear's button pressed; or a button each. The game's
+//    way is the game's entries with the player's buttons: the zones have the view's button as a shift that must be held, the
+//    gears have it as one that must be up, and the view changes when its button is let go, not when it goes down.
+// A thing with no button has no entry: the game takes that as "this layout has no button for it". Pause (131) and SKIP (132)
+// are not the layout's: Start and Cross, as in A.
+namespace custom {
+
+const u32 kAnalog = 0x154e48, kUpOrDown = 0x1547e8, kDown = 0x1546b0, kSteer = 0x154be8;
+// by PcButton: the button's bit in the pad's data, its pressure byte's bit (0: it has none), its glyph in the game's font
+const struct { u8 bit, pressure, glyph; } kButton[PCB_COUNT + 1] = {
+    {20, 80, 130}, {22, 88, 131}, {23, 72, 132}, {21, 64, 133},         // Up Down Left Right
+    {30, 112, 134}, {31, 120, 136}, {29, 104, 137}, {28, 96, 135},      // Cross Square Circle Triangle
+    {26, 128, 138}, {27, 136, 139}, {24, 144, 140}, {25, 152, 141},     // L1 R1 L2 R2
+    {18, 0, 143}, {19, 0, 128}, {16, 0, 129},                           // R3 Start Select
+    {17, 0, 142}};                                                      // L3 (PC_CUSTOM_L3: window_pad hands it on for this layout)
+const u32 kFirst = 93, kLast = 130;         // the events' span; of it the race's own are the layout's (mine, below)
+// The race's events, for which a layout of the player's own answers itself: the cameras and the zones (93..96) and the car's
+// (111..130). Between them are the slow motion and the warp, which no pad has (97, 98), and the replay screen's buttons
+// (99..110), which are every layout's alike and are answered as layout A.
+bool mine(u32 event) { return (event >= 93 && event <= 96) || (event >= 111 && event <= 130); }
+u32 g_base[3];                              // a layout's entries (player 1's own, player 2's, the modern one), one for each event from kFirst on
+bool g_has[3][kLast - kFirst + 1];
+
+// What a layout is made from: a player's own choices (pcconfig.h, the page of the layout), or the modern layout's, which are
+// nobody's to change: a player's own layout as it comes (PcConfig::default_custom, which says what it is; the user,
+// 2026-11-25: "take layout I as the default of layout J").
+struct Setup {
+    int b[PCC_COUNT];
+    int steer, pedals_digital, right_stick, zone_buttons;
+};
+Setup setup(int p)
+{
+    Setup s;
+    if (p < 2) {
+        memcpy(s.b, g_cfg.custom[p], sizeof s.b);
+        s.steer = g_cfg.custom_steer[p], s.pedals_digital = g_cfg.custom_pedals_digital[p];
+        s.right_stick = g_cfg.custom_right_stick[p], s.zone_buttons = g_cfg.custom_zone_buttons[p];
+        return s;
+    }
+    static const PcConfig modern;           // (its constructor is default_custom for both players)
+    memcpy(s.b, modern.custom[0], sizeof s.b);
+    s.steer = modern.custom_steer[0], s.pedals_digital = modern.custom_pedals_digital[0];
+    s.right_stick = modern.custom_right_stick[0], s.zone_buttons = modern.custom_zone_buttons[0];
+    return s;
+}
+
+void entry(int p, u32 event, u32 scan, int polarity, int shift_polarity, int button, int shift, int value, int axis, int glyph, int shift_glyph)
+{
+    const u32 a = g_base[p] + (event - kFirst) * 36;
+    for (u32 k = 0; k < 36; k += 4) SW(a + k, 0);
+    SB(a, (u8)(PC_CUSTOM_LAYOUT + (u32)p));     // +0: the layouts it is for
+    SW(a + 8, event);
+    SW(a + 12, scan);
+    SB(a + 16, (u8)polarity);
+    SB(a + 17, (u8)shift_polarity);
+    SB(a + 18, (u8)button);
+    SB(a + 19, (u8)shift);
+    SB(a + 20, (u8)value);
+    SB(a + 21, (u8)axis);
+    SW(a + 24, (u32)glyph);
+    SW(a + 28, (u32)shift_glyph);
+    g_has[p][event - kFirst] = true;
+}
+
+void build(int p)
+{
+    if (!g_base[p]) return;
+    memset(g_has[p], 0, sizeof g_has[p]);
+    for (u32 k = 0; k < (kLast - kFirst + 1) * 36; k += 4) SW(g_base[p] + k, 0);       // (an empty entry has no scanner: not read)
+    const Setup s = setup(p);
+    const auto has = [&s](int action) {
+        const int b = s.b[action];
+        return b >= 0 && b <= PC_CUSTOM_L3 && b != PCB_START ? b : -1;
+    };
+    if (s.steer != 1) entry(p, 112, kAnalog, 1, 0, 48, 0, 0, 1, 148, 0);     // the left stick's X, calibration 1
+    if (s.steer != 0) {
+        const int l = has(PCC_STEER_LEFT), r = has(PCC_STEER_RIGHT);
+        const bool dpad = l == PCB_LEFT && r == PCB_RIGHT;      // (the D-pad's own glyph of the two)
+        if (l >= 0 && r >= 0) entry(p, 111, kSteer, 1, 1, kButton[l].bit, kButton[r].bit, 0, 0, dpad ? 153 : kButton[l].glyph, dpad ? 0 : kButton[r].glyph);
+    }
+    const auto pedal = [&](int action, u32 analog, int axis, u32 digital) {
+        const int b = has(action);
+        if (b < 0) return;
+        if (!s.pedals_digital && kButton[b].pressure) entry(p, analog, kAnalog, 1, 0, kButton[b].pressure, 0, 0, axis, kButton[b].glyph, 0);
+        else entry(p, digital, kUpOrDown, 1, 0, kButton[b].bit, 0, 255, 0, kButton[b].glyph, 0);
+    };
+    pedal(PCC_ACCEL, 114, 3, 113);
+    pedal(PCC_BRAKE, 117, 2, 116);
+    if (const int b = has(PCC_HANDBRAKE); b >= 0) entry(p, 121, kUpOrDown, 1, 0, kButton[b].bit, 0, 255, 0, kButton[b].glyph, 0);
+    if (s.right_stick == 1) {
+        entry(p, 115, kAnalog, 1, 0, 40, 0, 1, 3, 150, 0);     // the right stick's Y: its upper half the throttle
+        entry(p, 118, kAnalog, 1, 0, 40, 0, 2, 2, 151, 0);     // its lower half the brake
+    }
+    const auto button = [&](int action, u32 event, u32 scan) {
+        const int b = has(action);
+        if (b >= 0) entry(p, event, scan, 1, 0, kButton[b].bit, 0, 0, 0, kButton[b].glyph, 0);
+    };
+    button(PCC_LOOK_BACK, 94, kUpOrDown);
+    button(PCC_HORN, 126, kUpOrDown);
+    button(PCC_RESET, 125, kUpOrDown);
+    button(PCC_BOOST, 127, kDown);
+    button(PCC_HUD, 130, kDown);
+    if (s.zone_buttons) {
+        button(PCC_SHIFT_UP, 123, kUpOrDown);
+        button(PCC_SHIFT_DOWN, 124, kUpOrDown);
+        button(PCC_VIEW, 93, kDown);
+        button(PCC_ZONE_FREEZE, 95, kDown);
+        button(PCC_ZONE_FREEZE, 129, kDown);        // a cop's call for the helicopter
+        button(PCC_ZONE_ZOOM, 96, kDown);
+        button(PCC_ZONE_ZOOM, 128, kDown);          // and for a road block
+    } else {
+        // the game's way: the view's button is the shift
+        const int view = has(PCC_VIEW), up = has(PCC_SHIFT_UP), down = has(PCC_SHIFT_DOWN);
+        const int held = view >= 0 ? kButton[view].bit : 0, held_glyph = view >= 0 ? kButton[view].glyph : 0;
+        if (view >= 0) entry(p, 93, kDown, 0, 0, kButton[view].bit, 0, 0, 0, kButton[view].glyph, 0);      // (polarity 0: as it is let go)
+        if (up >= 0) entry(p, 123, kUpOrDown, 1, 0, kButton[up].bit, held, 0, 0, kButton[up].glyph, 0);    // (shift polarity 0: the view's must be up)
+        if (down >= 0) entry(p, 124, kUpOrDown, 1, 0, kButton[down].bit, held, 0, 0, kButton[down].glyph, 0);
+        if (view >= 0 && down >= 0) {
+            entry(p, 95, kDown, 1, 1, kButton[down].bit, held, 0, 0, kButton[down].glyph, held_glyph);     // Zone Freeze
+            entry(p, 129, kDown, 1, 1, kButton[down].bit, held, 0, 0, kButton[down].glyph, held_glyph);    // the helicopter
+        }
+        if (view >= 0 && up >= 0) {
+            entry(p, 96, kDown, 1, 1, kButton[up].bit, held, 0, 0, kButton[up].glyph, held_glyph);         // Zone Zoom
+            entry(p, 128, kDown, 1, 1, kButton[up].bit, held, 0, 0, kButton[up].glyph, held_glyph);        // a road block
+        }
+    }
+}
+
+}   // namespace custom
+
+bool pc_custom_port(int port) { return pc_port_layout(LW(0x2f9530 + (u32)(port & 1) * 0xcc + 0xc8)); }
+
+void pc_custom_changed(int player)
+{
+    player &= 1;
+    custom::build(player);
+    g_custom_rebuilt[player] = true;        // (HOOK_GenerateJoyEvents: an event that had no button may have one now, and the other way)
+}
+
+// FindScannerConfig (0x155138: the event, the pad's type, the layout chosen): for a DualShock 2 with a layout of the player's
+// own, the port's entry of a race event, or none; anything else as layout A has it.
+void HOOK_FindScannerConfigByEvent(Ctx &c, void (*orig)(Ctx &))
+{
+    const u32 event = c.r[4].w[0], type = c.r[5].w[0], chosen = c.r[6].w[0];
+    if (type == 0x79 && pc_port_layout(chosen)) {
+        if (custom::mine(event)) {
+            const int p = (int)(chosen - PC_CUSTOM_LAYOUT);
+            if (!custom::g_base[p]) {
+                g_pc_ctx = &c;
+                custom::g_base[p] = pc_keep((custom::kLast - custom::kFirst + 1) * 36);
+                custom::build(p);
+                if (p < 2) fprintf(stderr, "layout: player %d's own layout is made, at %08x\n", p + 1, custom::g_base[p]);
+                else fprintf(stderr, "layout: the modern layout is made, at %08x\n", custom::g_base[p]);
+            }
+            const bool has = custom::g_base[p] && custom::g_has[p][event - custom::kFirst];
+            c.r[2].d[0] = has ? (u64)(s64)(s32)(custom::g_base[p] + (event - custom::kFirst) * 36) : 0;
+            return;
+        }
+        c.r[6].d[0] = kKeyboardLayout;      // 0x1e, layout A
+    }
+    orig(c);
+}
+
+// The same by a button's name (0x155360: the name, the type, the layout chosen): the names are the table's, so as layout A
+void HOOK_FindScannerConfigByName(Ctx &c, void (*orig)(Ctx &))
+{
+    if (c.r[5].w[0] == 0x79 && pc_port_layout(c.r[6].w[0])) c.r[6].d[0] = kKeyboardLayout;
+    orig(c);
+}
+
+// ---- the stick camera: the right stick turns the race's camera around the car -------------------------------------------
+// The user, 2026-11-25: "the right stick as the camera, as in modern racing games; into the Custom layout, and the player
+// chooses what the right stick is: the throttle and the brake, the camera, or nothing".
+//
+// The race's camera (DriveCameraMover, its Update at 0x15c880) already turns around the car: that is how it looks back.
+// Update takes the car's matrix transposed and turns it about the up axis by the mover's look-back angle (+140, 65536 a full
+// turn; 0x8000 is backward, and 0x4000 / 0xc000 to the right / the left are what CalculateLookbackAngle, 0x15c5a8, gives
+// for a pursuer beside the car), with bRotateZ (0x11ba18: dst = src * the turn), at two places, one for each kind of view
+// (the calls that come back to 0x15d2e0 and 0x15d978); the boom, the height, the walls it must not go through and the
+// spring are worked out after that, for whatever angle it is. The angle itself is made inside Update from the look-back
+// button's state (+124 the button, +128 how far the turn has got, eased by a cosine: one side only), so it cannot be set
+// from outside; the stick's angle is ADDED to it in the call instead: Update's hook says how much, bRotateZ's hook adds it
+// to the angle of those two calls and of nothing else (the function is the game's rotation for everything; the generated
+// code leaves the return address in ra before a call). The look-back button goes on working, on top of the stick.
+//
+// Those two turns are made only with the player's look-back option (Player +44, the pause menu's display options) not 0;
+// at 0 the game looks back another way and makes no turn. So with the option at 0 the word is 1 for the length of Update
+// while the stick is out and the player is not looking back; while the button looks back there, the stick waits.
+//
+// The stick: where it points is where the camera looks, by how far it is pushed. Up is ahead (nothing), to a side a
+// quarter turn at the stick's end, down half a turn: backward. Straight down is half a turn either way, so the side is the
+// one the stick was last clearly on. It follows the stick and goes back when the stick is let go, by an exponent (a tenth
+// of the way left after about a fifth of a second), the short way round only while the stick is far out (rolled past
+// straight down), else back the way it came. One player's stick, one player's camera: both in a split screen.
+// Only with a layout of the player's own in use (not with the keyboard driving: the port's layout is A then), in a race,
+// not in a replay. The stick is read here, from the gamepad: it is no event of the game's, a replay has nothing of it.
+static std::atomic<int> g_stick_yaw{0};     // while a race camera's Update runs: what its look-back turn gets added (0: nothing)
+
+static int stick_camera(u32 player, float step)
+{
+    static float yaw[2];                    // a player's turn now, in turns: to the right above 0, -0.5..0.5
+    static int side[2] = {1, 1};
+    static bool told[2];
+    const int p = (int)(LW(player + 8) & 1);
+    float x = 0.0f, y = 0.0f, want = 0.0f, amount = 0.0f;
+    // (whose stick is the camera: the modern layout's always, a player's own layout's by its Right Stick row)
+    const u32 layout = LW(0x2f9530 + (u32)p * 0xcc + 0xc8);
+    const bool camera = layout == PC_MODERN_LAYOUT || (pc_custom_layout(layout) && g_cfg.custom_right_stick[layout - PC_CUSTOM_LAYOUT] == 2);
+    if (camera && pc_racing() && !pc_replay_playing() && window_right_stick(p, x, y)) {
+        const float kDead = 0.25f, m = sqrtf(x * x + y * y);
+        if (m > kDead) {
+            amount = m >= 1.0f ? 1.0f : (m - kDead) / (1.0f - kDead);
+            if (fabsf(x) > 0.2f * m) side[p] = x < 0.0f ? -1 : 1;
+            want = atan2f(fabsf(x), y) / 6.2831853f * amount * (float)side[p];     // (0 up, a quarter to the side, a half down)
+        }
+    }
+    if (yaw[p] == 0.0f && want == 0.0f) return 0;
+    if (!(step > 0.0f)) step = 0.0f;
+    if (step > 0.1f) step = 0.1f;
+    float d = want - yaw[p];
+    if (amount > 0.8f) d -= floorf(d + 0.5f);
+    yaw[p] += d * (1.0f - expf(-12.0f * step));
+    yaw[p] -= floorf(yaw[p] + 0.5f);
+    if (want == 0.0f && fabsf(yaw[p]) < 0.0005f) yaw[p] = 0.0f;
+    if (!told[p]) told[p] = true, fprintf(stderr, "camera: player %d's right stick turns the camera\n", p + 1);
+    return (int)lroundf(yaw[p] * 65536.0f) & 0xffff;
+}
+
+void HOOK_DriveCameraUpdate(Ctx &c, void (*orig)(Ctx &))
+{
+    g_pc_ctx = &c;
+    const u32 mover = c.r[4].w[0], player = mover ? LW(mover + 28) : 0;
+    int yaw = 0;
+    if (player) {
+        const u32 bits = LW(c.r[28].w[0] - 19560);      // the step Update itself goes by
+        float step;
+        memcpy(&step, &bits, 4);
+        yaw = stick_camera(player, step);
+    }
+    bool forced = false;
+    if (yaw && !LW(player + 44)) {
+        if ((LW(mover + 124) << 1) == 0 && (LW(mover + 128) << 1) == 0) SW(player + 44, 1), forced = true;     // (0.0 both: not looking back)
+        else yaw = 0;
+    }
+    g_stick_yaw.store(yaw, std::memory_order_relaxed);
+    orig(c);
+    g_stick_yaw.store(0, std::memory_order_relaxed);
+    if (forced) SW(player + 44, 0);
+}
+
+void HOOK_RotateZ(Ctx &c, void (*orig)(Ctx &))
+{
+    if (const int yaw = g_stick_yaw.load(std::memory_order_relaxed)) {
+        const u32 back = c.r[31].w[0];
+        if (back == 0x15d2e0 || back == 0x15d978) c.r[6].d[0] = (u64)((c.r[6].w[0] + (u32)yaw) & 0xffff);
     }
     orig(c);
 }
@@ -406,10 +1052,18 @@ void draw_pad(Cell &c, const Sheet &ft, u32 font, const std::string &name)
         {"A", {0x30, 0xa0, 0x30, 128}}, {"B", {0xd0, 0x30, 0x30, 128}}, {"X", {0x30, 0x68, 0xd8, 128}}, {"Y", {0xd8, 0xb0, 0x10, 128}}};
     for (auto &f : kFace)
         if (name == f.n) {
-            c.fill([](float x, float y) { return (x - 13) * (x - 13) + (y - 14) * (y - 14) <= 11.5f * 11.5f; }, f.col);
+            // (a Nintendo pad's four are all of one dark grey, its letters white)
+            c.fill([](float x, float y) { return (x - 13) * (x - 13) + (y - 14) * (y - 14) <= 11.5f * 11.5f; }, g_pad_nintendo ? Rgba{0x48, 0x48, 0x4c, 128} : f.col);
             c.text(ft, font, name, 13, 14, 16, 0.9f, WHITE);
             return;
         }
+    if (name == "Plus" || name == "Minus") {    // a Nintendo pad's + and -: small round buttons with the sign, drawn (the font may have neither)
+        c.fill([](float x, float y) { return (x - 13) * (x - 13) + (y - 14) * (y - 14) <= 9.5f * 9.5f; }, EDGE);
+        c.fill([](float x, float y) { return (x - 13) * (x - 13) + (y - 14) * (y - 14) <= 8.5f * 8.5f; }, CAP);
+        c.fill([](float x, float y) { return x >= 8.5f && x <= 17.5f && y >= 13.0f && y <= 15.0f; }, WHITE);
+        if (name == "Plus") c.fill([](float x, float y) { return x >= 12.0f && x <= 14.0f && y >= 9.5f && y <= 18.5f; }, WHITE);
+        return;
+    }
     if (name.rfind("Pad ", 0) == 0) {           // the D-pad, with the direction lit
         c.round_rect(9, 3, 17, 25, 2, EDGE);
         c.round_rect(2, 10, 24, 18, 2, EDGE);
@@ -520,6 +1174,12 @@ void pc_replay_bar_retouch(u32 *px, int stride)
     }
 }
 
+// The layouts' screen's hints have cells of their own in the buttons' font (below): 1 the three spare ones of the sticks', 0
+// Select's and L3's, where this font has no glyphs in the spare ones (the hints then stand as they stood before 2026-11-25,
+// and a layout of the player's own shows those two buttons as the hints); -1 not known yet (the font is not there).
+static int g_hint_cells = -1;
+int pc_layout_hint_cells() { return g_hint_cells; }
+
 // the keys, the device or the context changed: the sheet again
 void pc_paint_buttons()
 {
@@ -528,17 +1188,21 @@ void pc_paint_buttons()
     // the game's controller layouts (Joystick Config, b6657464) show what each button does in a race: the race's keys and buttons
     const bool layouts = pc_screen_hash() == 0xb6657464;
     // That screen is the gamepad's: it shows a gamepad's buttons whatever is in use, PlayStation's unless an Xbox pad is there or chosen.
-    // Its two hints at the bottom are the device's in use, as on every screen: they have cells of their own there (Select's and L3's,
-    // which the layouts do not show), since Circle's and Triangle's are the layout's.
+    // Its hints (Back and Help at the bottom, and "press ... to edit" under a layout of the player's own) are the device's in use, as
+    // on every screen: they have cells of their own there, since Triangle's, Circle's and Cross's are the layout's. The cells are
+    // three of the sticks' that no layout of a gamepad shows ('p', 'v', 'u': the help characters 0x90, 0x91, 0x93). They were
+    // Select's and L3's until 2026-11-25; a layout of the player's own can give those two buttons a thing, and shows them.
     const bool hand = window_input_kind() == 1;
     bool pad = hand || layouts, driving = (pc_racing() && !pc_race_menu()) || layouts;
     bool ps = layouts ? g_layout_playstation != 0 : pad && g_pad_playstation;
-    int state = (pad ? 1 : 0) | (driving ? 2 : 0) | (ps ? 4 : 0) | (layouts ? 8 : 0) | (hand ? 16 : 0);
+    int state = (pad ? 1 : 0) | (driving ? 2 : 0) | (ps ? 4 : 0) | (layouts ? 8 : 0) | (hand ? 16 : 0) | (g_pad_nintendo ? 32 : 0);
     if (state == last_state && !memcmp(last.key, g_cfg.key, sizeof last.key) && !memcmp(last.pad, g_cfg.pad, sizeof last.pad))
         return;
     u32 buttons = pc_call(FindFont, pc_hash("BUTTONSOUT")), letters = pc_call(FindFont, pc_hash("FONT_A"));
     Sheet out, ft;
     if (!out.load(buttons) || !ft.load(letters)) return;
+    const bool spare = font_glyph(buttons, 'p') && font_glyph(buttons, 'v') && font_glyph(buttons, 'u');
+    g_hint_cells = spare ? 1 : 0;
     last_state = state;
     memcpy(last.key, g_cfg.key, sizeof last.key);
     memcpy(last.pad, g_cfg.pad, sizeof last.pad);
@@ -561,8 +1225,11 @@ void pc_paint_buttons()
         u32 g = ch == 0x92 ? 0 : font_glyph(buttons, ch);
         if (!g) continue;
         int gx = (int)glyph_f(g, 4), gy = (int)glyph_f(g, 8), gw = (int)glyph_f(g, 12), gh = (int)glyph_f(g, 16);
-        if (layouts && (i == 1 || i == 14)) {       // Back and Help at the bottom of the layouts' screen
-            const int menu = i == 1 ? PCB_TRIANGLE : PCB_CIRCLE;
+        // Back, Help and "edit" on the layouts' screen: the menu's button of each, in a cell of its own
+        const int hint = !layouts ? -1 : spare ? (i == 16 ? PCB_TRIANGLE : i == 17 ? PCB_CIRCLE : i == 19 ? PCB_SQUARE : -1)
+                                               : (i == 1 ? PCB_TRIANGLE : i == 14 ? PCB_CIRCLE : -1);
+        if (hint >= 0) {
+            const int menu = hint;
             if (hand && ps) {
                 u32 src = font_glyph(buttons, ps_glyph(pc_pad_name(pc_menu_pad(menu))));
                 int sx = src ? (int)glyph_f(src, 4) : gx, sy = src ? (int)glyph_f(src, 8) : gy;
@@ -570,7 +1237,8 @@ void pc_paint_buttons()
                     for (int x = 0; x < gw; x++) out.set(gx + x, gy + y, disc_px[(size_t)(sy + y) * out.w + sx + x]);
             } else {
                 Cell cell(gw, gh);
-                draw_button(cell, ft, letters, menu, hand, false);
+                if (i == 19 && !hand) draw_key(cell, ft, letters, 0x2E);         // "edit" on the keyboard: the Delete key (window_delete_pressed)
+                else draw_button(cell, ft, letters, menu, hand, false);
                 cell.store(out, gx, gy, ps ? disc_pal : nullptr);        // a key's cap among the disc's icons: in their colours
             }
             continue;
@@ -590,7 +1258,8 @@ void pc_paint_buttons()
             continue;
         }
         Cell cell(gw, gh);
-        if (i == 14) draw_key(cell, ft, letters, 0x2E);     // the font's L3, which no screen shows: the Delete key, for the profiles' hint
+        if (i == 14 && layouts && spare) draw_pad(cell, ft, letters, "L Stick");     // the left stick's press, on the layouts' screen
+        else if (i == 14) draw_key(cell, ft, letters, 0x2E);    // the font's L3, which no other screen shows: the Delete key, for the profiles' hint
         else if (i < 16 && kBtn[i] >= 0) draw_button(cell, ft, letters, kBtn[i], pad, driving);
         else if (i >= 16 && i < 21) draw_stick(cell, ft, letters, true, pad);
         else if (i >= 21 && i < 25) draw_stick(cell, ft, letters, false, pad);

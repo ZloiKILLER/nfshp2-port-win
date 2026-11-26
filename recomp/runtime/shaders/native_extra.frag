@@ -1,6 +1,8 @@
 #version 450
 // The port's own dithering against the steps of a smooth gradient (Options > Graphics > Advanced), on the finished picture: one
-// pass that reads the picture's copy. None of this is the game's: the PS2 had none of it.
+// pass that reads the picture's copy. None of this is the game's: the PS2 had none of it. Two ways (native_vk.cpp,
+// choose_color_format): the picture at 16 bits a channel, where this pass lays on the noise alone, and a picture of 8 bits on a
+// card that has no wide format, where it smooths as well, as it did for every card till 2026-11-18.
 // (An ambient occlusion and a bloom were here too, passes of their own, and were taken out on the user's word, 2026-11-14:
 // work/parked/ssao and work/parked/bloom.)
 layout(push_constant) uniform Push {
@@ -8,6 +10,12 @@ layout(push_constant) uniform Push {
     vec2 size;          // the picture
     float frame;        // moves the noise from frame to frame
     float lines;        // the picture's height over the GS's 448: sizes in pixels go by it
+    float grain;        // the picture's pixels to a pixel of the window (1 at the least): the noise's grain
+    float wide;         // 1: the picture has 16 bits a channel, and only the noise is laid on
+    // The settings' brightness, contrast and gamma in this pass (2026-11-24; native_grade.frag's sums, which was a pass of its own
+    // before this one, with a copy of the picture of its own): graded 1, and only with wide.
+    float brightness, contrast, gamma, graded;
+    float opaque;       // 1: the picture's last pass, and its alpha goes to 1 for the window (what native_opaque.frag did)
 } u;
 layout(set = 0, binding = 0) uniform sampler2D scene;
 layout(location = 0) out vec4 o_col;
@@ -25,6 +33,24 @@ void main()
     ivec2 ip = ivec2(fc);
     vec4 here = texelFetch(scene, ip, 0);
     vec3 c = here.rgb;
+    float alpha = u.opaque > 0.5 ? 1.0 : here.a;
+    if (u.wide > 0.5) {
+        // as native_grade.frag left it in the picture: to the picture's own 16 bits, so what follows sees the very same colour
+        if (u.graded > 0.5) {
+            c = pow(clamp((c - 0.5) * u.contrast + 0.5 + u.brightness, 0.0, 1.0), vec3(1.0 / u.gamma));
+            c = floor(c * 65535.0 + 0.5) / 65535.0;
+        }
+        // The picture has its colours finer than the window's 255 steps: here they are as the shading and the blends made them.
+        // Shown as it is, each would go to the nearest step and a smooth gradient would be bands of one step. With a step's
+        // worth of noise laid on first (two random numbers summed: the noise that leaves no pattern of its own), a colour
+        // between two steps comes out as a mix of both in the right shares: grain in place of bands. The grain is a pixel of
+        // the window: all the picture's pixels that are shown as one have the same noise. Plain black stays black.
+        vec2 cell = floor((fc - u.rect.xy) / max(u.grain, 1.0));
+        float w1 = hash(cell + u.frame * 7.31), w2 = hash(cell * 1.37 + 91.7 + u.frame * 3.17);
+        if (max(c.r, max(c.g, c.b)) > 0.0) c += (w1 + w2 - 1.0) / 255.0;
+        o_col = vec4(c, alpha);
+        return;
+    }
     float n1 = hash(fc + u.frame * 7.31), n2 = hash(fc * 1.37 + 91.7 + u.frame * 3.17);
     // Four places round the pixel, at a distance and an angle of chance. Where all are within a few steps of the pixel's colour
     // the pixel is on a gradient (the sky, the fog, a shaded wall) and takes their average: the steps of 1 / 255 go. An edge
@@ -37,5 +63,5 @@ void main()
     vec3 far = max(max(abs(s0 - c), abs(s1 - c)), max(abs(s2 - c), abs(s3 - c)));
     if (max(far.r, max(far.g, far.b)) < 3.5 / 255.0) c = (s0 + s1 + s2 + s3) * 0.25;
     c += (n1 + n2 - 1.0) / 255.0;           // a step's worth of noise: the average above lands between two steps
-    o_col = vec4(c, here.a);
+    o_col = vec4(c, alpha);
 }

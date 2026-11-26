@@ -112,6 +112,22 @@ hook Loader__15LanguageManagerP6bChunk
 hook ShouldSeeLanguageSelectScreen__Fv
 hook SetLanguage__15LanguageManager11e_Languages
 hook SetInputMode__6Player16PlayerInputModes
+# every frame for each player: a zone camera left without its end is ended (pcmenu.cpp)
+hook DetermineInputMode__6Player 0x177608
+# a help line of the menus that is too long for its place runs (pcmenu.cpp)
+hook BlurbAnimate 0x249348
+# Zone Slow Motion's key pressed again ends the slow motion (pcmenu.cpp)
+hook RacingJoyHandler 0x178978
+# the Debug menu's Environment row is a switch of the wipers (pcmenu.cpp): the retail storm functions are stubs
+hook SetStormType 0x1703c0
+hook GetStormType 0x1703c8
+hook GetStormTypeString 0x1703d0
+# the mirror's view kept on for the mirrors of the player's car, the HUD's picture of it hidden meanwhile (pcmenu.cpp)
+hook SetRearViewMirrorCameraMover 0x1767a8
+hook DisplayRVMs 0x10edc8
+hook PlayerDestructor 0x175bf0
+# the HUD's lights of the cars behind while the mirror's view is not drawn: by the view the mirror would have (pcmenu.cpp)
+hook CarTrackerSide 0x135280
 hook AttachDmaDataListMain__FP9eDmaChainP12eDmaDataListP8DMAState
 hook elSetupLightContext__FP13eLightContextP8bMatrix4T1P8bVector4P5eView 0x115978
 hook eDisplayFrame__Fv
@@ -121,6 +137,35 @@ hook JoyHandler_ResetCar__10RealDriver12JoystickPort8JoyEventUcPv 0x13c028
 hook BuildRideInfo__18FrontendPlayerInfoP8RideInfo7CarTypeUii 0x1879b8
 hook PickTrackNumberForExpressGame__Fv 0x216aa8
 hook GenerateJoyEvents__Fv 0x153e48
+# the gamepad's motors set as soon as the game has worked them out, and stopped when the pause comes (pcplatform.cpp)
+hook UpdatePortRumblers__Fv 0x155d40
+# what the car tells the motors (x, its four numbers, its envelope), for the port's own working out of them (pcplatform.cpp)
+hook PortRumble__FifPCfP9tEnvelopeb 0x155e88
+# the car's speed, the ground under its wheels and its blown tyres, for a DualSense's adaptive triggers (pcplatform.cpp)
+hook MaybeRumble__3Car 0x134378
+# the game's Controller screen: the Select Device rows and the order of its rows (pcmenu.cpp). The symbol of this name is 0x240298,
+# the tail of the destructor; the handler itself starts here
+hook JoystickPreConfigHandleEvent 0x2402c0
+hook JoystickPreConfigUpdateMenuItems 0x240870
+hook JoystickConfigHandleScreenCallback 0x23e148
+# a gamepad layout of the player's own: its buttons from the port's table (pcplatform.cpp), its place in the layouts' list (pcmenu.cpp)
+hook FindScannerConfigByEvent 0x155138
+hook FindScannerConfigByName 0x155360
+# the layouts' list as a player's screen reads it: the modern layout the ninth, that player's own the tenth (pcmenu.cpp)
+hook GetJoystickConfigs 0x155040
+hook ChooseJoystickConfig 0x1550d0
+hook InitCurrentDisplayedConfig 0x23e0b0
+# a help line of the port's own, by a LanguageID the game's table has not: the layouts' screen's "edit" (pcmenu.cpp)
+hook GetTranslatedString 0x21e560
+# the right stick as the camera, in a layout of the player's own: the race camera's turn around the car, the one its look back
+# is made of, gets the stick's angle added (pcplatform.cpp): DriveCameraMover::Update, and bRotateZ for its two calls there
+hook DriveCameraUpdate 0x15c880
+hook RotateZ 0x11ba18
+hook CycleConfiguration__20JoystickConfigScreenb 0x23e448
+# every button of the menus: a screen of one player's port hears any device while it is up (pcmenu.cpp)
+hook JoyHandler__17FlailerScreenList12JoystickPort8JoyEventUcPv
+# after a port's pad is scanned, the keyboard's actions for the same port (pcactions.cpp)
+hook GenerateEventsFromScanners__8JoystickiPUcT2R20QueuedJoystickEvents 0x153a98
 hook RequestZone__6Playeribbb 0x177c88
 hook SetTimeScale__5WorldffPFi_vi 0x14d620
 hook BuildQuaternionTable__14AnimatedDriverP10eAnimationP11bQuaternionP8bVector3 0x1aa2f0
@@ -132,6 +177,9 @@ hook GetTranslation__15eAnimationSolidP8bVector3f 0x1a78e0
 hook Render__10NisManagerP5eView 0x1b2c90
 hook SetupForRendering__10NisManager 0x1b13f0
 hook Callback__14BootAutoLoader13ScreenMessageP18ScreenCallbackData 0x247ab0
+# a start without the opening films (pcsettings.cpp): the title's constructor does not start the music
+hook TitleScreenMake 0x16f000
+hook JukeboxStart 0x1aeab0
 hook HandleEvent__9NameEntry13ScreenMessageP18ScreenCallbackData 0x24d870
 hook HandleEvent__12MemcardSaver13ScreenMessageP18ScreenCallbackData 0x246138
 hook HandleEvent__13MemcardLoader13ScreenMessageP18ScreenCallbackData 0x246c00
@@ -141,6 +189,7 @@ hook TreeCull__20ScenerySectionHeaderP15SceneryCullInfo 0x150378
 hook DrawAScenery__20ScenerySectionHeaderiP15SceneryCullInfoi 0x14fe18
 hook WhatSectionsShouldWeDraw__20GrandSceneryCullInfoPsiP15SceneryCullInfo 0x150950
 hook FetchVRAM__FP12eRenderStage 0x111348
+hook StuffSun__FP5eView 0x1252b0
 hook eMulMatrix__FP8bMatrix4T0T0 0x11b248
 hook eMulVector__FP8bVector4PC8bMatrix4PC8bVector4 0x11b2c0
 hook eRotTransPers__FP8bVector4P8bMatrix4T0 0x11b350
@@ -161,6 +210,25 @@ hook bMulMatrix__FP8bVector3PC8bMatrix4PC8bVector3 0x25aed0
 hook fDeterminant__FP8bMatrix4 0x126088
 hook Render__12FlailerStripP5eView 0x145950
 hook RenderLayer__20FlailerRenderManageriP5eView 0x145e10
+hook Render__8TrackMap 0x1bade8
+# Options > Extras > Disable Catchup (pcsettings.cpp): the four places that turn the game's Catch-up on
+hook StartQuickRace 0x216c18
+hook RaceParametersDefaults 0x1ed5c8
+hook CopsOnModeSelectEvent 0x2170b0
+hook CopsOffModeSelectEvent 0x217768
+# Options > Extras > Speed Boost for All Cars (pcsettings.cpp): RealDriver::JoyHandler_NitroBoost
+hook NitroBoostHandler 0x13c228
+# a new profile's gamepads on layout I (pcsettings.cpp): Fred's defaults
+hook InitWithDefaults__16FrontendDatabase 0x183830
+# Options > Extras > Cinematic Replays (pcsettings.cpp): the replay's letterbox screen is never shown
+hook SetFlailerScreenVisibility__FUi23FlailerScreenVisibility 0x14cbf8
+# the developers' readout (the screen's printf) keeps to the left edge of a wide picture (native.cpp, g_packet_edge)
+hook RenderScreenPrintf 0x146190
+# Options > Extras > Playable Traffic Cars (traffic.cpp): the mod's places of the program
+hook GetNumAvailableSkins__11CarTypeInfo 0x1884b8
+hook GetAvailableSkin__11CarTypeInfoi 0x1884d8
+hook GetVisibleTotalDamage__10BodyDamage 0x1b50c8
+hook BeACopChallengeSetupLeave 0x1b6e30
 hook eAllocateFrameMallocBuffers__FUi
 hook eFreeFrameMallocBuffers__Fv
 hook eSwapFrameMallocBuffers__Fv
@@ -217,6 +285,8 @@ hook DoTimeStep__16AcidEffectSystemf 0x128718
 hook emProcessAllEvents__Fv 0x1ba520
 hook FakeEngineTask__3Car 0x132a70
 hook Update__5soundv 0x1af4c0
+hook UpdateLogitechWheels__Fv 0x12c080
+hook DrawSteeringWheel__25JoystickCalibrationScreenb 0x23fde0
 hook ServiceQueuedFiles__Fv 0x1ad850
 hook LoadResourceIfFileTransferFinished__12ResourceFile 0x1994f0
 hook WaitUntilVSync__Fv 0x111d70

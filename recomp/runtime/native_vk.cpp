@@ -7,9 +7,16 @@
 #include "hw.h"
 #include "pcconfig.h"
 #include "pclang.h"
+#include "cores.h"
 
 #include <functional>
 #include <algorithm>
+#include <chrono>
+#include <atomic>
+#include <thread>
+#include <unordered_map>
+#include <memory>
+#include <vector>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -107,7 +114,8 @@ static const uint32_t kSmaaBlendFrag[] =
     X(vkGetPhysicalDeviceMemoryProperties) X(vkGetPhysicalDeviceFeatures) X(vkCreateDevice) X(vkGetDeviceProcAddr)     \
     X(vkGetPhysicalDeviceSurfaceSupportKHR) X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR)                              \
     X(vkGetPhysicalDeviceSurfaceFormatsKHR) X(vkGetPhysicalDeviceSurfacePresentModesKHR)                           \
-    X(vkEnumerateDeviceExtensionProperties) X(vkDestroySurfaceKHR)
+    X(vkEnumerateDeviceExtensionProperties) X(vkDestroySurfaceKHR)                                         \
+    X(vkGetPhysicalDeviceFormatProperties) X(vkGetPhysicalDeviceImageFormatProperties)
 #define NV_DEVICE(X)                                                                                        \
     X(vkGetDeviceQueue) X(vkCreateBuffer) X(vkDestroyBuffer) X(vkGetBufferMemoryRequirements) X(vkAllocateMemory) \
     X(vkFreeMemory) X(vkBindBufferMemory) X(vkMapMemory) X(vkCreateImage) X(vkGetImageMemoryRequirements)        \
@@ -121,8 +129,8 @@ static const uint32_t kSmaaBlendFrag[] =
     X(vkCmdBindDescriptorSets) X(vkCmdCopyBufferToImage) X(vkCmdBlitImage) X(vkDestroyImage) X(vkDestroyImageView)  \
     X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdClearColorImage) X(vkCreateSemaphore) X(vkDeviceWaitIdle)         \
     X(vkCreateSwapchainKHR) X(vkDestroySwapchainKHR) X(vkGetSwapchainImagesKHR) X(vkAcquireNextImageKHR) X(vkQueuePresentKHR) \
-    X(vkCreateQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults) X(vkCmdCopyBuffer) X(vkCmdBindIndexBuffer) X(vkCmdDrawIndexed) X(vkCmdDrawIndirect) \
-    X(vkCmdCopyImage)
+    X(vkCreateQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults) X(vkCmdCopyBuffer) X(vkCmdBindIndexBuffer) X(vkCmdDrawIndexed) X(vkCmdDrawIndirect) X(vkCmdDrawIndexedIndirect) \
+    X(vkCmdCopyImage) X(vkCreatePipelineCache) X(vkGetPipelineCacheData) X(vkCmdBeginQuery) X(vkCmdEndQuery)
 #define NV_DECLARE(name) static PFN_##name name;
 static PFN_vkGetInstanceProcAddr gipa;
 static PFN_vkCreateInstance vkCreateInstance;
@@ -241,7 +249,7 @@ static void picture_clip(float *out, const NativeDraw &d)
 // were 8 rows and 8 effects of any kind at most (till 2026-11-17), the shadows, which read none, among them.
 static const int kPaletteRows = 32;
 // an effect's row of the palette image; -1: it reads none
-static bool fx_palette(uint8_t kind) { return kind != FX_SHADOW && kind != FX_AO; }
+static bool fx_palette(uint8_t kind) { return kind != FX_SHADOW && kind != FX_AO && kind != FX_AO_WORLD; }
 static int fx_row(const NativeFrame &frame, size_t i)
 {
     if (!fx_palette(frame.fx[i].kind)) return -1;
@@ -253,6 +261,8 @@ static int fx_row(const NativeFrame &frame, size_t i)
 // Shadows: the map of the cars as the sun sees them is so many cells across and down, a car each (native.cpp, kShadowCells). The
 // image is twice as many down: the upper half has the cars' bodies, the lower, cell for cell, their glass (kShadowRows in all).
 static const int kShadowAcross = 8, kShadowDown = 4, kShadowRows = kShadowDown * 2;
+// At Ultra two rows more below them for the tunnels' lamps (native.cpp, kLampCells): cells of half the side, so 16 across and 4 down
+static const int kLampCellsAcross = kShadowAcross * 2, kLampRows = 2, kLampCellsAll = kLampCellsAcross * kLampRows * 2;
 
 // native_shadow.frag's
 struct ShadowPush {
@@ -269,6 +279,10 @@ struct ExtraPush {
     float size[2];
     float frame;
     float lines;
+    float grain;            // the picture's pixels to a pixel of the window, 1 at the least
+    float wide;             // 1: the picture has 16 bits a channel (g_color_wide), the noise alone is laid on
+    float brightness, contrast, gamma, graded;      // graded 1: the settings' three in this pass (with wide only)
+    float opaque;           // 1: the picture's alpha to 1 here
 };
 
 static struct {
@@ -357,10 +371,16 @@ static struct {
     VkRenderPass env_pass_load;             // env_pass with what is there kept: the rest of the mirror after its shadows
     VkFramebuffer shadow_fb, rvm_post_fb;
     VkPipeline shadow_cast, shadow_pipeline;
+    // A car's draw with the alpha test goes into the map with it too (native.frag, ALPHA_TEST): the brake discs are a picture of a
+    // disc on a square, the square's corners see-through, and drawn whole the squares stood out behind the wheels, their edges
+    // giving the shadow's test "behind the car" places it took for the car itself (the user's pictures, 2026-11-26)
+    VkPipeline shadow_cast_test;
     VkPipelineLayout shadow_layout;
     VkDescriptorSet shadow_set, rvm_post_set;
     int palette_rows;                       // of the palette image: how many this frame's effects have (upload_palettes)
-    int shadow_cell;                        // a cell's side in texels: 256, at Maximum 512, at Ultra 1024
+    int shadow_cell;                        // a cell's side in texels: 256, at Very High 512, at Ultra 1024
+    int shadow_h;                           // the map's height in texels: kShadowRows cells, and at Very High and Ultra two rows more for the lamps
+    bool lamp_row;                          // the map has the tunnel lamps' rows (Very High, Ultra): 16 x 4 cells of half a cell each
     bool shadow_ready;                      // the map has been drawn at least once
     // Shadows with multisampling: laid over the samples themselves (ms_read_pass: the picture's samples, their depth read and not
     // written), each sample by its own depth. Null where the card cannot shade by the sample: over the resolved picture then, as before
@@ -379,6 +399,11 @@ static struct {
     VkPipeline ao_pipeline, ao_apply_pipeline;
     VkDescriptorSet ao_set;
     int ao_w, ao_h;
+    // and the depth with no car in it yet (FX_AO_WORLD, copy_depth_world): what the road and the walls are shaded by (ПОРА111)
+    VkImage depth_world;
+    VkImageView depth_world_view;
+    VkDescriptorSet ao_world_set;
+    bool world_ready;                   // it has been copied into since it was made: its layout is SHADER_READ_ONLY
     // Particles: High, the soft sprites (native.frag, SOFT): a copy of the picture's depth made before a picture's first such sprite
     // (copy_depth_soft), and the scene's pipelines again with that shader, by the samples (0 one, 1 the picture's), the blend, the depth test
     VkImage depth_copy;
@@ -419,7 +444,10 @@ static struct {
     bool env_ready[6], env_drawn_now[6], sphere_ready;
     bool scene_ready;                       // the scene image has had a layout: copy_scene, or the fog's first frame
     VkCommandBuffer cmd;
+    VkCommandBuffer cmd_b;                  // the frame's second part, after depth_send_early (the two change places each time)
     VkFence fence;
+    VkFence depth_fence;                    // the first part's: the depth rects are copied (depth_send_early)
+    bool depth_early;                       // the last frame's rects went on depth_fence
     bool waiting;
     // the window
     VkInstance instance;
@@ -453,6 +481,8 @@ static struct {
     std::vector<NativeDepthRect> depth_rects;
     std::vector<VkDeviceSize> depth_places;
     float depth_ox, depth_sx;
+    VkDeviceSize depth_bytes;               // how much of depth_rb the last frame's rects take
+    bool depth_new;                         // copied by a frame and not kept yet (depth_keep)
 } g;
 
 // Everything that depends on the settings is made once more when they change (rebuild). What setup_resources makes is written down here as it
@@ -487,16 +517,406 @@ NV_TRACK(vkCreateSampler, VkSamplerCreateInfo, VkSampler, vkDestroySampler)
 NV_TRACK(vkCreateDescriptorSetLayout, VkDescriptorSetLayoutCreateInfo, VkDescriptorSetLayout, vkDestroyDescriptorSetLayout)
 NV_TRACK(vkCreateDescriptorPool, VkDescriptorPoolCreateInfo, VkDescriptorPool, vkDestroyDescriptorPool)
 
+// ---- the pipelines: kept, and made on the workers (2026-11-24) --------------------------------------------------------------------
+// The user, on Intel's UHD 630: "switching the graphics settings the game sometimes froze: the choice was not taken and two seconds
+// of the music went round". The log: the change to MSAA made the renderer again in 4.4 s (the other changes in 0.1 to 0.3 s), the
+// game's thread waiting for the renderer's at the hand-over all that time, and the sound with it. setup_resources makes some 90
+// pipelines, with multisampling 75 more, one after another on one thread and with no pipeline cache: every one compiled by the
+// driver from nothing, each time anew.
+// Now, at the one place all of them are made through (the stand-in below):
+//   - a pipeline cache for the device's life, so what was compiled once in a session is not compiled again by a later change; and
+//     kept in a file beside the exe (shaders_<vendor>_<device>.bin, the driver's own data behind Vulkan's header, which is looked at
+//     before the file is given back to the driver), so the next start and the first change of the next session have it too;
+//   - what setup_resources asks for is written down whole (a copy of everything the request points at: the code goes on to change
+//     its structures for the next one) and made at its end by the workers and this thread together. A handle is there only then:
+//     nothing in setup_resources reads one.
+// The time is in the log's "native: pipelines" line. HP2_PIPEJOBS=0: each made where it is asked for, as before. HP2_PIPECACHE=0:
+// no cache.
 static PFN_vkCreateGraphicsPipelines real_vkCreateGraphicsPipelines;
+
+struct PipeJob {
+    VkGraphicsPipelineCreateInfo pi;
+    VkPipelineShaderStageCreateInfo stages[2];
+    VkSpecializationInfo spec[2];
+    std::vector<VkSpecializationMapEntry> spec_map[2];
+    std::vector<unsigned char> spec_data[2];
+    VkPipelineVertexInputStateCreateInfo vin;
+    std::vector<VkVertexInputBindingDescription> binds;
+    std::vector<VkVertexInputAttributeDescription> attrs;
+    VkPipelineInputAssemblyStateCreateInfo ia;
+    VkPipelineViewportStateCreateInfo vs;
+    std::vector<VkViewport> viewports;
+    std::vector<VkRect2D> scissors;
+    VkPipelineRasterizationStateCreateInfo ra;
+    VkPipelineMultisampleStateCreateInfo ms;
+    VkPipelineDepthStencilStateCreateInfo ds;
+    VkPipelineColorBlendStateCreateInfo cb;
+    std::vector<VkPipelineColorBlendAttachmentState> blends;
+    VkPipelineDynamicStateCreateInfo dyn;
+    std::vector<VkDynamicState> dyn_states;
+    VkPipeline *out;
+    VkResult result;
+    std::atomic<int> state{0};              // 0 asked for, 1 being made, 2 made, 3 could not be made
+    VkPipeline made = VK_NULL_HANDLE;       // (there with state 2)
+};
+static std::vector<std::unique_ptr<PipeJob>> g_pipe_jobs;
+
+static bool g_pipe_wait;                    // setup_resources is running: its pipelines are written down, not made
+static VkPipelineCache g_pipe_cache;
+static size_t g_pipe_saved;                 // the cache's size as the file has it
+static double g_pipe_ms;                    // made where they were asked for: the time, and how many
+static unsigned g_pipe_direct;
+
+static double pipe_clock()
+{
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// ---- made when first bound, the rest behind the picture (2026-11-24) -----------------------------------------------------------
+// The cache and the workers above left the first time a set of settings is seen as it was: the user on Intel's UHD 630, "MSAA
+// freezes all the same": 161 pipelines in 2.1 s, 88 in 2.8 s for a change of the picture's format, the workers or no (that driver
+// compiles one at a time, some 30 ms each), the game's thread waiting and the music going round. A picture needs a handful of
+// them; so none is made by setup_resources at all. Where a pipeline was asked for, its variable gets a stand-in handle (the
+// request's own address); the first vkCmdBindPipeline of it makes the pipeline there and then and puts the real handle in the
+// variable; and a thread of its own goes through the rest meanwhile, so that by the time a race begins they are there (and in the
+// cache's file: the next start has them at once). A change of settings is then a few pipelines' wait, once for each set of
+// settings ever.
+// Only the renderer's thread writes a variable or binds; the other thread makes a pipeline and says so in the request. Before the
+// renderer's things are taken apart (rebuild) that thread is stopped and what was made is destroyed here: these are not in g_undo.
+// HP2_PIPELAZY=0: all of them at the end of setup_resources, by the workers, as before.
+static const bool g_pipe_lazy = !(getenv("HP2_PIPELAZY") && atoi(getenv("HP2_PIPELAZY")) == 0);
+static std::vector<std::unique_ptr<PipeJob>> g_pipe_live;           // the requests the stand-in handles are of
+static std::unordered_map<uint64_t, PipeJob *> g_pipe_tokens;       // by stand-in handle (the renderer's thread only)
+static std::atomic<bool> g_pipe_stop, g_pipe_running;
+static unsigned g_pipe_asked;               // made at a bind, since the last setup_resources: how many, and the time
+static double g_pipe_asked_ms;
+static PFN_vkCmdBindPipeline real_vkCmdBindPipeline;
+static void pipe_cache_save();
+
+// by whichever thread comes first; the other waits for it
+static bool pipe_make(PipeJob &j)
+{
+    int asked = 0;
+    if (j.state.compare_exchange_strong(asked, 1)) {
+        VkPipeline made = VK_NULL_HANDLE;
+        const VkResult r = real_vkCreateGraphicsPipelines(g.dev, g_pipe_cache, 1, &j.pi, nullptr, &made);
+        j.result = r;
+        j.made = made;
+        j.state.store(r == VK_SUCCESS ? 2 : 3);
+    } else {
+        while (j.state.load() == 1) std::this_thread::yield();
+    }
+    return j.state.load() == 2;
+}
+
+static void pipe_background()
+{
+    cores_thread(CORE_BACKGROUND);
+    const double t0 = pipe_clock();
+    unsigned made = 0, failed = 0;
+    for (auto &j : g_pipe_live) {
+        if (g_pipe_stop.load()) break;
+        if (j->state.load() != 0) continue;
+        if (pipe_make(*j)) made++;
+        else if (j->state.load() == 3) failed++;
+    }
+    if (!g_pipe_stop.load()) {
+        const size_t before = g_pipe_saved;
+        pipe_cache_save();
+        fprintf(g_hle_log, "native: pipelines: %u made behind the picture in %.0f ms%s; the cache %zu KB%s\n", made, pipe_clock() - t0,
+                failed ? " (SOME COULD NOT BE MADE)" : "", g_pipe_saved >> 10, g_pipe_saved != before ? ", written to its file" : "");
+    }
+    g_pipe_running.store(false);
+}
+
+static VKAPI_ATTR void VKAPI_CALL lazy_vkCmdBindPipeline(VkCommandBuffer cb, VkPipelineBindPoint point, VkPipeline pipeline)
+{
+    if (!g_pipe_tokens.empty()) {
+        const auto it = g_pipe_tokens.find((uint64_t)(uintptr_t)pipeline);
+        if (it != g_pipe_tokens.end()) {
+            PipeJob &j = *it->second;
+            if (j.state.load() != 2) {
+                const double t0 = pipe_clock();
+                pipe_make(j);
+                g_pipe_asked_ms += pipe_clock() - t0;
+                g_pipe_asked++;
+            }
+            if (j.state.load() != 2) {
+                static int told;
+                if (told++ < 5) fprintf(g_hle_log, "native: a pipeline could not be made (%d): the renderer stops\n", (int)j.result);
+                g.failed = true;
+                return;
+            }
+            pipeline = j.made;
+            *j.out = pipeline;              // the variable has the real handle from here on
+        }
+    }
+    real_vkCmdBindPipeline(cb, point, pipeline);
+}
+
+// Before the renderer's things are taken apart, the device idle: the thread stopped, what was made destroyed, the requests gone.
+static void pipes_retire()
+{
+    g_pipe_stop.store(true);
+    while (g_pipe_running.load()) std::this_thread::yield();
+    g_pipe_stop.store(false);
+    if (!g_pipe_live.empty()) {
+        const auto destroy = (PFN_vkDestroyPipeline)vkGetDeviceProcAddr(g.dev, "vkDestroyPipeline");
+        for (auto &j : g_pipe_live)
+            if (j->state.load() == 2 && j->made && destroy) destroy(g.dev, j->made, nullptr);
+        if (g_pipe_asked)
+            fprintf(g_hle_log, "native: pipelines: %u were made when first bound, %.0f ms in all\n", g_pipe_asked, g_pipe_asked_ms);
+    }
+    g_pipe_tokens.clear();
+    g_pipe_live.clear();
+    g_pipe_asked = 0;
+    g_pipe_asked_ms = 0;
+}
+
+// a request the copy below takes whole: no chains, no more than two stages, nothing it has no place for
+static bool pipe_can_wait(const VkGraphicsPipelineCreateInfo &i)
+{
+    if (i.pNext || !i.pStages || i.stageCount > 2 || i.pTessellationState) return false;
+    for (uint32_t k = 0; k < i.stageCount; k++)
+        if (i.pStages[k].pNext) return false;
+    if ((i.pVertexInputState && i.pVertexInputState->pNext) || (i.pInputAssemblyState && i.pInputAssemblyState->pNext) ||
+        (i.pViewportState && i.pViewportState->pNext) || (i.pRasterizationState && i.pRasterizationState->pNext) ||
+        (i.pMultisampleState && (i.pMultisampleState->pNext || i.pMultisampleState->pSampleMask)) ||
+        (i.pDepthStencilState && i.pDepthStencilState->pNext) || (i.pColorBlendState && i.pColorBlendState->pNext) ||
+        (i.pDynamicState && i.pDynamicState->pNext))
+        return false;
+    return true;
+}
+
+static void pipe_keep(const VkGraphicsPipelineCreateInfo &i, VkPipeline *out)
+{
+    g_pipe_jobs.push_back(std::make_unique<PipeJob>());
+    PipeJob &j = *g_pipe_jobs.back();       // (on the heap and never moved: it points into itself)
+    j.pi = i;
+    j.out = out;
+    j.result = VK_SUCCESS;
+    for (uint32_t k = 0; k < i.stageCount; k++) {
+        j.stages[k] = i.pStages[k];
+        if (const VkSpecializationInfo *sp = i.pStages[k].pSpecializationInfo) {
+            j.spec[k] = *sp;
+            if (sp->pMapEntries) j.spec_map[k].assign(sp->pMapEntries, sp->pMapEntries + sp->mapEntryCount);
+            if (sp->pData) j.spec_data[k].assign((const unsigned char *)sp->pData, (const unsigned char *)sp->pData + sp->dataSize);
+            j.spec[k].pMapEntries = j.spec_map[k].data();
+            j.spec[k].pData = j.spec_data[k].data();
+            j.stages[k].pSpecializationInfo = &j.spec[k];
+        }
+    }
+    j.pi.pStages = j.stages;
+    if (i.pVertexInputState) {
+        j.vin = *i.pVertexInputState;
+        if (j.vin.pVertexBindingDescriptions) j.binds.assign(j.vin.pVertexBindingDescriptions, j.vin.pVertexBindingDescriptions + j.vin.vertexBindingDescriptionCount);
+        if (j.vin.pVertexAttributeDescriptions)
+            j.attrs.assign(j.vin.pVertexAttributeDescriptions, j.vin.pVertexAttributeDescriptions + j.vin.vertexAttributeDescriptionCount);
+        j.vin.pVertexBindingDescriptions = j.binds.data();
+        j.vin.pVertexAttributeDescriptions = j.attrs.data();
+        j.pi.pVertexInputState = &j.vin;
+    }
+    if (i.pInputAssemblyState) j.ia = *i.pInputAssemblyState, j.pi.pInputAssemblyState = &j.ia;
+    if (i.pViewportState) {
+        j.vs = *i.pViewportState;
+        if (j.vs.pViewports) j.viewports.assign(j.vs.pViewports, j.vs.pViewports + j.vs.viewportCount), j.vs.pViewports = j.viewports.data();
+        if (j.vs.pScissors) j.scissors.assign(j.vs.pScissors, j.vs.pScissors + j.vs.scissorCount), j.vs.pScissors = j.scissors.data();
+        j.pi.pViewportState = &j.vs;
+    }
+    if (i.pRasterizationState) j.ra = *i.pRasterizationState, j.pi.pRasterizationState = &j.ra;
+    if (i.pMultisampleState) j.ms = *i.pMultisampleState, j.pi.pMultisampleState = &j.ms;
+    if (i.pDepthStencilState) j.ds = *i.pDepthStencilState, j.pi.pDepthStencilState = &j.ds;
+    if (i.pColorBlendState) {
+        j.cb = *i.pColorBlendState;
+        if (j.cb.pAttachments) j.blends.assign(j.cb.pAttachments, j.cb.pAttachments + j.cb.attachmentCount), j.cb.pAttachments = j.blends.data();
+        j.pi.pColorBlendState = &j.cb;
+    }
+    if (i.pDynamicState) {
+        j.dyn = *i.pDynamicState;
+        if (j.dyn.pDynamicStates) j.dyn_states.assign(j.dyn.pDynamicStates, j.dyn.pDynamicStates + j.dyn.dynamicStateCount), j.dyn.pDynamicStates = j.dyn_states.data();
+        j.pi.pDynamicState = &j.dyn;
+    }
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL track_vkCreateGraphicsPipelines(VkDevice d, VkPipelineCache c, uint32_t n, const VkGraphicsPipelineCreateInfo *i, const VkAllocationCallbacks *a, VkPipeline *o)
 {
+    if (!c) c = g_pipe_cache;
+    if (g_pipe_wait && n == 1 && !a && pipe_can_wait(*i)) {
+        *o = VK_NULL_HANDLE;
+        pipe_keep(*i, o);
+        return VK_SUCCESS;
+    }
+    const double t0 = pipe_clock();
     VkResult r = real_vkCreateGraphicsPipelines(d, c, n, i, a, o);
+    g_pipe_ms += pipe_clock() - t0;
+    g_pipe_direct += n;
     if (r == VK_SUCCESS && g_tracking)
         for (uint32_t k = 0; k < n; k++) {
             VkPipeline h = o[k];
             g_undo.push_back([d, h] { ((PFN_vkDestroyPipeline)vkGetDeviceProcAddr(d, "vkDestroyPipeline"))(d, h, nullptr); });
         }
     return r;
+}
+
+// the file is the device's own: a machine with two cards keeps one for each
+static std::string pipe_cache_path()
+{
+    char name[64];
+    snprintf(name, sizeof name, "shaders_%04x_%04x.bin", g.props.vendorID, g.props.deviceID);
+    std::string p = name;
+#ifdef _WIN32
+    char exe[MAX_PATH];
+    if (GetModuleFileNameA(nullptr, exe, MAX_PATH)) {
+        p = exe;
+        p = p.substr(0, p.find_last_of("\\/") + 1) + name;
+    }
+#endif
+    return p;
+}
+
+// Once, with the device there. The file is given to the driver only if Vulkan's header on it says this card and this driver's data
+// (the drivers look too; this is so that no driver has to).
+static void pipe_cache_open()
+{
+    static bool tried;
+    if (tried) return;
+    tried = true;
+    static const bool off = getenv("HP2_PIPECACHE") && atoi(getenv("HP2_PIPECACHE")) == 0;
+    if (off || !vkCreatePipelineCache || !vkGetPipelineCacheData) return;
+    std::vector<unsigned char> data;
+    if (FILE *f = fopen(pipe_cache_path().c_str(), "rb")) {
+        fseek(f, 0, SEEK_END);
+        const long size = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        if (size > 0 && size <= (64 << 20)) {
+            data.resize((size_t)size);
+            if (fread(data.data(), 1, data.size(), f) != data.size()) data.clear();
+        }
+        fclose(f);
+    }
+    struct Head {
+        uint32_t length, version, vendor, device;
+        uint8_t uuid[VK_UUID_SIZE];
+    } h;
+    bool good = data.size() > sizeof h;
+    if (good) {
+        memcpy(&h, data.data(), sizeof h);
+        good = h.length >= sizeof h && h.version == (uint32_t)VK_PIPELINE_CACHE_HEADER_VERSION_ONE && h.vendor == g.props.vendorID &&
+               h.device == g.props.deviceID && !memcmp(h.uuid, g.props.pipelineCacheUUID, VK_UUID_SIZE);
+    }
+    VkPipelineCacheCreateInfo ci = {VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+    if (good) ci.initialDataSize = data.size(), ci.pInitialData = data.data();
+    if (vkCreatePipelineCache(g.dev, &ci, nullptr, &g_pipe_cache)) {
+        g_pipe_cache = VK_NULL_HANDLE;
+        ci.initialDataSize = 0, ci.pInitialData = nullptr;
+        good = false;
+        if (vkCreatePipelineCache(g.dev, &ci, nullptr, &g_pipe_cache)) g_pipe_cache = VK_NULL_HANDLE;
+    }
+    g_pipe_saved = good ? data.size() : 0;
+    fprintf(g_hle_log, "native: pipeline cache: %s\n",
+            !g_pipe_cache ? "none could be made" : good ? "taken from its file" : data.empty() ? "new, no file yet" : "new, the file is another driver's");
+}
+
+// to the file, when there is more in it than the file has: written beside and put in the file's place whole
+static void pipe_cache_save()
+{
+    if (!g_pipe_cache) return;
+    size_t size = 0;
+    if (vkGetPipelineCacheData(g.dev, g_pipe_cache, &size, nullptr) || !size || size == g_pipe_saved || size > (64u << 20)) return;
+    std::vector<unsigned char> data(size);
+    if (vkGetPipelineCacheData(g.dev, g_pipe_cache, &size, data.data()) != VK_SUCCESS || !size) return;
+    const std::string path = pipe_cache_path();
+#ifdef _WIN32
+    const std::string tmp = path + "." + std::to_string((unsigned)GetCurrentProcessId()) + ".tmp";
+#else
+    const std::string tmp = path + ".tmp";
+#endif
+    FILE *f = fopen(tmp.c_str(), "wb");
+    if (!f) return;
+    const bool written = fwrite(data.data(), 1, size, f) == size;
+    fclose(f);
+#ifdef _WIN32
+    if (!written || !MoveFileExA(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
+        DeleteFileA(tmp.c_str());
+        return;
+    }
+#else
+    if (!written || rename(tmp.c_str(), path.c_str())) {
+        remove(tmp.c_str());
+        return;
+    }
+#endif
+    g_pipe_saved = size;
+}
+
+static void pipes_begin()
+{
+    static const bool jobs_off = getenv("HP2_PIPEJOBS") && atoi(getenv("HP2_PIPEJOBS")) == 0;
+    pipe_cache_open();
+    pipes_retire();                         // (rebuild has done it already, before it took the rest apart)
+    if (!real_vkCmdBindPipeline) real_vkCmdBindPipeline = vkCmdBindPipeline, vkCmdBindPipeline = lazy_vkCmdBindPipeline;
+    g_pipe_jobs.clear();
+    g_pipe_ms = 0;
+    g_pipe_direct = 0;
+    g_pipe_wait = !jobs_off;
+}
+
+// setup_resources is through (made: all of it went well): what it asked for is made, by the workers and this thread. The pool is
+// the game's too: if the game's thread has it at this moment, the pieces are done here in order (cores.cpp), which is the old way.
+static bool pipes_end(bool made)
+{
+    g_pipe_wait = false;
+    if (g_pipe_lazy) {
+        // none made here: each variable gets its stand-in, and the thread begins on them
+        if (!made) {
+            g_pipe_jobs.clear();
+            return false;
+        }
+        g_pipe_live = std::move(g_pipe_jobs);
+        g_pipe_jobs.clear();
+        for (auto &j : g_pipe_live) {
+            const VkPipeline token = reinterpret_cast<VkPipeline>(j.get());
+            *j->out = token;
+            g_pipe_tokens[(uint64_t)(uintptr_t)token] = j.get();
+        }
+        fprintf(g_hle_log, "native: pipelines: %zu to be made when first bound and behind the picture, %u more in %.0f ms where asked for\n",
+                g_pipe_live.size(), g_pipe_direct, g_pipe_ms);
+        if (!g_pipe_live.empty()) {
+            g_pipe_running.store(true);
+            std::thread(pipe_background).detach();
+        }
+        return true;
+    }
+    bool ok = true;
+    const size_t count = made ? g_pipe_jobs.size() : 0;
+    const double t0 = pipe_clock();
+    if (count) {
+        const VkDevice d = g.dev;
+        jobs_each((int)count, [d](int k, int) {
+            PipeJob &j = *g_pipe_jobs[(size_t)k];
+            j.result = real_vkCreateGraphicsPipelines(d, g_pipe_cache, 1, &j.pi, nullptr, j.out);
+        });
+        for (size_t k = 0; k < count; k++) {
+            PipeJob &j = *g_pipe_jobs[k];
+            if (j.result != VK_SUCCESS) {
+                ok = false;
+                *j.out = VK_NULL_HANDLE;
+                continue;
+            }
+            VkPipeline h = *j.out;
+            g_undo.push_back([d, h] { ((PFN_vkDestroyPipeline)vkGetDeviceProcAddr(d, "vkDestroyPipeline"))(d, h, nullptr); });
+        }
+    }
+    const double jobs_ms = pipe_clock() - t0;
+    g_pipe_jobs.clear();
+    if (made) {
+        const size_t before = g_pipe_saved;
+        pipe_cache_save();
+        fprintf(g_hle_log, "native: pipelines: %zu in %.0f ms with %d workers, %u more in %.0f ms where asked for%s; the cache %zu KB%s\n", count, jobs_ms,
+                cores_workers(), g_pipe_direct, g_pipe_ms, ok ? "" : " (SOME WERE NOT MADE)", g_pipe_saved >> 10,
+                g_pipe_saved != before ? ", written to its file" : "");
+    }
+    return made && ok;
 }
 
 static uint32_t mem_type(uint32_t bits, VkMemoryPropertyFlags want)
@@ -563,6 +983,12 @@ static void vb_layout(VkDeviceSize total, VkDeviceSize side)
 // what the game's thread reads of it: as it stood when the last frame was done
 static std::atomic<uint32_t> g_cache_cap_pub{0};
 uint32_t native_vk_cache_vertices() { return g_cache_cap_pub.load(); }
+static std::atomic<bool> g_geo_ok_pub{false};
+bool native_vk_geo_ok() { return g_geo_ok_pub.load(); }
+// A merged draw's command: VkDrawIndirectCommand, or for the strips by indices VkDrawIndexedIndirectCommand, in cells of one size
+struct MergeCmd {
+    uint32_t count, instances, first, d, e;     // not indexed: d the instance; indexed: d the vertex offset (0), e the instance
+};
 
 static void device_vertices()
 {
@@ -688,7 +1114,7 @@ static bool merge_room(uint32_t draws, uint32_t cmds)
     if (dc != g.draws_cap && own_buffer(g.draws_buf, g.draws_mem, &g.draws_map, (VkDeviceSize)dc * sizeof(DrawData), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
         g.draws_cap = dc;
-    if (cc != g.cmds_cap && own_buffer(g.cmds_buf, g.cmds_mem, &g.cmds_map, (VkDeviceSize)cc * sizeof(VkDrawIndirectCommand), VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+    if (cc != g.cmds_cap && own_buffer(g.cmds_buf, g.cmds_mem, &g.cmds_map, (VkDeviceSize)cc * sizeof(MergeCmd), VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
                                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
         g.cmds_cap = cc;
     if ((was_d && g.draws_cap != was_d) || (was_c && g.cmds_cap != was_c))
@@ -1124,6 +1550,17 @@ static VkShaderModule shader(const uint32_t *code, size_t bytes)
 }
 
 static bool setup_resources();
+static bool g_stats_query;                  // the device counts the fragment shader's runs (HP2_DRAWPROF)
+
+// setup_resources, and the pipelines it asked for (pipes_begin, pipes_end above)
+static bool make_resources()
+{
+    const double t0 = pipe_clock();
+    pipes_begin();
+    const bool made = pipes_end(setup_resources());
+    fprintf(g_hle_log, "native: the renderer's own things made in %.0f ms\n", pipe_clock() - t0);
+    return made;
+}
 
 static bool setup()
 {
@@ -1246,7 +1683,13 @@ static bool setup()
     g.sample_shading = has.sampleRateShading != VK_FALSE && !getenv("HP2_NOMSSHADOW");
     // the draws merged (draw_target): many draws in one call, each with an instance number of its own. HP2_NOMERGE=1: one by one
     want.multiDrawIndirect = has.multiDrawIndirect;
+    // the strips' triangles by indices (native.cpp): an index is a vertex's place in the whole buffer, up to a gigabyte of it
+    want.fullDrawIndexUint32 = has.fullDrawIndexUint32;
+    g_geo_ok_pub = has.fullDrawIndexUint32 != VK_FALSE;
     want.drawIndirectFirstInstance = has.drawIndirectFirstInstance;
+    // HP2_DRAWPROF's count of the pixels shaded; asked of the device only for that
+    if (getenv("HP2_DRAWPROF")) want.pipelineStatisticsQuery = has.pipelineStatisticsQuery;
+    g_stats_query = want.pipelineStatisticsQuery != VK_FALSE;
     g.can_merge = has.multiDrawIndirect && has.drawIndirectFirstInstance && !getenv("HP2_NOMERGE");
     g.clip_far = has.shaderClipDistance && !getenv("HP2_NOCLIPFAR");
     g.can_aniso = has.samplerAnisotropy != VK_FALSE;
@@ -1272,16 +1715,56 @@ static bool setup()
     NV_STAND_IN(vkCreateCommandPool) NV_STAND_IN(vkCreateFence) NV_STAND_IN(vkCreateSemaphore) NV_STAND_IN(vkCreateSampler)
     NV_STAND_IN(vkCreateDescriptorSetLayout) NV_STAND_IN(vkCreateDescriptorPool) NV_STAND_IN(vkCreateGraphicsPipelines)
     g_tracking = true;
-    const bool made = setup_resources();
+    const bool made = make_resources();
     g_tracking = false;
     return made;
 }
 
 // the picture's size, the multisampling, the filter: what the settings say
+// The picture's format. B8G8R8A8, the GS's own 8 bits a channel, as it always was; with Dithering on (2026-11-18, the user: "it does
+// not seem to work") R16G16B16A16_UNORM, 16 bits a channel. Dithering was a pass over the finished 8-bit picture that smoothed what
+// lay within a few steps of its neighbours: with every step of the way kept to 8 bits (each blend, the fog, the shadows, the
+// brightness and gamma) there was nothing between two steps left to show, and a band wider than the pass's reach stayed a band. Now
+// the picture keeps what the shading and the blends really give, the steps of 1 / 255 are made once, where the picture goes to the
+// window, and the noise laid on just before that (native_extra.frag) turns them into grain instead of bands. UNORM and not a float
+// format: the GS's colours stop at 255 at every blend, and so must these. Everything the game draws into has the format (the user,
+// 2026-11-18: "the whole render"): the picture, its multisampled twin, its copy for the effects and the last frame's copy; the
+// mirror; the six views of the reflections, the sphere map folded from them and its copy. One format for all of them is also what
+// lets one set of pipelines draw into the picture and into the views (without multisampling they share it: the passes must agree).
+// The textures are the game's own 8 bits, and what is banded in them stays so. Not where a test reads a picture back as 4 bytes a
+// pixel (HP2_NATIVESHOT, HP2_PIXAB, HP2_ENVLOG), not with HP2_NATIVEEXACT; HP2_COLOR8=1: never.
+static VkFormat g_color_format = VK_FORMAT_B8G8R8A8_UNORM;
+static bool g_color_wide;
+static void choose_color_format()
+{
+    static const bool never = getenv("HP2_NATIVEEXACT") || getenv("HP2_NATIVESHOT") || getenv("HP2_PIXAB") || getenv("HP2_ENVLOG") || getenv("HP2_COLOR8");
+    g_color_format = VK_FORMAT_B8G8R8A8_UNORM;
+    g_color_wide = false;
+    if (!g_cfg.deband || never) return;
+    const VkFormat wide = VK_FORMAT_R16G16B16A16_UNORM;
+    const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+                                      VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT | VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
+    VkFormatProperties fp = {};
+    vkGetPhysicalDeviceFormatProperties(g.phys, wide, &fp);
+    bool ok = (fp.optimalTilingFeatures & need) == need;
+    if (ok && g.samples != VK_SAMPLE_COUNT_1_BIT) {
+        VkImageFormatProperties ip = {};
+        ok = vkGetPhysicalDeviceImageFormatProperties(g.phys, wide, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, 0, &ip) == VK_SUCCESS &&
+             (ip.sampleCounts & (VkSampleCountFlags)g.samples) != 0;
+    }
+    static int told = -1;
+    if (told != (int)ok) {
+        told = ok;
+        fprintf(g_hle_log, "native: dithering: the picture has %s\n", ok ? "16 bits a channel (the mirror and the reflections too), dithered as it goes to the window"
+                                                                        : "8 bits a channel (the card has no 16-bit picture for this): the old smoothing pass");
+    }
+    if (ok) g_color_format = wide, g_color_wide = true;
+}
+
 static uint64_t settings_key()
 {
     const uint32_t rest = (uint32_t)(g_cfg.msaa() << 8 | g_cfg.aniso << 16 | (g_cfg.aa_mode == 2) << 24 | (g_cfg.reflections == 2) << 25 |
-                                     (g_cfg.shadows >= 2 ? g_cfg.shadows - 1 : 0) << 26);
+                                     (g_cfg.shadows >= 2 ? g_cfg.shadows - 1 : 0) << 26 | (g_cfg.deband != 0) << 28);
     return (uint64_t)(uint32_t)native_aspect() << 32 | rest;
 }
 
@@ -1370,7 +1853,8 @@ static bool setup_resources()
         !make_buffer(g.readback, &g.rb_map, (VkDeviceSize)W * H * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT))
         return false;
     VkImageView cv, dv;
-    if (!make_image(g.color, cv, VK_FORMAT_B8G8R8A8_UNORM, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+    choose_color_format();
+    if (!make_image(g.color, cv, g_color_format, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                     VK_IMAGE_ASPECT_COLOR_BIT) ||
         !make_image(g.depth, dv, VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                     VK_IMAGE_ASPECT_DEPTH_BIT))
@@ -1392,9 +1876,9 @@ static bool setup_resources()
     g.scene_levels = 2;
     for (int m = W; m > 256; m >>= 1) g.scene_levels++;
     VkImageView scene_view, prev_view, palette_view;
-    if (!make_image(g.scene, scene_view, VK_FORMAT_B8G8R8A8_UNORM,
+    if (!make_image(g.scene, scene_view, g_color_format,
                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT, W, H, g.scene_levels) ||
-        !make_image(g.prev, prev_view, VK_FORMAT_B8G8R8A8_UNORM, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT) ||
+        !make_image(g.prev, prev_view, g_color_format, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT) ||
         !make_image(g.palette, palette_view, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT, 256, kPaletteRows))
         return false;
 
@@ -1406,14 +1890,13 @@ static bool setup_resources()
         {VK_SUBPASS_EXTERNAL, 0, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT, kAll, 0},
         {0, VK_SUBPASS_EXTERNAL, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT, kAll, 0}};
     VkAttachmentDescription at[2] = {};
-    at[0].format = VK_FORMAT_B8G8R8A8_UNORM;
+    at[0].format = g_color_format;
     at[0].samples = VK_SAMPLE_COUNT_1_BIT;
     at[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     at[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     at[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
     at[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
     at[0].finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    at[0].format = VK_FORMAT_B8G8R8A8_UNORM;
     at[1] = at[0];
     at[1].format = VK_FORMAT_D32_SFLOAT;
     at[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
@@ -1448,7 +1931,7 @@ static bool setup_resources()
     fb.layers = 1;
     if (vkCreateFramebuffer(g.dev, &fb, nullptr, &g.fb)) return false;
 
-    // the envmap views: the same formats, read back by the fold
+    // the envmap views, in the picture's format (g_color_format); the mirror's and the fold's passes below are made from this one too
     at[0].finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     if (vkCreateRenderPass(g.dev, &rp, nullptr, &g.env_pass)) return false;
     // the same going on with what a pass before left (the mirror, after its shadows)
@@ -1464,13 +1947,13 @@ static bool setup_resources()
         real_vkCreateRenderPass2 = (PFN_vkCreateRenderPass2)vkGetDeviceProcAddr(g.dev, "vkCreateRenderPass2");
         auto create2 = track_vkCreateRenderPass2;
         VkImageView msc, msd;
-        if (!real_vkCreateRenderPass2 || !make_image(g.color_ms, msc, VK_FORMAT_B8G8R8A8_UNORM, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1, g.samples) ||
+        if (!real_vkCreateRenderPass2 || !make_image(g.color_ms, msc, g_color_format, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1, g.samples) ||
             !make_image(g.depth_ms, msd, VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1, g.samples))
             return false;
         VkAttachmentDescription2 a2[4] = {};
         for (int i = 0; i < 4; i++) {
             a2[i].sType = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2;
-            a2[i].format = i & 1 ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_B8G8R8A8_UNORM;
+            a2[i].format = i & 1 ? VK_FORMAT_D32_SFLOAT : g_color_format;
             a2[i].samples = i < 2 ? g.samples : VK_SAMPLE_COUNT_1_BIT;
             a2[i].loadOp = i < 2 ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
             a2[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -1531,7 +2014,7 @@ static bool setup_resources()
         if (g.sample_shading) {
             VkAttachmentDescription ra[2] = {};
             for (int i = 0; i < 2; i++) {
-                ra[i].format = i ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_B8G8R8A8_UNORM;
+                ra[i].format = i ? VK_FORMAT_D32_SFLOAT : g_color_format;
                 ra[i].samples = g.samples;
                 ra[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
                 ra[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -1562,7 +2045,7 @@ static bool setup_resources()
     if (!make_image(g.env_depth, ed, VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT, ENV_SIZE, ENV_SIZE)) return false;
     VkImageView env_view[6];
     for (int i = 0; i < 6; i++) {
-        if (!make_image(g.env[i], env_view[i], VK_FORMAT_B8G8R8A8_UNORM, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        if (!make_image(g.env[i], env_view[i], g_color_format, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                         VK_IMAGE_ASPECT_COLOR_BIT, ENV_SIZE, ENV_SIZE))
             return false;
         VkImageView v2[2] = {env_view[i], ed};
@@ -1577,7 +2060,7 @@ static bool setup_resources()
     g.rvm_h = std::max(H / 7, 1);
     VkImageView rv, rd;
     if (!make_buffer(g.rvm_rb, &g.rvm_rb_map, (VkDeviceSize)g.rvm_w * g.rvm_h * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT)) return false;
-    if (!make_image(g.rvm, rv, VK_FORMAT_B8G8R8A8_UNORM, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT, g.rvm_w, g.rvm_h) ||
+    if (!make_image(g.rvm, rv, g_color_format, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT, g.rvm_w, g.rvm_h) ||
         !make_image(g.rvm_depth, rd, VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_DEPTH_BIT,
                     g.rvm_w, g.rvm_h))
         return false;
@@ -1619,10 +2102,14 @@ static bool setup_resources()
     {
         // Ultra (a test setting, the user, 2026-11-17): 1024, a map of 8192 x 8192, 256 MB; not on a card with no image that large
         g.shadow_cell = g_cfg.shadows >= 3 ? 1024 : g_cfg.shadows == 2 ? 512 : 256;
-        if ((uint32_t)(g.shadow_cell * kShadowRows) > g.props.limits.maxImageDimension2D) g.shadow_cell = 512;
+        // Ultra has two rows more below the glass, for the tunnels' lamps (native.cpp, "the tunnels' lamps"): 8192 x 10240, 320 MB
+        g.lamp_row = g_cfg.shadows >= 2;     // Very High (4096 x 5120, 80 MB) and Ultra
+        const int rows = kShadowRows + (g.lamp_row ? kLampRows : 0);
+        if ((uint32_t)(g.shadow_cell * rows) > g.props.limits.maxImageDimension2D) g.shadow_cell = 512;
+        g.shadow_h = g.shadow_cell * rows;
         g.shadow_ready = false;
         if (!make_image(g.shadow_map, g.shadow_view, VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-                        VK_IMAGE_ASPECT_DEPTH_BIT, g.shadow_cell * kShadowAcross, g.shadow_cell * kShadowRows))
+                        VK_IMAGE_ASPECT_DEPTH_BIT, g.shadow_cell * kShadowAcross, g.shadow_h))
             return false;
         VkAttachmentDescription sa = at[1];
         sa.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
@@ -1643,12 +2130,16 @@ static bool setup_resources()
         sf.attachmentCount = 1;
         sf.pAttachments = &g.shadow_view;
         sf.width = g.shadow_cell * kShadowAcross;
-        sf.height = g.shadow_cell * kShadowRows;
+        sf.height = g.shadow_h;
         if (vkCreateFramebuffer(g.dev, &sf, nullptr, &g.shadow_fb)) return false;
     }
     // Ambient Occlusion: its image, half the picture each way, and the pass that makes it
     {
         g.ao_w = (W + 1) / 2, g.ao_h = (H + 1) / 2;
+        if (!make_image(g.depth_world, g.depth_world_view, VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                        VK_IMAGE_ASPECT_DEPTH_BIT))
+            return false;
+        g.world_ready = false;
         if (!make_image(g.ao, g.ao_view, VK_FORMAT_R8_UNORM, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_IMAGE_ASPECT_COLOR_BIT, g.ao_w,
                         g.ao_h))
             return false;
@@ -1679,7 +2170,7 @@ static bool setup_resources()
     // the sphere map: kept from frame to frame
     VkImageView sv;
     if (!make_buffer(g.sphere_rb, &g.sphere_rb_map, SPHERE_SIZE * SPHERE_SIZE * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT)) return false;
-    if (!make_image(g.sphere, sv, VK_FORMAT_B8G8R8A8_UNORM,
+    if (!make_image(g.sphere, sv, g_color_format,
                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                     VK_IMAGE_ASPECT_COLOR_BIT, SPHERE_SIZE, SPHERE_SIZE))
         return false;
@@ -1726,7 +2217,8 @@ static bool setup_resources()
     sl.pBindings = &sb;
     if (vkCreateDescriptorSetLayout(g.dev, &sl, nullptr, &g.set_layout)) return false;
     // the lights, and the merged draws' matrices and lights
-    VkDescriptorSetLayoutBinding lb[2] = {{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr},
+    // the lights are read by the shadows' fragment shader too: the tunnel lamps' blocks (native.cpp, lamps_pick)
+    VkDescriptorSetLayoutBinding lb[2] = {{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
                                           {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_VERTEX_BIT, nullptr}};
     VkDescriptorSetLayoutCreateInfo ll = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     ll.bindingCount = 2;
@@ -1778,7 +2270,7 @@ static bool setup_resources()
     if (vkAllocateDescriptorSets(g.dev, &la, &g.sphere_set)) return false;
     bind_view(g.sphere_set, sv, g.sampler[4 | 8]);
     VkImageView spv;
-    if (!make_image(g.sphere_prev, spv, VK_FORMAT_B8G8R8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT, SPHERE_SIZE, SPHERE_SIZE))
+    if (!make_image(g.sphere_prev, spv, g_color_format, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT, SPHERE_SIZE, SPHERE_SIZE))
         return false;
     if (vkAllocateDescriptorSets(g.dev, &la, &g.sphere_prev_set)) return false;
     bind_view(g.sphere_prev_set, spv, g.sampler[0]);
@@ -1825,6 +2317,8 @@ static bool setup_resources()
     bind_view(g.shadow_set, g.shadow_view, g.sampler[0]);
     if (vkAllocateDescriptorSets(g.dev, &la, &g.ao_set)) return false;
     bind_view(g.ao_set, g.ao_view, g.sampler[0]);
+    if (vkAllocateDescriptorSets(g.dev, &la, &g.ao_world_set)) return false;
+    bind_view(g.ao_world_set, g.depth_world_view, g.sampler[0]);
     if (g.depth_copy) {
         if (vkAllocateDescriptorSets(g.dev, &la, &g.soft_set)) return false;
         bind_view(g.soft_set, g.depth_copy_view, g.sampler[0]);
@@ -1866,9 +2360,14 @@ static bool setup_resources()
     const VkShaderModule frag_clip = g.clip_far ? shader(kFragClip, sizeof kFragClip) : VK_NULL_HANDLE;
     // the old shaders as well only for HP2_PERFAB's comparison, or where there is no clip distance
     const bool old_too = getenv("HP2_PERFAB") != nullptr || getenv("HP2_PIXAB") != nullptr;
-    VkBool32 spec_alpha_test = VK_TRUE;
-    VkSpecializationMapEntry spec_entry = {0, 0, sizeof(VkBool32)};
-    VkSpecializationInfo spec = {1, &spec_entry, sizeof(VkBool32), &spec_alpha_test};
+    // the shader's constants: ALPHA_TEST, and WIDE with the picture of 16 bits a channel (Dithering on: nothing rounded to a byte)
+    VkBool32 spec_data[2] = {VK_TRUE, g_color_wide ? VK_TRUE : VK_FALSE};
+    VkBool32 &spec_alpha_test = spec_data[0];
+    VkSpecializationMapEntry spec_entry[2] = {{0, 0, sizeof(VkBool32)}, {1, sizeof(VkBool32), sizeof(VkBool32)}};
+    VkSpecializationInfo spec = {2, spec_entry, sizeof spec_data, spec_data};
+    // the fold's: WIDE alone
+    VkSpecializationMapEntry fold_spec_entry = {0, 0, sizeof(VkBool32)};
+    VkSpecializationInfo fold_spec = {1, &fold_spec_entry, sizeof(VkBool32), &spec_data[1]};
     // the second binding is the same buffer again, for the place of a vertex in the picture halfway (a_pos_mid): from further on
     // in the buffer for a draw with a second copy of its vertices (NativeDraw::mid_verts), else the vertex itself
     VkVertexInputBindingDescription bind[2] = {{0, sizeof(NativeVertex), VK_VERTEX_INPUT_RATE_VERTEX}, {1, sizeof(NativeVertex), VK_VERTEX_INPUT_RATE_VERTEX}};
@@ -1979,6 +2478,8 @@ static bool setup_resources()
         if (vkCreatePipelineLayout(g.dev, &sli, nullptr, &g.soft_layout)) return false;
         st[0].module = g.clip_far ? vert_clip : vert_old;
         st[1].module = shader(kFragSoft, sizeof kFragSoft);
+        spec_alpha_test = VK_TRUE;
+        st[1].pSpecializationInfo = &spec;
         pi.layout = g.soft_layout;
         ds.depthTestEnable = VK_TRUE;
         ds.depthWriteEnable = VK_FALSE;
@@ -2005,6 +2506,7 @@ static bool setup_resources()
         ds.depthCompareOp = VK_COMPARE_OP_GREATER_OR_EQUAL;
         ba.blendEnable = VK_FALSE;
         pi.layout = g.layout;
+        st[1].pSpecializationInfo = nullptr;
         g.soft_ok = true;
     }
 
@@ -2017,8 +2519,13 @@ static bool setup_resources()
         ds.depthCompareOp = VK_COMPARE_OP_GREATER;
         cb.attachmentCount = 0;
         if (vkCreateGraphicsPipelines(g.dev, VK_NULL_HANDLE, 1, &pi, nullptr, &g.shadow_cast)) return false;
-        cb.attachmentCount = 1;
+        // and with the scene's fragment shader for the draws with the alpha test: what it throws away is no car
         pi.stageCount = 2;
+        st[1].module = g.clip_far ? frag_clip : frag_old;
+        spec_alpha_test = VK_TRUE;
+        st[1].pSpecializationInfo = &spec;
+        if (vkCreateGraphicsPipelines(g.dev, VK_NULL_HANDLE, 1, &pi, nullptr, &g.shadow_cast_test)) return false;
+        cb.attachmentCount = 1;
         ds.depthCompareOp = VK_COMPARE_OP_GREATER_OR_EQUAL;
     }
 
@@ -2044,7 +2551,9 @@ static bool setup_resources()
     pi.layout = g.fold_layout;
     pi.renderPass = g.fold_pass;
     pi.pDepthStencilState = nullptr;
+    st[1].pSpecializationInfo = &fold_spec;
     if (vkCreateGraphicsPipelines(g.dev, VK_NULL_HANDLE, 1, &pi, nullptr, &g.fold_pipeline)) return false;
+    st[1].pSpecializationInfo = nullptr;
     ba.blendEnable = VK_TRUE;
     ba.colorBlendOp = VK_BLEND_OP_ADD;
 
@@ -2072,10 +2581,11 @@ static bool setup_resources()
     // Shadows: High: a shadow over the picture by its depth (native_shadow.frag): the depth's set, and the patch's texture or the map
     {
         const VkPipelineColorBlendAttachmentState ba_was = ba;
-        VkDescriptorSetLayout shadow_sets[2] = {g.post_set_layout, g.set_layout};
+        // the third: the frame's lights, for the tunnel lamps' blocks (mode 3)
+        VkDescriptorSetLayout shadow_sets[3] = {g.post_set_layout, g.set_layout, g.light_layout};
         VkPushConstantRange spc = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(ShadowPush)};
         VkPipelineLayoutCreateInfo sl = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-        sl.setLayoutCount = 2;
+        sl.setLayoutCount = 3;
         sl.pSetLayouts = shadow_sets;
         sl.pushConstantRangeCount = 1;
         sl.pPushConstantRanges = &spc;
@@ -2141,7 +2651,7 @@ static bool setup_resources()
         la.pSetLayouts = &g.set_layout;
         if (vkAllocateDescriptorSets(g.dev, &la, &g.grade_set)) return false;
         bind_view(g.grade_set, scene_view, g.sampler[0]);
-        VkPushConstantRange gpc = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(float) * 3};
+        VkPushConstantRange gpc = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(float) * 4};
         VkPipelineLayoutCreateInfo gl = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         gl.setLayoutCount = 1;
         gl.pSetLayouts = &g.set_layout;
@@ -2307,6 +2817,11 @@ static bool setup_resources()
     VkFenceCreateInfo fi = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     fi.flags = VK_FENCE_CREATE_SIGNALED_BIT;
     if (vkCreateFence(g.dev, &fi, nullptr, &g.fence)) return false;
+    // depth_send_early's: without them the rects go at the end of the frame, as before
+    if (vkAllocateCommandBuffers(g.dev, &ca, &g.cmd_b) || vkCreateFence(g.dev, &fi, nullptr, &g.depth_fence)) {
+        g.cmd_b = VK_NULL_HANDLE;
+        g.depth_fence = VK_NULL_HANDLE;
+    }
     return true;
 }
 
@@ -2314,7 +2829,10 @@ static bool setup_resources()
 // The device and the swapchain stay, so the window goes on.
 static bool rebuild()
 {
+    const double idle0 = pipe_clock();
     vkDeviceWaitIdle(g.dev);
+    fprintf(g_hle_log, "native: the settings changed: the device waited for %.0f ms\n", pipe_clock() - idle0);
+    pipes_retire();                         // before what the pipelines are made of goes
     free_dead_textures();
     for (VkTex *t : g.textures) free_texture(t);
     g.textures.clear();
@@ -2327,8 +2845,9 @@ static bool rebuild()
     g.waiting = false;
     g.depth_rects.clear();
     g.depth_places.clear();
+    g.depth_early = false;
     g_tracking = true;
-    const bool made = setup_resources();
+    const bool made = make_resources();
     g_tracking = false;
     fprintf(stderr, "native: picture %dx%d, %d samples, anisotropy %d\n", W, H, (int)g.samples, g.aniso);
     return made;
@@ -2343,15 +2862,48 @@ static void active_region(const NativeFrame &frame, float &ox, float &sx, float 
     sy = H / 448.0f;
 }
 
-static void copy_scene();
+static void copy_scene(bool levels = true);
+
+// ---- the picture's last passes, cheaper (2026-11-24) ---------------------------------------------------------------------------
+// Intel's UHD 630 at 3840x2180 (the user's ride, speed_uhd630_prof.log): the brightness / contrast / gamma and the dithering took
+// some 20 ms of a frame, SMAA 20 more and the alpha's pass before the window its share of 6. Each of the three read a copy of the
+// picture made for it, and every copy came with the five smaller levels the blur effects need and these never read (texelFetch
+// and textureLod at level 0; SMAA's sampler has the first level only). Now:
+//   - their copies are the picture's first level alone (copy_scene(false));
+//   - with the picture at 16 bits a channel the three settings are worked in the dithering's pass (native_extra.frag does
+//     native_grade.frag's sums, and rounds to the 16 bits the picture would have kept them in): one copy and one pass in place of
+//     two and two. With a picture of 8 bits, or one of the two off, the passes are as they were;
+//   - the last of these passes writes the alpha 1 that opaque_picture wrote after it, over the same part of the picture the
+//     window is shown (blit_to_window takes the scissor's own columns), and opaque_picture is then left out. Not with
+//     HP2_NATIVESHOT: a shot is read between the two and has the game's alpha.
+// HP2_POSTMERGE=0: all as before.
+static const bool g_post_merge = !(getenv("HP2_POSTMERGE") && atoi(getenv("HP2_POSTMERGE")) == 0);
+static bool g_opaque_done;                  // this picture's alpha is 1 already (draw_frame clears it before the passes)
+
+static bool post_graded()
+{
+    static const bool exact = getenv("HP2_NATIVEEXACT") != nullptr;
+    return !exact && !(g_cfg.brightness == 0 && g_cfg.contrast == 100 && g_cfg.gamma == 100);
+}
+static bool post_dithered()
+{
+    static const bool exact = getenv("HP2_NATIVEEXACT") != nullptr;
+    return !exact && g_cfg.deband;
+}
+static bool post_folds_alpha()
+{
+    static const bool shots = getenv("HP2_NATIVESHOT") != nullptr;
+    return g_post_merge && !shots;
+}
 
 // Brightness, contrast and gamma from the settings on the finished picture, in the frame's own part of it: the bars beside stay black.
 // At their defaults nothing runs. After the copy for the next frame's DisplayBlendPrevious, so it does not build up from frame to frame.
 static void grade_picture(const NativeFrame &frame)
 {
-    static const bool exact = getenv("HP2_NATIVEEXACT") != nullptr;
-    if (exact || (g_cfg.brightness == 0 && g_cfg.contrast == 100 && g_cfg.gamma == 100)) return;
-    copy_scene();
+    if (!post_graded()) return;
+    if (g_post_merge && g_color_wide && post_dithered()) return;       // in dither_picture's pass
+    const bool last = !post_dithered() && post_folds_alpha();
+    copy_scene(false);
     float ox, sx, sy;
     active_region(frame, ox, sx, sy);
     VkRenderPassBeginInfo rb = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
@@ -2365,11 +2917,12 @@ static void grade_picture(const NativeFrame &frame)
     vkCmdSetScissor(g.cmd, 0, 1, &sc);
     vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.grade_pipeline);
     vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.grade_layout, 0, 1, &g.grade_set, 0, nullptr);
-    const float push[3] = {g_cfg.brightness / 100.0f, g_cfg.contrast / 100.0f, g_cfg.gamma / 100.0f};
+    const float push[4] = {g_cfg.brightness / 100.0f, g_cfg.contrast / 100.0f, g_cfg.gamma / 100.0f, last ? 1.0f : 0.0f};
     vkCmdPushConstants(g.cmd, g.grade_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof push, push);
     vkCmdDraw(g.cmd, 3, 1, 0, 0);
     vkCmdEndRenderPass(g.cmd);
     all_barrier();
+    if (last) g_opaque_done = true;
 }
 
 // SMAA on the finished picture, the 2D over it included (the game's 3D and 2D are one list in one picture): the edges by luma, the weights,
@@ -2396,7 +2949,7 @@ static void smaa_picture()
                           VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
         }
     }
-    copy_scene();
+    copy_scene(false);
     struct {
         float rt[4], threshold;
         int steps, diag, corner;
@@ -2452,19 +3005,47 @@ static int g_ab;                            // this frame's variant
 static double g_ab_scene[2], g_ab_total[2];
 static int g_ab_n[2];
 
-// HP2_DRAWPROF: once every 600 frames, a timestamp every 16 draws of the scene; the slowest stretches go to the log with what was in them
-static const bool g_dp_on = getenv("HP2_DRAWPROF") != nullptr;
-static VkQueryPool g_dp_pool;
+// HP2_DRAWPROF=<n>: once every n frames (600 without a number above 1) the main picture's pass is timed in stretches, and the
+// log says where its time went. A stretch is up to 16 draws of one kind (opaque, opaque with the alpha test, blended), or what is
+// laid over the picture between two of its passes (an effect: the fog, the shadows, the ambient occlusion ...; the depth's copy for
+// the soft sprites). Made full on 2026-11-24 for Intel's UHD 630, where the whole frame is the GPU's (the scene 90 to 220 ms of
+// it) and the question is what in the scene: each stretch also counts the pixels its draws shaded (a pipeline statistics query,
+// the fragment shader's runs: a pixel the depth test turned away before the shader is not among them), so the sums say how many
+// times over the picture is shaded, and by what. That frame's draws go one by one (not merged), so its own time is a little more.
+static const int g_dp_period = [] {
+    const char *e = getenv("HP2_DRAWPROF");
+    if (!e) return 0;
+    const int n = atoi(e);
+    return n >= 2 ? n : 600;
+}();
+static const bool g_dp_on = g_dp_period != 0;
+enum { kDpMax = 2048 };
+enum { DP_OPAQUE, DP_TEST, DP_BLEND, DP_FX, DP_END };
+enum { DP_FX_SOFT_DEPTH = 5 };              // DP_FX's sub: the effect's kind (FX_FOG ...), or this
+static VkQueryPool g_dp_pool, g_dp_stat_pool;
 static bool g_dp_now, g_dp_pending;
-struct DpSeg { uint32_t draw, draws, vertices, sphere, road, alpha, blended, big; };
-static DpSeg g_dp_seg[512];
-static uint32_t g_dp_n;
+static bool g_dp_open;                      // the last stretch's count of pixels is running
+static bool g_dp_fresh;                     // the next draw begins a stretch (a pass has just begun)
+struct DpSeg { uint32_t draw, draws, vertices, sphere, road, alpha, blended, big, kind, sub; };
+static DpSeg g_dp_seg[kDpMax];
+static uint32_t g_dp_n, g_dp_frame;
 
-static void dp_mark(uint32_t draw)
+// A stretch begins here and the one before ends. counted: inside the picture's pass, its pixels are counted (a count begins and
+// ends within one pass, so every pass's end is a mark too).
+static void dp_mark(uint32_t draw, uint32_t kind, uint32_t fx, bool counted)
 {
-    if (!g_dp_now || g_dp_n >= 512) return;
+    if (!g_dp_now) return;
+    if (g_dp_open) {
+        vkCmdEndQuery(g.cmd, g_dp_stat_pool, g_dp_n - 1);
+        g_dp_open = false;
+    }
+    if (g_dp_n >= kDpMax) return;
     vkCmdWriteTimestamp(g.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_dp_pool, g_dp_n);
-    g_dp_seg[g_dp_n] = {draw, 0, 0, 0, 0, 0, 0, 0};
+    g_dp_seg[g_dp_n] = {draw, 0, 0, 0, 0, 0, 0, 0, kind, fx};
+    if (counted && g_dp_stat_pool && g_dp_n + 1 < kDpMax) {
+        vkCmdBeginQuery(g.cmd, g_dp_stat_pool, g_dp_n, 0);
+        g_dp_open = true;
+    }
     g_dp_n++;
 }
 
@@ -2473,22 +3054,81 @@ static void dp_read()
     if (!g_dp_pending) return;
     g_dp_pending = false;
     if (g_dp_n < 3) return;
-    static uint64_t t[512];
+    static uint64_t t[kDpMax];
+    static uint64_t st[kDpMax][2];          // the pixels shaded, and whether the count is there
     if (vkGetQueryPoolResults(g.dev, g_dp_pool, 0, g_dp_n, sizeof t, t, sizeof t[0], VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) return;
-    const double ns = g.props.limits.timestampPeriod;
+    memset(st, 0, sizeof st);
+    bool counted = false;
+    if (g_dp_stat_pool) {
+        const VkResult r = vkGetQueryPoolResults(g.dev, g_dp_stat_pool, 0, g_dp_n, sizeof st, st, sizeof st[0],
+                                                 VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+        counted = r == VK_SUCCESS || r == VK_NOT_READY;
+        if (!counted) memset(st, 0, sizeof st);
+    }
+    const double ns = g.props.limits.timestampPeriod, picture = (double)W * (double)H;
+    struct Sum {
+        double ms, px;
+        unsigned long long draws, vertices;
+        unsigned n;
+    };
+    Sum by[3] = {}, fx[8] = {}, cars = {}, road = {}, rest = {}, tenth[10] = {}, all = {};
+    const uint32_t last_draw = std::max(g_dp_seg[g_dp_n - 1].draw, 1u);
     std::vector<std::pair<double, uint32_t>> d;
     double total = 0;
+    static double px_of[kDpMax];
     for (uint32_t i = 0; i + 1 < g_dp_n; i++) {
         double ms = t[i + 1] > t[i] ? (double)(t[i + 1] - t[i]) * ns / 1e6 : 0;
         total += ms;
         d.push_back({ms, i});
+        const DpSeg &s = g_dp_seg[i];
+        const double px = st[i][1] ? (double)st[i][0] : 0;
+        px_of[i] = px;
+        auto add = [&](Sum &to) {
+            to.ms += ms, to.px += px, to.draws += s.draws, to.vertices += s.vertices, to.n++;
+        };
+        add(all);
+        if (s.kind == DP_FX) {
+            add(fx[std::min(s.sub, 7u)]);
+        } else if (s.kind <= DP_BLEND) {
+            add(by[s.kind]);
+            add(s.sphere * 2 > s.draws ? cars : s.road * 2 > s.draws ? road : rest);
+            add(tenth[std::min((uint32_t)((uint64_t)s.draw * 10 / last_draw), 9u)]);
+        }
     }
     std::sort(d.begin(), d.end(), [](auto &a, auto &b) { return a.first > b.first; });
-    fprintf(g_hle_log, "native: drawprof %.3f ms over %u stretches\n", total, g_dp_n - 1);
+    fprintf(g_hle_log, "native: drawprof frame %u: the picture's pass %.2f ms over %u stretches, %llu draws, %llu vertices; picture %dx%d, %d samples%s\n", g_dp_frame,
+            total, g_dp_n - 1, all.draws, all.vertices, W, H, (int)g.samples, g_dp_n >= kDpMax ? " (MORE STRETCHES THAN THERE IS ROOM FOR: the end is missing)" : "");
+    if (counted)
+        fprintf(g_hle_log, "native: drawprof   pixels shaded %.2f M = %.2f times the picture\n", all.px / 1e6, all.px / picture);
+    else
+        fprintf(g_hle_log, "native: drawprof   (the device does not count the pixels shaded)\n");
+    const auto line = [&](const char *name, const Sum &m) {
+        if (!m.n) return;
+        fprintf(g_hle_log, "native: drawprof   %-22s %8.2f ms (%4.1f%%), %5llu draws, %7llu vertices, %7.2f M pixels = %5.2f pictures, %.2f ms a picture\n", name, m.ms,
+                total > 0 ? m.ms * 100 / total : 0, m.draws, m.vertices, m.px / 1e6, m.px / picture, m.px > 0 ? m.ms * picture / m.px : 0);
+    };
+    line("opaque", by[DP_OPAQUE]);
+    line("opaque, alpha test", by[DP_TEST]);
+    line("blended", by[DP_BLEND]);
+    static const char *const fx_name[8] = {"fx: fog", "fx: grey", "fx: depth of field", "fx: shadows", "fx: ambient occlusion", "soft sprites' depth", "fx: ambient occlusion's world", "fx 7"};
+    for (int k = 0; k < 8; k++)
+        if (fx[k].n)
+            fprintf(g_hle_log, "native: drawprof   %-22s %8.2f ms (%4.1f%%), %u times (with the draws left of the stretch before it)\n", fx_name[k], fx[k].ms,
+                    total > 0 ? fx[k].ms * 100 / total : 0, fx[k].n);
+    line("of the draws: cars", cars);
+    line("of the draws: road", road);
+    line("of the draws: the rest", rest);
+    fprintf(g_hle_log, "native: drawprof   by tenths of the draws' order, ms:");
+    for (int k = 0; k < 10; k++) fprintf(g_hle_log, " %.1f", tenth[k].ms);
+    fprintf(g_hle_log, "; pictures shaded:");
+    for (int k = 0; k < 10; k++) fprintf(g_hle_log, " %.2f", tenth[k].px / picture);
+    fprintf(g_hle_log, "\n");
+    static const char *const kind_name[5] = {"opaque", "alpha test", "blended", "fx", "end"};
     for (size_t k = 0; k < d.size() && k < 12; k++) {
         const DpSeg &s = g_dp_seg[d[k].second];
-        fprintf(g_hle_log, "native: drawprof %.3f ms from draw %u: %u draws, %u vertices, sphere %u, road %u, alpha-test %u, blended %u, over 3000 vertices %u\n",
-                d[k].first, s.draw, s.draws, s.vertices, s.sphere, s.road, s.alpha, s.blended, s.big);
+        fprintf(g_hle_log, "native: drawprof %.3f ms from draw %u (%s%s%s): %u draws, %u vertices, %.2f pictures shaded, sphere %u, road %u, alpha-test %u, blended %u, over 3000 vertices %u\n",
+                d[k].first, s.draw, kind_name[std::min(s.kind, 4u)], s.kind == DP_FX ? " " : "", s.kind == DP_FX ? fx_name[std::min(s.sub, 7u)] : "", s.draws,
+                s.vertices, px_of[d[k].second] / picture, s.sphere, s.road, s.alpha, s.blended, s.big);
     }
     // the spread: how many stretches it takes for half of the time
     double half = 0;
@@ -2518,7 +3158,7 @@ static void draw_target(const NativeFrame &frame, int target, int vw, int vh, si
     const VkDeviceSize zeros[2] = {0, 0};
     vkCmdBindVertexBuffers(g.cmd, 0, 2, both, zeros);
     VkDeviceSize mid_off = 0;               // where the second binding starts: a draw's second copy of its vertices less its first
-    vkCmdBindIndexBuffer(g.cmd, g.vb, g.draw_idx_off, VK_INDEX_TYPE_UINT32);
+    vkCmdBindIndexBuffer(g.cmd, g.vb, frame.geo_indexed ? 0 : g.draw_idx_off, VK_INDEX_TYPE_UINT32);
     vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.layout, 1, 1, &g.light_set, 0, nullptr);
     VkTex *road = frame.road_specular ? (VkTex *)frame.road_specular->vk : nullptr;
     VkTex *env_tex = frame.env_override ? (VkTex *)frame.env_override->vk : nullptr;
@@ -2561,6 +3201,8 @@ static void draw_target(const NativeFrame &frame, int target, int vw, int vh, si
         // the pictures of this renderer: clamped and linear, as TEX1's 0xe0 has it at level 0
         p.tex_mode = which == 2 && env_tex ? frame.env_mode | 64
                    : which == 2 || d.rt >= 0 || !d.tex ? 4 | 8 : which == 1 ? frame.road_mode : d.tex_mode;
+        // the mirror's picture on a car's own mirror glass: native.frag's sample_glass (native.cpp, mirror_glass_now)
+        if (which == 0 && d.rt == NATIVE_RT_MIRROR && (d.tex_mode & 128)) p.tex_mode |= 128;
         // what VU1 transforms, the world, whatever filter the game gave the texture; the setting's filter leaves the 2D and the envmap views
         // to the GS's sampling. HP2_AFOLD: only the textures the game filters linear, as it was; HP2_AFFLIP: that and this by turns of
         // 120 frames, for two pictures of one place
@@ -2585,12 +3227,17 @@ static void draw_target(const NativeFrame &frame, int target, int vw, int vh, si
             vkCmdBindVertexBuffers(g.cmd, 1, 1, &g.vb, &mid_want);
             mid_off = mid_want;
         }
-        if (merged_cmds) {
-            vkCmdDrawIndirect(g.cmd, g.cmds_buf, (VkDeviceSize)merged_from * sizeof(VkDrawIndirectCommand), merged_cmds, sizeof(VkDrawIndirectCommand));
+        if (merged_cmds && frame.geo_indexed && d.ranges) {
+            vkCmdDrawIndexedIndirect(g.cmd, g.cmds_buf, (VkDeviceSize)merged_from * sizeof(MergeCmd), merged_cmds, sizeof(MergeCmd));
+        } else if (merged_cmds) {
+            vkCmdDrawIndirect(g.cmd, g.cmds_buf, (VkDeviceSize)merged_from * sizeof(MergeCmd), merged_cmds, sizeof(MergeCmd));
         } else if (d.ranges) {
             // the strips' vertices where they lie in the buffer: the same triangles in the same order as their indices gave
             const NativeRange *r = frame.ranges.data() + d.first;
-            for (uint32_t i = 0; i < d.ranges; i++) vkCmdDraw(g.cmd, r[i].count, 1, r[i].first, 0);
+            if (frame.geo_indexed)
+                for (uint32_t i = 0; i < d.ranges; i++) vkCmdDrawIndexed(g.cmd, r[i].count, 1, r[i].first, 0, 0);
+            else
+                for (uint32_t i = 0; i < d.ranges; i++) vkCmdDraw(g.cmd, r[i].count, 1, r[i].first, 0);
         } else if (d.indexed) {
             vkCmdDrawIndexed(g.cmd, d.count, 1, d.first, 0, 0);
         } else {
@@ -2607,6 +3254,7 @@ static void draw_target(const NativeFrame &frame, int target, int vw, int vh, si
         VkDescriptorSet set;
         float factor, scroll[2], snap[2], view[4];
         int flags, tfx, lod_l, tex_mode, alpha_test, textured, upscaled, min_linear;
+        int by_indices;                     // the run's commands are indexed ones: strips' draws do not share a run with the others
     };
     RunKey run_key;
     const NativeDraw *run_first = nullptr;
@@ -2629,9 +3277,11 @@ static void draw_target(const NativeFrame &frame, int target, int vw, int vh, si
         if (!d.count || !mine) continue;
         if (g_dp_now && target == 1) {
             static uint32_t since;
-            if (g_dp_n == 0 || ++since >= 16) {
+            const uint32_t kind = d.blend != NB_OPAQUE ? DP_BLEND : d.alpha_test ? DP_TEST : DP_OPAQUE;
+            if (g_dp_n == 0 || g_dp_fresh || ++since >= 16 || g_dp_seg[g_dp_n - 1].kind != kind) {
                 since = 0;
-                dp_mark((uint32_t)i);
+                g_dp_fresh = false;
+                dp_mark((uint32_t)i, kind, 0, true);
             }
             DpSeg &s = g_dp_seg[g_dp_n - 1];
             s.draws++;
@@ -2706,6 +3356,7 @@ static void draw_target(const NativeFrame &frame, int target, int vw, int vh, si
                 memcpy(key.view, d.view, sizeof key.view);
                 key.flags = d.flags, key.tfx = d.tfx, key.lod_l = d.lod_l, key.tex_mode = d.tex_mode, key.alpha_test = d.alpha_test;
                 key.textured = textured, key.upscaled = d.tex_upscaled, key.min_linear = d.tex_min_linear;
+                key.by_indices = frame.geo_indexed && d.ranges;
                 if (!run_first || memcmp(&key, &run_key, sizeof key)) {
                     flush_run();
                     run_key = key;
@@ -2715,12 +3366,15 @@ static void draw_target(const NativeFrame &frame, int target, int vw, int vh, si
                 DrawData &own = ((DrawData *)g.draws_map)[g.merge_draws];
                 picture_clip(own.clip, d);
                 own.light = d.light;
-                VkDrawIndirectCommand *cmd = (VkDrawIndirectCommand *)g.cmds_map + g.merge_cmds;
-                if (d.ranges) {
+                MergeCmd *cmd = (MergeCmd *)g.cmds_map + g.merge_cmds;
+                if (d.ranges && frame.geo_indexed) {
                     const NativeRange *r = frame.ranges.data() + d.first;
-                    for (uint32_t k = 0; k < d.ranges; k++) cmd[k] = {r[k].count, 1, r[k].first, g.merge_draws};
+                    for (uint32_t k = 0; k < d.ranges; k++) cmd[k] = {r[k].count, 1, r[k].first, 0, g.merge_draws};
+                } else if (d.ranges) {
+                    const NativeRange *r = frame.ranges.data() + d.first;
+                    for (uint32_t k = 0; k < d.ranges; k++) cmd[k] = {r[k].count, 1, r[k].first, g.merge_draws, 0};
                 } else {
-                    cmd[0] = {d.count, 1, g.draw_dyn_first + d.first, g.merge_draws};
+                    cmd[0] = {d.count, 1, g.draw_dyn_first + d.first, g.merge_draws, 0};
                 }
                 g.merge_cmds += cmds;
                 g.merge_draws++;
@@ -2744,7 +3398,10 @@ static void draw_target(const NativeFrame &frame, int target, int vw, int vh, si
         // In the frontend (eDisplayFrame's header for 0x318 and 0x31c alike, 0x10af58 and 0x10b040) both are ALPHA 0x48, Cs As + Cd:
         // a body's reflection there goes by the material's strength and the map's alpha, not by the gloss the first pass left
         if (has_sphere) {
-            if (gloss && !env_tex) {
+            if (gloss && !env_tex && frame.chrome) {
+                // the Chrome Cars cheat: ALPHA (0 - 0) Ad + Cs, the map as it is over the paint (NativeFrame::chrome)
+                pass(d, 2, env_set, pipes[NB_OPAQUE][0][d.depth_test], -2.0f, true);
+            } else if (gloss && !env_tex) {
                 pass(d, 2, env_set, dest_pipeline, -3.0f, true);
                 pass(d, 2, env_set, dest_pipeline, -3.0f, true);
             } else {
@@ -2760,7 +3417,7 @@ static VkBuffer g_env_log_rb;
 static void *g_env_log_map;
 static int g_env_log_have;
 
-// ---- Shadows: High (native.cpp, "Shadows: High and Maximum") ----
+// ---- Shadows: High (native.cpp, "Shadows: High, Very High and Ultra") ----
 static void depth_image_barrier(VkImage image, VkImageLayout from, VkImageLayout to)
 {
     VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -2783,7 +3440,7 @@ static void draw_shadow_map(const NativeFrame &frame)
     VkRenderPassBeginInfo rb = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     rb.renderPass = g.shadow_pass;
     rb.framebuffer = g.shadow_fb;
-    rb.renderArea.extent = {(uint32_t)(g.shadow_cell * kShadowAcross), (uint32_t)(g.shadow_cell * kShadowRows)};
+    rb.renderArea.extent = {(uint32_t)(g.shadow_cell * kShadowAcross), (uint32_t)g.shadow_h};
     rb.clearValueCount = 1;
     rb.pClearValues = &clear;
     vkCmdBeginRenderPass(g.cmd, &rb, VK_SUBPASS_CONTENTS_INLINE);
@@ -2791,15 +3448,34 @@ static void draw_shadow_map(const NativeFrame &frame)
     const VkBuffer both[2] = {g.vb, g.vb};
     const VkDeviceSize zeros[2] = {0, 0};
     vkCmdBindVertexBuffers(g.cmd, 0, 2, both, zeros);
-    vkCmdBindIndexBuffer(g.cmd, g.vb, g.draw_idx_off, VK_INDEX_TYPE_UINT32);
+    vkCmdBindIndexBuffer(g.cmd, g.vb, frame.geo_indexed ? 0 : g.draw_idx_off, VK_INDEX_TYPE_UINT32);
     vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.layout, 1, 1, &g.light_set, 0, nullptr);
+    bool tested_bound = false;              // the pipeline bound: shadow_cast_test (else shadow_cast)
     for (const NativeShadowCaster &k : frame.casters) {
-        if (k.draw >= frame.draws.size() || k.cell >= kShadowAcross * kShadowDown) continue;
+        if (k.draw >= frame.draws.size()) continue;
+        VkViewport vp;
+        if (k.cell >= kShadowAcross * kShadowDown) {        // a tunnel lamp's cell, in the row below the glass
+            const int lamp = k.cell - kShadowAcross * kShadowDown, half = g.shadow_cell / 2;
+            if (!g.lamp_row || lamp >= kLampCellsAll) continue;
+            vp = {(float)((lamp % kLampCellsAcross) * half), (float)(kShadowRows * g.shadow_cell + (lamp / kLampCellsAcross) * half), (float)half, (float)half, 0, 1};
+        } else {
+            vp = {(float)((k.cell % kShadowAcross) * g.shadow_cell), (float)((k.cell / kShadowAcross + (k.glass ? kShadowDown : 0)) * g.shadow_cell),
+                  (float)g.shadow_cell, (float)g.shadow_cell, 0, 1};
+        }
         const NativeDraw &d = frame.draws[k.draw];
         if (!d.count) continue;
-        VkViewport vp = {(float)((k.cell % kShadowAcross) * g.shadow_cell), (float)((k.cell / kShadowAcross + (k.glass ? kShadowDown : 0)) * g.shadow_cell),
-                         (float)g.shadow_cell, (float)g.shadow_cell, 0, 1};
-        VkRect2D sc = {{(int32_t)vp.x, (int32_t)vp.y}, {(uint32_t)g.shadow_cell, (uint32_t)g.shadow_cell}};
+        // the alpha test: with the draw's texture, by the scene's shader
+        VkTex *t = d.alpha_test && d.tex && d.rt < 0 ? (VkTex *)d.tex->vk : nullptr;
+        const bool tested = t && t->set;   // every level (the user, 2026-11-26)
+        if (tested != tested_bound) {
+            vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, tested ? g.shadow_cast_test : g.shadow_cast);
+            tested_bound = tested;
+        }
+        if (tested) {
+            t->used = g.frame;
+            vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.layout, 0, 1, &t->set, 0, nullptr);
+        }
+        VkRect2D sc = {{(int32_t)vp.x, (int32_t)vp.y}, {(uint32_t)vp.width, (uint32_t)vp.height}};
         vkCmdSetViewport(g.cmd, 0, 1, &vp);
         vkCmdSetScissor(g.cmd, 0, 1, &sc);
         Push p = {};
@@ -2807,10 +3483,21 @@ static void draw_shadow_map(const NativeFrame &frame)
         p.blend_alpha = -2.0f;
         p.light = -1;
         p.between = 1.0f;
+        if (tested) {
+            p.alpha_test = 1.0f;
+            p.textured = 1.0f;
+            p.tfx = d.tfx;
+            p.lod_l = (float)d.lod_l;
+            p.tex_mode = d.tex_mode | 32;           // the texture by its own sampler: its alpha is what is asked
+            p.scroll[0] = d.scroll_s, p.scroll[1] = d.scroll_t;
+        }
         vkCmdPushConstants(g.cmd, g.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof p, &p);
         if (d.ranges) {
             const NativeRange *r = frame.ranges.data() + d.first;
-            for (uint32_t i = 0; i < d.ranges; i++) vkCmdDraw(g.cmd, r[i].count, 1, r[i].first, 0);
+            if (frame.geo_indexed)
+                for (uint32_t i = 0; i < d.ranges; i++) vkCmdDrawIndexed(g.cmd, r[i].count, 1, r[i].first, 0, 0);
+            else
+                for (uint32_t i = 0; i < d.ranges; i++) vkCmdDraw(g.cmd, r[i].count, 1, r[i].first, 0);
         } else if (d.indexed) {
             vkCmdDrawIndexed(g.cmd, d.count, 1, d.first, 0, 0);
         } else {
@@ -2831,6 +3518,7 @@ static void draw_shadows(const NativeFrame &frame, int target, bool mirror, bool
     vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, samples ? g.shadow_ms_pipeline : g.shadow_pipeline);
     vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.shadow_layout, 0, 1, samples ? &g.ms_post_set : mirror ? &g.rvm_post_set : &g.post_set, 0,
                             nullptr);
+    if (g.light_set) vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.shadow_layout, 2, 1, &g.light_set, 0, nullptr);
     for (const NativeShadow &s : frame.shadows) {
         if (s.target != target) continue;
         VkViewport vp = {0, 0, (float)g.rvm_w, (float)g.rvm_h, 0, 1};
@@ -2869,8 +3557,18 @@ static void draw_shadows(const NativeFrame &frame, int target, bool mirror, bool
             p.low = std::max(s.soft > 0 ? s.soft : 1.5f * p.texel, p.texel);
             p.high = std::min(std::max(s.low, p.texel), p.low);
             p.colour[0] = s.high;
-            p.rect[0] = (float)(s.cell % kShadowAcross) / kShadowAcross, p.rect[1] = (float)(s.cell / kShadowAcross) / kShadowRows;
-            p.rect[2] = 1.0f / kShadowAcross, p.rect[3] = 1.0f / kShadowRows;
+            p.colour[1] = s.metres[0], p.colour[2] = s.metres[1];
+            p.rect[0] = (float)(s.cell % kShadowAcross) / kShadowAcross, p.rect[1] = (float)((s.cell / kShadowAcross) * g.shadow_cell) / (float)g.shadow_h;
+            p.rect[2] = 1.0f / kShadowAcross, p.rect[3] = (float)g.shadow_cell / (float)g.shadow_h;
+            set = g.shadow_set;
+        } else if (s.kind == 3) {               // the light a car's tunnel lamps lose to it (native.cpp, "the tunnels' lamps")
+            if (!g.shadow_ready || !g.lamp_row || !g.light_set) continue;
+            const float pixels = s.size * vp.width;
+            const float fade = std::min(std::max((pixels - 12.0f) / (36.0f - 12.0f), 0.0f), 1.0f);
+            if (!(fade > 0)) continue;
+            p.colour[3] = fade;
+            p.mode = 3;
+            p.texel = (float)s.block;           // its block's first quad in the lights: whole, and well below 2^24
             set = g.shadow_set;
         } else {
             VkTex *t = s.tex ? (VkTex *)s.tex->vk : nullptr;
@@ -3535,41 +4233,128 @@ static void copy_depth_rects(const NativeFrame &frame)
         g.depth_places.push_back(place);
         place += bytes;
     }
+    g.depth_bytes = place;
+    g.depth_new = true;
     depth_barrier(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
 }
 
-bool native_vk_depth(const NativeDepthRect &r, uint32_t *out)
+// The frame in two parts (2026-11-26): what is recorded so far, the scene and the copy of its depth rects, goes to the GPU now on a
+// fence of its own, and the rest (SMAA, the grading, the window) is recorded into the other command buffer and goes at the end as
+// before. The game's thread wants those rects in StuffSun (native.cpp, depth_settle) and no longer waits for the last passes, nor
+// for this thread to record them. The two parts are one queue's, in order: the frame's own fence, at the end, is past both. The
+// depth is final here: nothing after the copy draws into it. HP2_DEPTHEARLY=0: all of the frame at the end, as it was.
+static void depth_send_early(const NativeFrame &frame, const VkCommandBufferBeginInfo &bi)
+{
+    static const bool off = getenv("HP2_DEPTHEARLY") && atoi(getenv("HP2_DEPTHEARLY")) == 0;
+    if (off || !g.cmd_b || !g.depth_fence) return;
+    VkMemoryBarrier b = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};     // the copies, for the host to read
+    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    b.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    vkCmdPipelineBarrier(g.cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &b, 0, nullptr, 0, nullptr);
+    vkEndCommandBuffer(g.cmd);
+    vkResetFences(g.dev, 1, &g.depth_fence);
+    VkSubmitInfo si = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &g.cmd;
+    const VkResult sent = vkQueueSubmit(g.queue, 1, &si, g.depth_fence);
+    std::swap(g.cmd, g.cmd_b);
+    vkResetCommandBuffer(g.cmd, 0);
+    vkBeginCommandBuffer(g.cmd, &bi);
+    if (sent != VK_SUCCESS) return;         // (the frame's own submit says what the device said)
+    g.depth_early = true;
+    native_depth_sent(frame.handed);
+}
+
+// The last frame's rects kept apart, for a game's thread that does not wait for the renderer (native.cpp's queue of one): taken on
+// the renderer's thread once the card is done with that frame (draw_frame, after its wait for the fence), read under the mutex.
+static std::mutex g_depth_kept_mutex;
+static struct {
+    std::vector<NativeDepthRect> rects;
+    std::vector<VkDeviceSize> places;
+    std::vector<char> bytes;
+    float ox = 0, sx = 0;
+    int w = 0, h = 0;                       // the picture's size they were taken at
+} g_depth_kept;
+static void depth_keep()
+{
+    if (!g.depth_new) return;
+    g.depth_new = false;
+    std::lock_guard<std::mutex> hold(g_depth_kept_mutex);
+    g_depth_kept.rects.clear();
+    g_depth_kept.places.clear();
+    if (!g.depth_rb_map || g.depth_bytes > g.depth_cap) return;
+    g_depth_kept.rects = g.depth_rects;
+    g_depth_kept.places = g.depth_places;
+    g_depth_kept.bytes.assign((const char *)g.depth_rb_map, (const char *)g.depth_rb_map + g.depth_bytes);
+    g_depth_kept.ox = g.depth_ox, g_depth_kept.sx = g.depth_sx;
+    g_depth_kept.w = W, g_depth_kept.h = H;
+}
+
+static void depth_words(const NativeDepthRect &r, uint32_t *out, const float *depth, float ox, float sx, int pw, int ph)
+{
+    const float sy = ph / 448.0f;
+    int x0 = std::clamp((int)(ox + r.x * sx), 0, pw - 1), y0 = std::clamp((int)(r.y * sy), 0, ph - 1);
+    int w = std::clamp((int)std::ceil(r.w * sx), 1, pw - x0), h = std::clamp((int)std::ceil(r.h * sy), 1, ph - y0);
+    for (int y = 0; y < r.h; y++)
+        for (int x = 0; x < r.w; x++) {
+            int px = std::clamp((int)(ox + (r.x + x + 0.5f) * sx) - x0, 0, w - 1), py = std::clamp((int)((r.y + y + 0.5f) * sy) - y0, 0, h - 1);
+            out[(size_t)y * r.w + x] = (uint32_t)(depth[(size_t)py * w + px] * 16777216.0f);
+        }
+}
+
+bool native_vk_depth(const NativeDepthRect &r, uint32_t *out, bool idle)
 {
     if (!g.ready) return false;
+    if (!idle) {
+        // The renderer may be at work: what it kept. The rect asked for is the last frame's, and what is kept may be the frame
+        // before that one's, with the rect a little elsewhere: the same rect by its size then (the sun's, a frame earlier).
+        std::lock_guard<std::mutex> hold(g_depth_kept_mutex);
+        int at = -1;
+        for (size_t i = 0; i < g_depth_kept.rects.size() && i < g_depth_kept.places.size() && at < 0; i++) {
+            const NativeDepthRect &have = g_depth_kept.rects[i];
+            if (have.x == r.x && have.y == r.y && have.w == r.w && have.h == r.h) at = (int)i;
+        }
+        for (size_t i = 0; i < g_depth_kept.rects.size() && i < g_depth_kept.places.size() && at < 0; i++)
+            if (g_depth_kept.rects[i].w == r.w && g_depth_kept.rects[i].h == r.h) at = (int)i;
+        if (at < 0) return false;
+        const NativeDepthRect &have = g_depth_kept.rects[(size_t)at];
+        // (the copy is as long as the rects' places say: depth_keep took all of them)
+        depth_words(have, out, (const float *)(g_depth_kept.bytes.data() + g_depth_kept.places[(size_t)at]), g_depth_kept.ox, g_depth_kept.sx,
+                    g_depth_kept.w, g_depth_kept.h);
+        return true;
+    }
     for (size_t i = 0; i < g.depth_rects.size() && i < g.depth_places.size(); i++) {
         const NativeDepthRect &have = g.depth_rects[i];
         if (have.x != r.x || have.y != r.y || have.w != r.w || have.h != r.h) continue;
-        vkWaitForFences(g.dev, 1, &g.fence, VK_TRUE, UINT64_MAX);
-        float ox = g.depth_ox, sx = g.depth_sx, sy = H / 448.0f;
-        int x0 = std::clamp((int)(ox + r.x * sx), 0, W - 1), y0 = std::clamp((int)(r.y * sy), 0, H - 1);
-        int w = std::clamp((int)std::ceil(r.w * sx), 1, W - x0), h = std::clamp((int)std::ceil(r.h * sy), 1, H - y0);
-        const float *depth = (const float *)((const char *)g.depth_rb_map + g.depth_places[i]);
-        for (int y = 0; y < r.h; y++)
-            for (int x = 0; x < r.w; x++) {
-                int px = std::clamp((int)(ox + (r.x + x + 0.5f) * sx) - x0, 0, w - 1), py = std::clamp((int)((r.y + y + 0.5f) * sy) - y0, 0, h - 1);
-                out[(size_t)y * r.w + x] = (uint32_t)(depth[(size_t)py * w + px] * 16777216.0f);
-            }
+        // (the renderer's thread may be recording the frame's last passes now: the rects and their fence are the frame's first part's)
+        vkWaitForFences(g.dev, 1, g.depth_early ? &g.depth_fence : &g.fence, VK_TRUE, UINT64_MAX);
+        depth_words(r, out, (const float *)((const char *)g.depth_rb_map + g.depth_places[i]), g.depth_ox, g.depth_sx, W, H);
         return true;
     }
     return false;
 }
 
 // the picture so far into the scene image, with its levels down
-static void copy_scene()
+// levels false: the first level alone, for a pass that reads no other (the others keep what an earlier copy left in them, and
+// their layout: so only once a whole copy has been made)
+static void copy_scene(bool levels)
 {
     all_barrier();
-    image_barrier(g.scene, 0, g.scene_levels, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
-                  VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
     VkImageBlit bl = {};
     bl.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     bl.srcOffsets[1] = {W, H, 1};
     bl.dstSubresource = bl.srcSubresource;
     bl.dstOffsets[1] = {W, H, 1};
+    if (!levels && g_post_merge && g.scene_ready) {
+        image_barrier(g.scene, 0, 1, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                      VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+        vkCmdBlitImage(g.cmd, g.color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.scene, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_NEAREST);
+        image_barrier(g.scene, 0, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
+                      VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
+        return;
+    }
+    image_barrier(g.scene, 0, g.scene_levels, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0, VK_ACCESS_TRANSFER_WRITE_BIT,
+                  VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
     vkCmdBlitImage(g.cmd, g.color, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.scene, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_NEAREST);
     int mw = W, mh = H;
     for (int l = 1; l < g.scene_levels; l++) {
@@ -3590,15 +4375,16 @@ static void copy_scene()
     g.scene_ready = true;
 }
 
-// Dithering (Advanced), on the finished picture of every frame, a race's or a menu's or a film's: where the pixels around one are all
-// within a few steps of its colour it takes their average, and a step's worth of noise goes over the lot, so a smooth gradient has
-// no steps of 1 / 255 (native_extra.frag). The picture's last step: after the antialiasing and the
+// Dithering (Advanced), on the finished picture of every frame, a race's or a menu's or a film's. With the picture at 16 bits a
+// channel (g_color_wide, choose_color_format): a step's worth of noise, a grain to each pixel of the window, so that the steps of
+// 1 / 255 the window's 8 bits make of it come out as grain and not as bands. With a picture of 8 bits (a card without the wide
+// format): the old pass, where the pixels around one are all within a few steps of its colour it takes their average, and the
+// noise goes over the lot (native_extra.frag). The picture's last step: after the antialiasing and the
 // brightness, contrast and gamma, and after the copy the next frame may blend with, so the noise does not build up.
 static void dither_picture(const NativeFrame &frame)
 {
-    static const bool exact = getenv("HP2_NATIVEEXACT") != nullptr;
-    if (exact || !g_cfg.deband) return;
-    copy_scene();
+    if (!post_dithered()) return;
+    copy_scene(false);
     float ox, sx, sy;
     active_region(frame, ox, sx, sy);
     ExtraPush p = {};
@@ -3610,6 +4396,18 @@ static void dither_picture(const NativeFrame &frame)
     p.size[1] = (float)H;
     p.frame = (float)(frame.number & 255);
     p.lines = sy;
+    // the noise's grain is a pixel of the window: a picture drawn finer than the window (Render Scale above 100) is averaged down
+    // as it is shown, and noise of its own pixels would be averaged away with it
+    p.grain = g.swap_h > 0 && H > g.swap_h ? (float)H / (float)g.swap_h : 1.0f;
+    p.wide = g_color_wide ? 1.0f : 0.0f;
+    // the settings' brightness, contrast and gamma here too (grade_picture has left them to this pass)
+    if (g_post_merge && g_color_wide && post_graded()) {
+        p.brightness = g_cfg.brightness / 100.0f, p.contrast = g_cfg.contrast / 100.0f, p.gamma = g_cfg.gamma / 100.0f;
+        p.graded = 1.0f;
+    }
+    const bool last = post_folds_alpha();
+    p.opaque = last ? 1.0f : 0.0f;
+    if (last) g_opaque_done = true;
     VkRenderPassBeginInfo rb = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     rb.renderPass = g.post_pass;
     rb.framebuffer = g.post_fb;
@@ -3652,6 +4450,43 @@ static void copy_depth_soft()
     c.extent = {(uint32_t)W, (uint32_t)H, 1};
     vkCmdCopyImage(g.cmd, g.depth, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.depth_copy, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
     copy_layout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+    depth_barrier(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+    all_barrier();
+}
+
+// Ambient Occlusion's world (FX_AO_WORLD, ПОРА111): the view's depth before its first car is drawn, into depth_world, the view's
+// rectangle only (on a split screen the other view's part stays as its own copy made it)
+static void copy_depth_world(const NativeFrame &frame, const NativeFx &f)
+{
+    float ox, sx, sy;
+    active_region(frame, ox, sx, sy);
+    const int32_t x0 = std::max((int32_t)(ox + f.rect[0] * sx), 0), y0 = std::max((int32_t)(f.rect[1] * sy), 0);
+    const int32_t x1 = std::min((int32_t)(ox + (f.rect[0] + f.rect[2]) * sx + 0.999f), W);
+    const int32_t y1 = std::min((int32_t)((f.rect[1] + f.rect[3]) * sy + 0.999f), H);
+    if (x1 <= x0 || y1 <= y0) return;
+    const auto world_layout = [](VkImageLayout from, VkImageLayout to, VkAccessFlags src, VkAccessFlags dst) {
+        VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b.srcAccessMask = src;
+        b.dstAccessMask = dst;
+        b.oldLayout = from;
+        b.newLayout = to;
+        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = g.depth_world;
+        b.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+        vkCmdPipelineBarrier(g.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+    };
+    all_barrier();
+    depth_barrier(VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    world_layout(g.world_ready ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                 VK_ACCESS_SHADER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    VkImageCopy c = {};
+    c.srcSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+    c.dstSubresource = c.srcSubresource;
+    c.srcOffset = c.dstOffset = {x0, y0, 0};
+    c.extent = {(uint32_t)(x1 - x0), (uint32_t)(y1 - y0), 1};
+    vkCmdCopyImage(g.cmd, g.depth, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.depth_world, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+    world_layout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+    g.world_ready = true;
     depth_barrier(VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
     all_barrier();
 }
@@ -3701,10 +4536,22 @@ static void draw_fx(const NativeFrame &frame, const NativeFx &f, int row)
         ao_vp = {ox + f.rect[0] * sx, f.rect[1] * sy, f.rect[2] * sx, f.rect[3] * sy, 0, 1};
         memcpy(ao.to, f.m, sizeof ao.to);
         ao.view[0] = ao_vp.x, ao.view[1] = ao_vp.y, ao.view[2] = ao_vp.width, ao.view[3] = ao_vp.height;
-        // (the user, 2026-11-17: it works, and far too faint. It was 0.8 m and 0.75; hp2.ini has both now)
-        ao.rect[0] = (float)g_cfg.ao_reach * 0.01f;         // the reach in metres
+        // it reaches 7 m (the user, 2026-11-25, after 0.8, 1.5 and 3 m were all "no wow"; Off / Low / High for a day, On / Off again)
+        ao.rect[0] = 7.0f;                  // the reach in metres
         ao.rect[1] = (float)g_cfg.ao_strength * 0.01f;      // the strength
         ao.rect[2] = 2.0f;                  // the image is half the picture each way
+        ao.mode = f.world && g.world_ready ? 1.0f : 0.0f;   // 1: the view's world depth is in depth_world (FX_AO_WORLD)
+        if (!g.world_ready) {               // never copied into: bound all the same, so in the layout the set says, with nothing in it
+            VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+            b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            b.image = g.depth_world;
+            b.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+            vkCmdPipelineBarrier(g.cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+            g.world_ready = true;
+        }
         VkClearValue none = {};
         VkRenderPassBeginInfo ab = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
         ab.renderPass = g.ao_pass;
@@ -3721,7 +4568,8 @@ static void draw_fx(const NativeFrame &frame, const NativeFx &f, int row)
             vkCmdSetViewport(g.cmd, 0, 1, &hv);
             vkCmdSetScissor(g.cmd, 0, 1, &hs);
             vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.ao_pipeline);
-            vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.shadow_layout, 0, 1, &g.post_set, 0, nullptr);
+            const VkDescriptorSet with_world[2] = {g.post_set, g.ao_world_set};
+            vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.shadow_layout, 0, 2, with_world, 0, nullptr);
             vkCmdPushConstants(g.cmd, g.shadow_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof ao, &ao);
             vkCmdDraw(g.cmd, 3, 1, 0, 0);
         }
@@ -3846,6 +4694,9 @@ void native_vk_gpus(std::vector<std::string> &names, std::string &now)
 // the screen the window is on: its refresh rate, 0: not known
 int native_vk_screen_hz()
 {
+    // HP2_FAKEHZ=<n>: a test's, the screen taken to have that rate (the queue of one and its catch-up on a 60 Hz screen)
+    static const int fake = getenv("HP2_FAKEHZ") ? atoi(getenv("HP2_FAKEHZ")) : 0;
+    if (fake > 0) return fake;
     static ULONGLONG looked;
     static int hz;
     const ULONGLONG now = GetTickCount64();
@@ -3865,6 +4716,14 @@ int native_vk_screen_hz()
 
 // The pictures a second to draw for a frame that asks for `asked` of them (above the game's 60), 0: the frame alone. With VSync a
 // picture waits for the screen, so more pictures than the screen has refreshes would hold the game back: no more than those.
+double native_vk_clock()
+{
+    LARGE_INTEGER t, f;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&t);
+    return (double)t.QuadPart / (double)f.QuadPart;
+}
+
 // Without VSync every picture is shown at once, torn or not, whatever the screen.
 static int picture_rate(int asked)
 {
@@ -3884,6 +4743,7 @@ static int picture_rate(int asked)
 
 bool native_vk_draw(NativeFrame &frame)
 {
+    native_frame_clips(frame);              // the clip matrices the game's thread left to this one
     // the textures first, whatever comes of the frame: the game's thread counts them as loaded
     for (NativeTexUpload &u : frame.uploads) g_tex_pending.push_back(std::move(u));
     frame.uploads.clear();
@@ -3930,10 +4790,12 @@ bool native_vk_draw(NativeFrame &frame)
             begin += span;
             next_f = 0;
             g_pic_f = 1.0f, g_between = false, g_pic_last = true;
-        } else if (rate) {
-            // The pictures are 60 / rate of a frame apart, whatever the frame they fall in: this frame has those at next_f, next_f +
-            // that, ... up to 1, the frame itself (at 120: the half and 1; at 144 two or three, 1 only now and then). They are
-            // shown 1 / rate s apart: the screen's refresh spaces them with VSync, the clock without.
+        } else if (rate && g_cfg.vsync) {
+            // With VSync: the pictures are 60 / rate of a frame apart, whatever the frame they fall in: this frame has those at
+            // next_f, next_f + that, ... up to 1, the frame itself (at 120: the half and 1; at 144 two or three, 1 only now and
+            // then). They are shown 1 / rate s apart, and the screen's refresh spaces them. (Without VSync it is done by the
+            // clock, below; on a model of both, work/nshots/t5/sim_rate.py, this one keeps the game at its 60 frames on a 75 or
+            // 100 Hz screen, where the other holds it at a whole number of refreshes a frame.)
             static LONGLONG due;
             static int rate_was;
             LARGE_INTEGER t, f;
@@ -3942,9 +4804,22 @@ bool native_vk_draw(NativeFrame &frame)
             if (rate != rate_was || next_f <= 0 || next_f > step + 1e-6) next_f = step, rate_was = rate, due = 0;
             int n = 0;
             while (next_f + n * step <= 1.0 + 1e-6) n++;
+            // The queue of one (native.cpp, hand_over): a frame that has waited for this thread more than 12.5 ms says the screen
+            // shows fewer pictures a second than the game's frames ask for (a screen is never exactly its nominal rate). One
+            // picture between the frames is then left out, of this frame or of the next that has more than one, and the
+            // renderer is ahead again by a refresh: on the model once in five to ten seconds, in place of the game waiting
+            // for the renderer in four frames of ten.
+            static bool owed;
+            QueryPerformanceCounter(&t);
+            if (frame.queued && frame.made_s > 0 && native_vk_clock() - frame.made_s > 0.0125) owed = true;
+            if (!frame.queued) owed = false;
             for (int i = 0; i < n; i++) {
                 double at = next_f + i * step;
                 if (at > 1.0 - 1e-6) at = 1.0;
+                if (owed && i == 0 && n > 1) {
+                    owed = false;
+                    continue;
+                }
                 QueryPerformanceCounter(&t);
                 // A picture between two frames that is already more than a picture late is left out (2026-11-17, with the rates up
                 // to 500): a card that cannot make so many would otherwise take longer over a frame than the game does, and hold
@@ -3972,6 +4847,81 @@ bool native_vk_draw(NativeFrame &frame)
                 if (g_pic_last) ok = drawn;
             }
             next_f += n * step - 1.0;
+            g_pic_f = 1.0f, g_between = false, g_pic_last = true;
+        } else if (rate) {
+            // A set rate without VSync, by the clock as Unlimited is (the user, 2026-11-18). The pictures are 1 / rate s apart on
+            // the clock, and each shows the place between the two frames that the clock is at when it is started: this frame's
+            // pictures have the time from `begin` on, for as long as the game says the frame is (NativeFrame::step_s, its own
+            // real time step), and a picture started `off` into that is at off / length + lead of the way. In step it is the grid
+            // it always was (at 120 the half and the frame itself; at 144 two or three a frame, the frame itself now and then):
+            // lead, 1 / p where rate / 60 is p / q in lowest terms, is what makes the grid meet the frame itself.
+            // What is new is what happens when the card does not make that many. It was: the pictures of a frame were all drawn,
+            // and the game's thread waited for them, so the game itself ran slower (a tester: 120 asked at 3840 x 2160, "the
+            // world lags behind me sometimes"; on the model, work/nshots/t5/sim_rate.py, 12 ms a picture at 120 held the game at
+            // 42 frames a second). Now a frame's pictures have a sixtieth of a second from when the frame is taken, the time the
+            // game needs for the next one: a picture between that would not leave the last one room in it is left out, the last
+            // one starts early enough to end with it, and a picture started late shows where the clock is, not where the grid
+            // had it. The game keeps its 60 frames, and the pictures are as many as the card makes.
+            static double begin, next_off, took = 0.004;
+            static int rate_was;
+            LARGE_INTEGER t, f;
+            QueryPerformanceFrequency(&f);
+            const auto clock = [&] {
+                QueryPerformanceCounter(&t);
+                return (double)t.QuadPart / (double)f.QuadPart;
+            };
+            const double gap = 1.0 / (double)rate;
+            double len = frame.step_s;
+            if (!(len > 1.0 / 240.0 && len < 1.0 / 15.0)) len = 1.0 / 60.0;
+            int common = rate;
+            for (int other = 60; other;) {
+                const int rest = common % other;
+                common = other, other = rest;
+            }
+            const double lead = (double)common / (double)rate;
+            double now = clock();
+            // the first, or out of step by more than a frame: from now
+            if (rate != rate_was || begin == 0 || now - begin > 2.0 * len + 0.02 || begin - now > len) begin = now, next_off = 0;
+            rate_was = rate;
+            const double limit = len * (1.0 - lead) + 0.02 * len;       // (the game's step is in ticks of a quarter millisecond)
+            const double end = now + 1.0 / 60.0;                        // the game has its next frame by then
+            for (int made = 0; made < 64; made++) {
+                const bool last = next_off + gap > limit;       // nothing of this frame's after it
+                double due = begin + next_off;
+                now = clock();
+                if (!last && (now > due + gap || (now > due ? now : due) + 2.0 * took > end + 0.0005)) {
+                    next_off += gap;
+                    continue;
+                }
+                if (last && due > end - took) due = end - took;
+                if (due > now && due - now < 0.05) {
+                    for (;;) {
+                        now = clock();
+                        const double left = due - now;
+                        if (left <= 0) break;
+                        if (left > 0.0015) Sleep(1);    // more than 1.5 ms: a sleep (the timer's resolution is 1 ms, iop_kernel.cpp)
+                    }
+                }
+                now = clock();
+                double at = (now - begin) / len + lead;
+                if (at > 0.98) at = 1.0;
+                if (at < 0.01) at = 0.01;
+                g_pic_f = (float)at;
+                g_between = at < 1.0;
+                g_pic_last = last;
+                bool first = false;
+                const bool drawn = draw_frame(frame, last ? uploaded : first);
+                took = took * 0.9 + 0.1 * (clock() - now);
+                if (took < 0.0002) took = 0.0002;
+                next_off += gap;
+                if (last) {
+                    ok = drawn;
+                    break;
+                }
+            }
+            begin += len;
+            next_off -= len;
+            next_f = 0;
             g_pic_f = 1.0f, g_between = false, g_pic_last = true;
         } else {
             next_f = 0;
@@ -4003,7 +4953,10 @@ static bool draw_frame(const NativeFrame &frame, bool &uploaded)
     // the settings or the window's size changed: this frame's textures are gone with the rest, so it is not drawn
     track_lines();
     if (g.key != settings_key() || g.lines != g_lines) {
-        if (!rebuild()) {
+        native_rebuild_mark(true);          // the game's thread need not wait meanwhile (native.cpp, hand_over)
+        const bool made = rebuild();
+        native_rebuild_mark(false);
+        if (!made) {
             g.failed = true;
             fprintf(g_hle_log, "native: the renderer could not be made again\n");
             return false;
@@ -4018,6 +4971,7 @@ static bool draw_frame(const NativeFrame &frame, bool &uploaded)
     if (frame.dyn_base != cache_verts_now()) return false;
     cpu_lap();
     vkWaitForFences(g.dev, 1, &g.fence, VK_TRUE, UINT64_MAX);
+    if (frame.queued) depth_keep();         // the card is done with the frame before: its rects of the depth, for the game's thread
     free_dead_textures();
     const double wait_ms = cpu_lap();
     // The buffers that grow, now that the GPU is done with the last frame. The vertices first: if their buffer is another now,
@@ -4129,17 +5083,26 @@ static bool draw_frame(const NativeFrame &frame, bool &uploaded)
     g.merge_draws = g.merge_cmds = 0;
     g_ab = g_ab_on ? (int)(g.frame & 1) : 0;
     g_dp_now = false;
-    if (g_dp_on && g.frame % 600 == 0) {
+    if (g_dp_on && g.frame % (uint32_t)g_dp_period == 0) {
         if (!g_dp_pool) {
             VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
             qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
-            qi.queryCount = 512;
+            qi.queryCount = kDpMax;
             vkCreateQueryPool(g.dev, &qi, nullptr, &g_dp_pool);
+            if (g_stats_query && vkCmdBeginQuery && vkCmdEndQuery) {
+                qi.queryType = VK_QUERY_TYPE_PIPELINE_STATISTICS;
+                qi.pipelineStatistics = VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT;
+                if (vkCreateQueryPool(g.dev, &qi, nullptr, &g_dp_stat_pool)) g_dp_stat_pool = VK_NULL_HANDLE;
+            }
         }
         if (g_dp_pool) {
-            vkCmdResetQueryPool(g.cmd, g_dp_pool, 0, 512);
+            vkCmdResetQueryPool(g.cmd, g_dp_pool, 0, kDpMax);
+            if (g_dp_stat_pool) vkCmdResetQueryPool(g.cmd, g_dp_stat_pool, 0, kDpMax);
             g_dp_now = true;
             g_dp_pending = true;
+            g_dp_open = false;
+            g_dp_fresh = true;
+            g_dp_frame = g.frame;
             g_dp_n = 0;
         }
     }
@@ -4226,15 +5189,22 @@ static bool draw_frame(const NativeFrame &frame, bool &uploaded)
     cuts.clear();
     for (size_t i = 0; i < frame.fx.size(); i++) cuts.push_back({frame.fx[i].at, (int)i});
     g_soft_now = false;
-    if (g.soft_ok)
+    // The copy is made before the first such particle of EACH view. One copy a frame, before the frame's first, was before
+    // player 1's: on a split screen player 2's world was not drawn yet, so player 2's smoke had nothing behind it in the copy
+    // and was cut hard by the road, except in the frames where player 1's view had no particle and the first was player 2's:
+    // its look went back and forth with what the other view showed (the user, 2026-11-23: "the particles flicker for player 2").
+    if (g.soft_ok) {
+        uint32_t views = 0;                 // by the target's number: its copy is asked for
         for (size_t i = 0; i < frame.draws.size(); i++) {
             const NativeDraw &d = frame.draws[i];
             if (!d.count || !(d.flags & kSoftKinds) || d.target > 4 || d.depth_write || d.blend == NB_OPAQUE) continue;
+            if (views >> d.target & 1) continue;
+            views |= 1u << d.target;
             size_t where = 0;
             while (where < cuts.size() && cuts[where].at <= i) where++;
             cuts.insert(cuts.begin() + where, Cut{i, -1});
-            break;
         }
+    }
     size_t at = 0;
     for (const Cut &cut : cuts) {
         const NativeFx *f = cut.fx >= 0 ? &frame.fx[cut.fx] : nullptr;
@@ -4243,11 +5213,14 @@ static bool draw_frame(const NativeFrame &frame, bool &uploaded)
         if (cut.at < at) continue;          // out of order: not this way
         draw_target(frame, 1, W, H, at, cut.at);
         at = cut.at;
+        dp_mark((uint32_t)cut.at, DP_FX, f ? (uint32_t)f->kind : (uint32_t)DP_FX_SOFT_DEPTH, false);      // (HP2_DRAWPROF: what follows is the effect's)
         vkCmdEndRenderPass(g.cmd);
         bool resolved = false;              // the effect went over the resolved picture: it has to go back into the samples
         if (!f) {
             copy_depth_soft();
             g_soft_now = true;
+        } else if (f->kind == FX_AO_WORLD) {
+            copy_depth_world(frame, *f);
         } else if (f->kind == FX_SHADOW && g.samples != VK_SAMPLE_COUNT_1_BIT && g.shadow_ms_pipeline) {
             draw_shadows_samples(frame, *f);
         } else {
@@ -4266,6 +5239,7 @@ static bool draw_frame(const NativeFrame &frame, bool &uploaded)
             vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.restore_layout, 0, 1, &g.restore_set, 0, nullptr);
             vkCmdDraw(g.cmd, 3, 1, 0, 0);
         }
+        g_dp_fresh = true;
     }
     draw_target(frame, 1, W, H, at);
     g_soft_now = false;
@@ -4276,7 +5250,7 @@ static bool draw_frame(const NativeFrame &frame, bool &uploaded)
                 g_ms.draws / n, g_ms.singles / n, g_ms.opaque / n, g_ms.passes / n, g_ms.pipelines / n, g_ms.sets / n, g_ms.calls / n, g_ms.runs / n);
         memset(&g_ms, 0, sizeof g_ms);
     }
-    dp_mark((uint32_t)frame.draws.size());
+    dp_mark((uint32_t)frame.draws.size(), DP_END, 0, false);
     vkCmdEndRenderPass(g.cmd);
     all_barrier();
     if (compare_now) copy_color_to(round == 0 ? 1 : 0);
@@ -4301,7 +5275,12 @@ static bool draw_frame(const NativeFrame &frame, bool &uploaded)
         image_barrier(g.prev, 0, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_TRANSFER_WRITE_BIT,
                       VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT);
     }
-    if (g_pic_last) copy_depth_rects(frame);
+    if (g_pic_last) {
+        copy_depth_rects(frame);
+        g.depth_early = false;
+        if (!g.depth_places.empty()) depth_send_early(frame, bi);
+    }
+    g_opaque_done = false;
     smaa_picture();
     grade_picture(frame);
     dither_picture(frame);
@@ -4381,7 +5360,7 @@ static bool draw_frame(const NativeFrame &frame, bool &uploaded)
         }
     }
     if (on_screen) {
-        opaque_picture();
+        if (!g_opaque_done) opaque_picture();
         blit_to_window(g.swap_images[image], frame);
     }
     // the semaphore the present waits on: the image's own

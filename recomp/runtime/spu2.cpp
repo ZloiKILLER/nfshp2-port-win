@@ -7,6 +7,7 @@
 #include "pcconfig.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -570,12 +571,65 @@ void spu2_read(u32 addr, u8 *dst, u32 size)
     for (u32 k = 0; k < size; k++) dst[k] = g_sram[(addr + k) & (SPU2_RAM_SIZE - 1)];
 }
 
+// ---- the police radio's voice, for a gamepad's speaker (spu2.h) ---------------------------------------------------------
+namespace {
+std::atomic<int> g_radio_channel{-1};       // core * 24 + voice, -1 none
+std::atomic<bool> g_radio_stopping{false}, g_radio_on{false};
+std::atomic<int> g_radio_percent{100};
+// what waits for the speaker: a ring of half a second. The mixer writes and the speaker's thread reads, each by its own device's
+// clock; the two drift apart by little, and a sentence is short: when more than 150 ms wait, the oldest go.
+std::mutex g_radio_lock;
+s16 g_radio_ring[24000];
+int g_radio_head, g_radio_count;
+}
+
+void spu2_radio_voice(int channel)
+{
+    g_radio_channel = channel >= 0 && channel < 48 ? channel : -1;
+    g_radio_stopping = false;
+}
+void spu2_radio_stop() { g_radio_stopping = true; }
+void spu2_radio_sink(bool on, int percent)
+{
+    g_radio_percent = percent < 0 ? 0 : percent > 100 ? 100 : percent;
+    if (on == g_radio_on.load()) return;
+    {
+        std::lock_guard<std::mutex> lock(g_radio_lock);
+        g_radio_head = g_radio_count = 0;
+    }
+    g_radio_on = on;
+}
+void spu2_radio_read(s16 *mono, int frames)
+{
+    const int scale = g_radio_percent * (g_cfg.volume < 0 ? 0 : g_cfg.volume > 100 ? 100 : g_cfg.volume);      // of 10000
+    std::lock_guard<std::mutex> lock(g_radio_lock);
+    const int size = (int)(sizeof g_radio_ring / sizeof g_radio_ring[0]);
+    if (g_radio_count > 7200 + frames) {            // (150 ms and what is asked for now)
+        const int drop = g_radio_count - 2400 - frames;
+        g_radio_head = (g_radio_head + drop) % size;
+        g_radio_count -= drop;
+    }
+    for (int i = 0; i < frames; i++) {
+        s32 v = 0;
+        if (g_radio_count > 0) {
+            v = g_radio_ring[g_radio_head];
+            g_radio_head = (g_radio_head + 1) % size;
+            g_radio_count--;
+        }
+        mono[i] = (s16)(v * scale / 10000);
+    }
+}
+
 void spu2_render(s16 *out, int frames)
 {
     std::lock_guard<std::mutex> lock(g_lock);
+    // the radio's voice, if a speaker takes it now; a stream that was stopped has the voice until it has rung out
+    int radio = g_radio_on ? g_radio_channel.load() : -1;
+    if (g_radio_stopping && g_radio_channel >= 0 && !g_core[g_radio_channel / 24].v[g_radio_channel % 24].keyed) g_radio_channel = -1, radio = -1;
     for (int f = 0; f < frames; f++) {
         s32 ext[2] = {0, 0};                            // core 0's output, core 1's external input
         s32 final[2] = {0, 0};
+        s32 radio_sample = 0;
         for (int ci = 0; ci < 2; ci++) {
             Core &c = g_core[ci];
             noise_step(c);
@@ -587,6 +641,10 @@ void spu2_render(s16 *out, int frames)
                 voice_volume(v, 0);
                 voice_volume(v, 1);
                 const s32 l = s * v.vol[0] >> 15, r = s * v.vol[1] >> 15;
+                if (ci * 24 + n == radio) {             // to the speaker, by the core's own master volume, and not into the mix
+                    radio_sample += (s32)((s64)((l + r) / 2) * c.mvol_cur[0] >> 15);
+                    continue;
+                }
                 if (c.mix[SPU2_VMIXL] >> n & 1) dry[0] += l;
                 if (c.mix[SPU2_VMIXR] >> n & 1) dry[1] += r;
                 if (c.mix[SPU2_VMIXEL] >> n & 1) wet[0] += l;
@@ -620,6 +678,13 @@ void spu2_render(s16 *out, int frames)
         }
         out[2 * f] = (s16)final[0];
         out[2 * f + 1] = (s16)final[1];
+        if (g_radio_on) {
+            std::lock_guard<std::mutex> hold(g_radio_lock);
+            const int size = (int)(sizeof g_radio_ring / sizeof g_radio_ring[0]);
+            if (g_radio_count == size) g_radio_head = (g_radio_head + 1) % size, g_radio_count--;
+            g_radio_ring[(g_radio_head + g_radio_count) % size] = (s16)std::clamp(radio_sample, -32768, 32767);
+            g_radio_count++;
+        }
     }
 }
 

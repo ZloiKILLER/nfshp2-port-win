@@ -18,13 +18,20 @@ void main()
     float d0 = texelFetch(depth, clamp(ivec2(gl_FragCoord.xy), ivec2(0), last), 0).r;
     if (d0 <= 0.0) discard;                 // nothing was drawn there
     ivec2 base = ivec2(floor(gl_FragCoord.xy / u.rect.z - 0.5)) - 1;
+    // the image's pixels this view made (native_ao.frag's viewport is the view at 1 / rect.z): the other player's half is not read
+    ivec2 lo = max(ivec2(ceil(u.view.xy / u.rect.z - 0.5)), ivec2(0));
+    ivec2 hi = min(ivec2(floor((u.view.xy + u.view.zw) / u.rect.z - 0.5)), most);
+    hi = max(hi, lo);
     float sum = 0.0, weights = 0.0;
     for (int j = 0; j < 4; j++)
         for (int i = 0; i < 4; i++) {
-            ivec2 q = clamp(base + ivec2(i, j), ivec2(0), most);
+            ivec2 q = clamp(base + ivec2(i, j), lo, hi);
             float d = texelFetch(depth, clamp(ivec2((vec2(q) + 0.5) * u.rect.z), ivec2(0), last), 0).r;
             float apart = abs(d - d0) / max(d0, 1.0e-7);        // the depth goes by one over the distance: half a percent apart is another surface
             float w = 1.0 / (1.0 + apart * apart * 4.0e4);
+            // the taps counted 1, 3, 3, 1 each way, not alike (alike till 2026-11-25): the image's pixels fade in and out of the
+            // window instead of stepping in and out of it, and the blocks go
+            w *= float((i == 1 || i == 2 ? 3 : 1) * (j == 1 || j == 2 ? 3 : 1));
             sum += w * texelFetch(tex, q, 0).r;
             weights += w;
         }

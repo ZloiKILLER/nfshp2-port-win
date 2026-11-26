@@ -24,6 +24,7 @@ MSAA
 SMAA
 Xbox
 PlayStation
+Nintendo
 text
 bitmap
 other
@@ -56,3 +57,41 @@ PC Cheats Tracks
 rb
 wb
 PC GPU
+Title Screen
+New Main Menu
+Options
+Debug Menu
+CONTROLLER1_DEVICE
+CONTROLLER2_DEVICE
+BOTTOM_MASK
+MI_8_MASK
+LEFT_ARROW_D1
+RIGHT_ARROW_D1
+LEFT_ARROW_D2
+RIGHT_ARROW_D2
+none
+Wipers On
+Wipers Off
+PC Pad 1
+PC Pad 2
+PC Wheel 1
+PC Wheel 2
+Joystick Calibration Port1
+Joystick Calibration Port2
+Joystick Calibration
+Joystick Config Port1
+Joystick Config Port2
+Joystick Config Port
+Joystick Calibration Port
+PC Layout 1
+PC Layout 2
+PC_EDIT_ICON
+PC_EDIT_POST
+PC_EDIT_PRE
+PC_INFO_TEXT
+SCROLLING_TEXT
+SCROLL_TEXT_CLIP
+the screen's own help line
+the Options screen's help line
+the Help word
+PC_EDIT_WORD

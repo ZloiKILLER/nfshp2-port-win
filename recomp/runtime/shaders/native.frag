@@ -18,6 +18,12 @@ layout(push_constant) uniform Push {
 layout(set = 0, binding = 0) uniform sampler2D tex;
 // false for the pipelines of draws without the alpha test: a shader with no discard in it keeps the GPU's early depth test
 layout(constant_id = 0) const bool ALPHA_TEST = true;
+// Dithering on (native_vk.cpp, g_color_wide): the picture, the mirror and the reflections' views have 16 bits a channel, and the colour
+// of a pixel keeps what lies between two of the GS's bytes: the texels are filtered and the vertex's colour is multiplied in as
+// fractions, nothing is rounded down to a byte (or, in a reflection's view, to 5 bits) on the way. With every draw rounded as the
+// GS rounds there was nothing between two steps for the dithering to show, whatever the picture could hold. A colour that is a whole
+// byte stays that byte. false: the GS's own integers, as always.
+layout(constant_id = 1) const bool WIDE = false;
 layout(location = 0) in vec4 v_col;
 layout(location = 1) in vec2 v_st;
 layout(location = 2) in float v_k;
@@ -63,6 +69,26 @@ ivec4 texel(int level, ivec2 at, ivec2 size)
     return t;
 }
 
+vec4 texel_wide(int level, ivec2 at, ivec2 size)
+{
+    if ((u.tex_mode & 1) != 0) at.x &= size.x - 1; else at.x = clamp(at.x, 0, size.x - 1);
+    if ((u.tex_mode & 2) != 0) at.y &= size.y - 1; else at.y = clamp(at.y, 0, size.y - 1);
+    return texelFetch(tex, at, level) * 255.0;
+}
+
+vec4 sample_level_wide(int level, vec2 uv, bool linear)
+{
+    ivec2 size = textureSize(tex, level);
+    uv /= float(1 << level);
+    if (!linear) return texel_wide(level, ivec2(floor(uv)), size);
+    uv -= 0.5;
+    vec2 f = floor(uv), w = uv - f;
+    ivec2 i = ivec2(f);
+    vec4 top = mix(texel_wide(level, i, size), texel_wide(level, i + ivec2(1, 0), size), w.x);
+    vec4 bottom = mix(texel_wide(level, i + ivec2(0, 1), size), texel_wide(level, i + ivec2(1, 1), size), w.x);
+    return mix(top, bottom, w.y);
+}
+
 ivec4 sample_level(int level, vec2 uv, bool linear)
 {
     ivec2 size = textureSize(tex, level);
@@ -77,11 +103,50 @@ ivec4 sample_level(int level, vec2 uv, bool linear)
     return top + ((bottom - top) * w.y >> 8);
 }
 
+// The rear-view mirror's picture on a car's own mirror glass (tex_mode 128; native.cpp, mirror_glass_now; the user, 2026-11-24).
+// v_st.x is the place across the glass, -1 to 1 toward the car's left, v_st.y the picture's own t. The vertices' colour is no
+// colour (the draw is DECAL) but the glass's numbers, the same at all its vertices: r the side (0 the right mirror, 255 the
+// left, 128 the one inside), g the width of the picture's part over the glass, b its middle, both in 255ths of the picture.
+//  - A side mirror is aspheric: flat over its inner two thirds, and over the outer third the picture runs on faster, by the
+//    square of the way into that third (GLASS_CURVE; native.cpp's kGlassCurve is the same number, for the part's reach).
+//  - The picture is taken at a quarter of its resolution: what a copy a quarter the size, each texel the mean of 4 x 4, would
+//    give under a linear filter. A tap of the linear sampler at the corner four texels share is their mean; four such taps
+//    are a quarter-size texel, and four of those are mixed as the copy's texels would be.
+const float GLASS_CURVE = 1.0;
+vec4 sample_glass(vec4 c)
+{
+    float side = c.r > 191.0 ? 1.0 : c.r < 64.0 ? -1.0 : 0.0;
+    float across = v_st.x, outer = across * side - 1.0 / 3.0;
+    if (outer > 0.0) across += side * GLASS_CURVE * outer * outer;
+    vec2 uv = vec2(c.b / 255.0 + across * (c.g / 255.0) * 0.5, v_st.y);
+    vec2 size = vec2(textureSize(tex, 0));
+    vec2 at = uv * size * 0.25 - 0.5;
+    vec2 f = floor(at), w = at - f;
+    vec4 sum = vec4(0.0);
+    for (int j = 0; j < 2; j++)
+        for (int i = 0; i < 2; i++) {
+            vec2 base = (f + vec2(float(i), float(j))) * 4.0;
+            vec4 t = textureLod(tex, (base + vec2(1.0, 1.0)) / size, 0.0) + textureLod(tex, (base + vec2(3.0, 1.0)) / size, 0.0) +
+                     textureLod(tex, (base + vec2(1.0, 3.0)) / size, 0.0) + textureLod(tex, (base + vec2(3.0, 3.0)) / size, 0.0);
+            sum += t * 0.25 * (i == 0 ? 1.0 - w.x : w.x) * (j == 0 ? 1.0 - w.y : w.y);
+        }
+    return sum * 255.0;
+}
+
 vec4 sample_tex(float lod)
 {
     vec2 uv = v_st * vec2(textureSize(tex, 0));
     int mxl = u.tex_mode >> 8;
     bool min_linear = (u.tex_mode & 8) != 0;
+    if (WIDE) {
+        if (lod <= 0.0) return sample_level_wide(0, uv, (u.tex_mode & 4) != 0);
+        if (mxl == 0) return sample_level_wide(0, uv, min_linear);
+        if ((u.tex_mode & 16) == 0) return sample_level_wide(min(int(lod + 0.5), mxl), uv, min_linear);
+        int l0 = min(int(lod), mxl);
+        vec4 t = sample_level_wide(l0, uv, min_linear);
+        if (l0 != mxl) t = mix(t, sample_level_wide(l0 + 1, uv, min_linear), lod - float(l0));
+        return t;
+    }
     ivec4 t;
     if (lod <= 0.0) {
         t = sample_level(0, uv, (u.tex_mode & 4) != 0);
@@ -100,38 +165,43 @@ vec4 sample_tex(float lod)
     return vec4(t);
 }
 
+// what the GS rounds down to a byte
+vec3 gs(vec3 x) { return WIDE ? x : floor(x); }
+float gs(float x) { return WIDE ? x : floor(x); }
+
 void main()
 {
 #ifndef CLIP_FAR
     if (v_far < 0.0) discard;               // past the far plane: the depth clamp would have kept it
 #endif
-    vec4 c = floor(v_col * gl_FragCoord.w * 255.0 + 0.01);
+    vec4 c = WIDE ? max(v_col * gl_FragCoord.w * 255.0, vec4(0.0)) : floor(v_col * gl_FragCoord.w * 255.0 + 0.01);
     vec3 rgb;
     float a8;
     if (u.textured > 0.5) {
         // the GS's level goes by Q alone: (log2(1 / Q) << L) + K, and Q is 1 / w
         float lod = u.pass == 2 ? 0.0 : log2(1.0 / gl_FragCoord.w) * pow(2.0, u.lod_l) + (u.pass == 0 ? v_k : 0.0);
         // the setting's anisotropic filter: the level goes by how the texture lies on the screen, not by Q
-        vec4 t = (u.tex_mode & 32) != 0 ? texture(tex, v_st) * 255.0 : sample_tex(lod);
+        vec4 t = (u.tex_mode & 128) != 0 ? sample_glass(c) : (u.tex_mode & 32) != 0 ? texture(tex, v_st) * 255.0 : sample_tex(lod);
         // the sphere map: its alpha is 1. The showroom's own map (bit 64) is 32 bits, and its alpha goes into As as any texture's
         if (u.pass == 2 && (u.tex_mode & 64) == 0) t.a = 128.0;
         if (u.tfx == 1) {                   // DECAL
             rgb = t.rgb / 255.0;
             a8 = t.a;
         } else if (u.tfx >= 2) {            // HIGHLIGHT, HIGHLIGHT2
-            rgb = min(floor(c.rgb * t.rgb / 128.0) + c.a, vec3(255.0)) / 255.0;
+            rgb = min(gs(c.rgb * t.rgb / 128.0) + c.a, vec3(255.0)) / 255.0;
             a8 = u.tfx == 2 ? min(t.a + c.a, 255.0) : t.a;
         } else {
-            rgb = min(floor(c.rgb * t.rgb / 128.0), vec3(255.0)) / 255.0;
-            a8 = min(floor(c.a * t.a / 128.0), 255.0);
+            rgb = min(gs(c.rgb * t.rgb / 128.0), vec3(255.0)) / 255.0;
+            a8 = min(gs(c.a * t.a / 128.0), 255.0);
         }
     } else {
         rgb = c.rgb / 255.0;
         a8 = c.a;
     }
-    if (ALPHA_TEST && u.alpha_test > 0.5 && a8 <= 48.0) discard;
+    // the test is of the byte: with fractions kept, 48.9 is the byte 48
+    if (ALPHA_TEST && u.alpha_test > 0.5 && (WIDE ? a8 < 49.0 : a8 <= 48.0)) discard;
     if (u.bits16 != 0) {                    // what such a target keeps
-        rgb = floor(rgb * 255.0 / 8.0 + 1e-3) * 8.0 / 255.0;
+        if (!WIDE) rgb = floor(rgb * 255.0 / 8.0 + 1e-3) * 8.0 / 255.0;
         // the env map's views have FBA 1 in their register block: whatever is drawn there sets the alpha bit, the clear's grey has it clear
         if (u.blend_alpha < -1.5) a8 = 128.0;
     }
@@ -149,6 +219,7 @@ void main()
 #ifdef SOFT
         f *= soft_share();
 #endif
-        o_col = vec4(max(rgb * f - 0.49 / 255.0, vec3(0.0)), min(f, 1.0));
+        // (with fractions kept there is no byte to round to, and a whole colour laid whole stays whole)
+        o_col = vec4(max(rgb * f - (WIDE ? 0.0 : 0.49 / 255.0), vec3(0.0)), min(f, 1.0));
     }
 }

@@ -66,7 +66,7 @@ set(SOUND_SOURCES runtime/iop_cpu.cpp runtime/iop_kernel.cpp runtime/iop_libsd.c
 set(HOST_SOURCES runtime/host.cpp runtime/disc.cpp)
 if(WIN32)
     list(APPEND HOST_SOURCES runtime/speed.rc)
-    set_source_files_properties(runtime/speed.rc PROPERTIES OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/runtime/speed.ico;${CMAKE_CURRENT_SOURCE_DIR}/data/zdir_names_ntsc.txt;${CMAKE_CURRENT_SOURCE_DIR}/data/README.txt;${CMAKE_CURRENT_SOURCE_DIR}/data/ui/cursor.cur;${CMAKE_CURRENT_SOURCE_DIR}/data/lang/ENGLISH.txt;${CMAKE_CURRENT_SOURCE_DIR}/data/lang/FRENCH.txt;${CMAKE_CURRENT_SOURCE_DIR}/data/lang/GERMAN.txt;${CMAKE_CURRENT_SOURCE_DIR}/data/lang/ITALIAN.txt;${CMAKE_CURRENT_SOURCE_DIR}/data/lang/SPANISH.txt;${CMAKE_CURRENT_SOURCE_DIR}/data/lang/SWEDISH.txt;${CMAKE_CURRENT_SOURCE_DIR}/../recompwin/savestransfer.exe")
+    set_source_files_properties(runtime/speed.rc PROPERTIES OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/runtime/speed.ico;${CMAKE_CURRENT_SOURCE_DIR}/data/zdir_names_ntsc.txt;${CMAKE_CURRENT_SOURCE_DIR}/data/README.txt;${CMAKE_CURRENT_SOURCE_DIR}/data/ui/cursor.cur;${CMAKE_CURRENT_SOURCE_DIR}/data/lang/ENGLISH.txt;${CMAKE_CURRENT_SOURCE_DIR}/data/lang/FRENCH.txt;${CMAKE_CURRENT_SOURCE_DIR}/data/lang/GERMAN.txt;${CMAKE_CURRENT_SOURCE_DIR}/data/lang/ITALIAN.txt;${CMAKE_CURRENT_SOURCE_DIR}/data/lang/SPANISH.txt;${CMAKE_CURRENT_SOURCE_DIR}/data/lang/SWEDISH.txt;${CMAKE_CURRENT_SOURCE_DIR}/data/lang/RUSSIAN_DISC.txt;${CMAKE_CURRENT_SOURCE_DIR}/../recompwin/savestransfer.exe")
 endif()
 
 # Gamepads: SDL3 inside the exe, nothing of it but the gamepad subsystem
@@ -89,7 +89,7 @@ if(NOT EXISTS ${SDL3_SOURCE}/CMakeLists.txt)
 endif()
 add_subdirectory(${SDL3_SOURCE} ${CMAKE_CURRENT_BINARY_DIR}/sdl3 EXCLUDE_FROM_ALL)
 
-add_executable(hp2recomp runtime/ps2.cpp runtime/mem_block.cpp runtime/pcmenu.cpp runtime/pcsettings.cpp runtime/pclang.cpp runtime/setup.cpp runtime/install.cpp runtime/pcplatform.cpp runtime/pad.cpp runtime/native.cpp runtime/native_tex.cpp runtime/native_vk.cpp runtime/hle_iop.cpp runtime/dma.cpp runtime/vif.cpp runtime/profile.cpp runtime/phase.cpp runtime/cores.cpp runtime/hot_math.cpp runtime/native_mem.cpp runtime/memwatch.cpp runtime/native_movie.cpp runtime/gs_regs.cpp runtime/pcconfig.cpp runtime/window.cpp ${SOUND_SOURCES} ${HOST_SOURCES} ${GEN_SOURCES})
+add_executable(hp2recomp runtime/ps2.cpp runtime/mem_block.cpp runtime/pcmenu.cpp runtime/pcsettings.cpp runtime/pclang.cpp runtime/setup.cpp runtime/install.cpp runtime/pcplatform.cpp runtime/pcactions.cpp runtime/pad.cpp runtime/pcwheel.cpp runtime/wheel_win.cpp runtime/native.cpp runtime/native_tex.cpp runtime/native_vk.cpp runtime/hle_iop.cpp runtime/dma.cpp runtime/vif.cpp runtime/profile.cpp runtime/phase.cpp runtime/cores.cpp runtime/hot_math.cpp runtime/native_mem.cpp runtime/memwatch.cpp runtime/native_movie.cpp runtime/gs_regs.cpp runtime/pcconfig.cpp runtime/window.cpp runtime/traffic.cpp ${SOUND_SOURCES} ${HOST_SOURCES} ${GEN_SOURCES})
 target_include_directories(hp2recomp PRIVATE runtime ${GEN_DIR} ${VULKAN_INCLUDE} ${SHADER_OUT})
 # the playable build is recompwin/speed.exe, next to data/, hp2.ini and saves/
 if(NOT HP2_NAME)
@@ -154,7 +154,7 @@ elseif(HP2_PGO STREQUAL "USE")
     endif()
     target_compile_options(hp2recomp PRIVATE -fprofile-use=${HP2_PGO_DATA} -Wno-profile-instr-out-of-date -Wno-profile-instr-unprofiled -Wno-backend-plugin)
 endif()
-target_link_libraries(hp2recomp PRIVATE user32 gdi32 ole32 comctl32 comdlg32 shell32 uuid SDL3::SDL3-static)
+target_link_libraries(hp2recomp PRIVATE user32 gdi32 ole32 comctl32 comdlg32 shell32 uuid dinput8 dxguid SDL3::SDL3-static)
 
 # savestransfer.exe, beside speed.exe and optional: saves of the game from PS2 memory cards (.ps2/.mcd images, PCSX2's folder cards) and save
 # files (.psu, .max, .cbs) made new profiles of the port (savestransfer/savestransfer.cpp). A window program of its own; the game does not need it, speed.exe's setup installs it.

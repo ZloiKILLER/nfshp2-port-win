@@ -48,12 +48,12 @@ The same tools give the same `speed.exe` as in Releases, and with the same disc 
 | Path | What |
 |---|---|
 | `recomp/runtime/` | the runtime: the PS2's hardware where the game needs it, the renderer, sound, input, menus, the first start's setup |
-| `recomp/data/` | what the exe carries into the game's folder: the port's texts in six languages, the cursor, the README, the names of the disc's files; `recomp/data/patch/` has the patches the port applies |
+| `recomp/data/` | what the exe carries into the game's folder: the port's texts in six languages and for the Russian disc, the cursor, the README, the names of the disc's files; `recomp/data/patch/` has the patches the port applies |
 | `recomp/savestransfer/` | the Saves Manager: PS2 memory cards (images, PCSX2 folder cards) and `.psu`/`.max`/`.cbs` save files to and from the port's profiles, its icon's maker and its tests (`README.md` there) |
 | `recomp/symbols/` | the recompiler's table of the game's functions |
 | `recomp/pgo/` | the counts the release is built by (`-DHP2_PGO=USE`) |
-| `recomp/docs/` | notes on the data files, the menus and the languages |
-| `tools/recomp/` | the recompilers (`gen.py` for the game, `gen_iop.py` for its sound driver), the language files' source (`make_lang.py`) and the makers of the patches' tables (`make_disc_patch.py`, `make_layouts.py`) |
+| `recomp/docs/` | notes on the data files, the menus, the languages and the cheat codes |
+| `tools/recomp/` | the recompilers (`gen.py` for the game, `gen_iop.py` for its sound driver), the language files' source (`make_lang.py`, the Russian disc's strings in `lang_ru.py`) and the makers of the patches' tables (`make_disc_patch.py`, `make_layouts.py`, `make_traffic_patch.py`) |
 | `third_party/` | SDL3's source archive |
 
 ## Credits
@@ -66,6 +66,12 @@ The same tools give the same `speed.exe` as in Releases, and with the same disc 
   at any point in a pursuit is an arrest, even with every cop out of sight; with this change it is an arrest only when a cop is
   close to the car, and otherwise the chase goes on. The hook on `RealDriver::JoyHandler_ResetCar` is in
   `recomp/runtime/native.cpp`; `HP2_PS2RESET` brings back the PS2's rule.
+- **Speed Boost for All Cars** and **Disable Catchup** (Options > Extras) — two PCSX2 patches by **Silent**: the boost a police
+  car has in You're the Cop for every car and mode, and the game's Catch-up off in Quick Race and the career. The port does what
+  the patches do in hooks of the same functions (`recomp/runtime/pcsettings.cpp`), switched from the menu.
+- **Playable Traffic Cars** (Options > Extras) — the mod "Playable traffic cars" v1.4.1 by **379Felipe**, with thanks there to
+  **Xanvier** and **nlgzrgn**. Its changes are in `recomp/runtime/traffic_patch.h` (made from the mod's patch by
+  `tools/recomp/make_traffic_patch.py`), laid over the game while the switch is on.
 - **SMAA** by Jorge Jimenez and others (MIT license, `LICENSE.txt` in `recomp/runtime/shaders/smaa/`): the antialiasing
   shader and its tables (`recomp/runtime/shaders/smaa/`, `recomp/runtime/smaa/`).
 - **SDL3** (zlib license), for gamepads: `third_party/`.

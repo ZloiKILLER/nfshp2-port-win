@@ -1,179 +1,185 @@
-# Меню игры (Flailer UI) и свои пункты порта
+# The game's menus (Flailer UI) and the port's own items
 
-Как устроены меню на этом диске (SLUS_203.62, NTSC) и как порт добавляет в них своё.
-Код: `recomp/runtime/pcmenu.{h,cpp}` (механизм), `pcsettings.cpp` (PC-настройки),
-`pcconfig.{h,cpp}` (`hp2.ini`). Разбор формата — в `work/ref/NFSHP2-3DS/docs/formats/flailer-*.md`
-(там PAL/демо-адреса, ниже везде адреса ретейла US).
+How the menus of this disc (SLUS_203.62, NTSC) are built, and how the port adds its own to them.
+Code: `recomp/runtime/pcmenu.{h,cpp}` (the mechanism), `pcsettings.cpp` (the PC settings),
+`pcconfig.{h,cpp}` (`hp2.ini`). The format is taken apart in `work/ref/NFSHP2-3DS/docs/formats/flailer-*.md`
+(the addresses there are PAL / demo ones; everywhere below they are the US retail's).
 
-## Как устроено меню игры
+## How the game's menus are built
 
-- Весь интерфейс — данные Flailer в `FRONTEND\FRONTB.BUN` (проект `255842fd`, 41 экран; ещё
-  `GLOBALB`, `INGAMEB`). Экран → список объектов: **text** (`FlailerTextChunk`, строка и
-  `LanguageID` в `FE_*.BIN`) и **bitmap**. В памяти это связанные списки: проекты — `bTList` по
-  `gp-22424`, у проекта `ScreenList` (+12), у экрана `ObjectList` (+32); узел — `Next/Prev` в начале
-  payload, пустой список указывает сам на себя. Смещения объектов ретейла в начале `pcmenu.cpp`.
-- Пункт меню — text-объект с именем `MENUITEM_n` (n = 0..15), других таблиц нет. Меню собирается при
-  каждой активации экрана (`FlailerScreen::Activate`), навигацию, оранжевую подсветку и звук Up/Down
-  делает общий код `FlailerMenu`.
-- Поведение экрана — C++ класс; его `Callback(msg, data)` зарегистрирован в `FlailerScreenConfig`
-  (имя экрана для `ChangeToScreen`, callback, хеш Flailer-экрана). Конфиги строит
-  `__17FlailerScreenList` (0x16c218) из списка `gp-21272`. `msg`: `ScreenMessage` из
+- The whole interface is Flailer data in `FRONTEND\FRONTB.BUN` (project `255842fd`, 41 screens; also
+  `GLOBALB`, `INGAMEB`). A screen is a list of objects: **text** (`FlailerTextChunk`, a string and a
+  `LanguageID` in `FE_*.BIN`) and **bitmap**. In memory these are linked lists: the projects are a `bTList` at
+  `gp-22424`, a project has its `ScreenList` (+12), a screen its `ObjectList` (+32); a node has `Next/Prev` at the start
+  of its payload, and an empty list points to itself. The retail's object offsets are at the start of `pcmenu.cpp`.
+- A menu item is a text object named `MENUITEM_n` (n = 0..15); there are no other tables. The menu is built anew on
+  every activation of the screen (`FlailerScreen::Activate`); the navigation, the orange highlight and the Up/Down sound
+  are done by the shared code of `FlailerMenu`.
+- A screen's behaviour is a C++ class; its `Callback(msg, data)` is registered in a `FlailerScreenConfig`
+  (the screen's name for `ChangeToScreen`, the callback, the hash of the Flailer screen). The configs are built by
+  `__17FlailerScreenList` (0x16c218) from the list at `gp-21272`. `msg`: `ScreenMessage` from
   `work/ccc/types.cpp` (1 SELECT, 4 HIGHLIGHT, 6/7 PAD_LEFT/RIGHT, 11 ACTIVATE, 12 UNACTIVATE,
-  18 TICK), `data` — `ScreenCallbackData {ItemHash, Port, Param, Noise}`; `Noise` — звук (1 Left, 2 Right).
-- Экраны Options, Audio и др. — потомки `OptionsScreenBase` (0x1f4c98): плавающая подсказка внизу
-  (`tAnimatedBlurb` в `this+100`), две линии `MI_OVERSCORE/MI_UNDERSCORE`, плашки `MI_n_MASK`.
-  `tOptionsScreen` (ctor 0x1eebb8, `HandleEvent` 0x1eeca8, `Callback` 0x1eef00): `this+0` — хеш
-  экрана, живой экземпляр лежит в `gp-16888`. Его ctor на NTSC прячет `MENUITEM_7` («Languages»)
-  через `GrayMenuItem(item, 2, screen)`.
-- Значения справа (`TRACKMAP`, `UNITS`…) и стрелки `LEFT_ARROW/RIGHT_ARROW` — просто объекты Display Options.
-  Строку можно писать напрямую: `FlailerTextChunk::SetString` (0x140e20) сбрасывает `LanguageID`,
-  поэтому `FE_*.BIN` менять не нужно. Подсказка — `tAnimatedBlurb::NewText(char*)` (0x249518).
+  18 TICK); `data` is `ScreenCallbackData {ItemHash, Port, Param, Noise}`; `Noise` is the sound (1 Left, 2 Right).
+- The Options, Audio and other screens derive from `OptionsScreenBase` (0x1f4c98): a floating hint at the bottom
+  (`tAnimatedBlurb` at `this+100`), two lines `MI_OVERSCORE/MI_UNDERSCORE`, the bars `MI_n_MASK`.
+  `tOptionsScreen` (ctor 0x1eebb8, `HandleEvent` 0x1eeca8, `Callback` 0x1eef00): `this+0` is the screen's
+  hash, the live instance is at `gp-16888`. On NTSC its ctor hides `MENUITEM_7` ("Languages")
+  through `GrayMenuItem(item, 2, screen)`.
+- The values on the right (`TRACKMAP`, `UNITS`...) and the arrows `LEFT_ARROW/RIGHT_ARROW` are just objects of Display Options.
+  A string can be written directly: `FlailerTextChunk::SetString` (0x140e20) clears the `LanguageID`,
+  so `FE_*.BIN` need not be changed. The hint is `tAnimatedBlurb::NewText(char*)` (0x249518).
 
-## Механизм порта
+## The port's mechanism
 
-1. **Хуки на функции игры.** В `recomp/runtime/hle_names.txt` строка `hook <имя>`; `tools/recomp/gen.py`
-   оставляет рекомпилированное тело как `F_xxxxxxxx_orig` и вызывает `HOOK_<имя>(Ctx &c, void (*orig)(Ctx &))`
-   из `pcmenu.cpp`. Хук выполняется до, после или вместо оригинала. Имена с `$` в идентификатор не
-   превращаются — такие функции хукать нельзя. `gen.py` пишет файлы только при изменении, так что
-   новый хук пересобирает один кусок кода.
-2. **Вызовы игры из хоста:** `pc_call(адрес, a0..a3, t0)` (сохраняет и возвращает регистры).
-   Адреса — `namespace fn` в `pcmenu.cpp`.
-3. **Правка Flailer-данных в памяти**: хук `LoaderFlailerChunk` после загрузки `FRONTB` клонирует
-   экран `OPTIONS` (+ стрелки и значение из `DISPLAY`) в новый экран; память берётся у `bMalloc`
-   и **освобождается при выгрузке `FRONTB`** (хук `UnloaderFlailerChunk`) — иначе гонка падает на
-   большой аллокации (куча осталась рваной). Любую новую аллокацию в кадре меню — только так.
-4. **Страницы** (`pcmenu.h`): `PcPage` — экран из ≤7 строк `PcRow {label, blurb, value(), change(dir)}`.
-   `pc_add_page` вызывается из `pc_settings_register()` до создания списка экранов. Страница получает
-   хеш `bStringHash("ИМЯ_ЗАГЛАВНЫМИ_С_ПОДЧЁРКИВАНИЕМ")`, свой `FlailerScreenConfig` с callback
-   `tOptionsScreen::Callback`, а `HandleEvent` хукается: для страницы события разбирает хост
-   (Select/Left/Right → `change`, Highlight → подсказка и стрелки), `TICK` отдаётся игре.
-   `pc_options_row(label, blurb, page)` — седьмой пункт Options (бывший «Languages») открывает страницу.
-5. Помощники: `pc_open_page(name)` (пункт, ведущий на другую страницу; «Назад» уже работает через
-   стек экранов), `pc_refresh_page()`, `pc_set_blurb(text)`, `pc_on_frame(fn)` (раз в кадр меню).
+1. **Hooks on the game's functions.** A line `hook <name>` in `recomp/runtime/hle_names.txt`; `tools/recomp/gen.py`
+   keeps the recompiled body as `F_xxxxxxxx_orig` and calls `HOOK_<name>(Ctx &c, void (*orig)(Ctx &))`
+   from `pcmenu.cpp`. The hook runs before, after or instead of the original. Names with `$` do not make an
+   identifier, so such functions cannot be hooked. `gen.py` writes files only when they change, so a
+   new hook rebuilds one piece of the code.
+2. **Calls into the game from the host:** `pc_call(address, a0..a3, t0)` (saves and restores the registers).
+   The addresses are in `namespace fn` in `pcmenu.cpp`.
+3. **Changing the Flailer data in memory**: a hook on `LoaderFlailerChunk`, after `FRONTB` is loaded, clones the
+   `OPTIONS` screen (plus the arrows and the value from `DISPLAY`) into a new screen; the memory comes from `bMalloc`
+   and **is freed when `FRONTB` is unloaded** (a hook on `UnloaderFlailerChunk`), or the race crashes on a
+   large allocation (the heap was left fragmented). Any new allocation in a menu frame goes only this way.
+4. **Pages** (`pcmenu.h`): a `PcPage` is a screen of at most 7 rows `PcRow {label, blurb, value(), change(dir)}`.
+   `pc_add_page` is called from `pc_settings_register()` before the list of screens is made. A page gets the
+   hash `bStringHash("NAME_IN_CAPITALS_WITH_UNDERSCORES")` and its own `FlailerScreenConfig` with the callback
+   `tOptionsScreen::Callback`, and `HandleEvent` is hooked: for a page the host handles the events
+   (Select/Left/Right → `change`, Highlight → the hint and the arrows), and `TICK` goes to the game.
+   `pc_options_row(label, blurb, page)`: the seventh item of Options (once "Languages") opens the page.
+5. Helpers: `pc_open_page(name)` (an item that leads to another page; "Back" already works through
+   the stack of screens), `pc_refresh_page()`, `pc_set_blurb(text)`, `pc_on_frame(fn)` (once a menu frame).
 
-### Как добавить экран (например, профили)
+### How to add a screen (profiles, for example)
 
 ```cpp
-PcPage &p = pc_add_page("PC Profiles", "Profiles");   // имя экрана и заголовок
+PcPage &p = pc_add_page("PC Profiles", "Profiles");   // the screen's name and its title
 p.rows.push_back({"Driver", "Pick the profile.",
-                  [] { return current_profile_name(); },   // значение справа (null — строка-действие)
-                  [](int dir) { next_profile(dir); }});    // dir -1/+1, 0 для строки-действия
-pc_options_row(...) или строка другой страницы с pc_open_page("PC Profiles");
+                  [] { return current_profile_name(); },   // the value on the right (null: a row that is an action)
+                  [](int dir) { next_profile(dir); }});    // dir -1/+1, 0 for an action row
+pc_options_row(...) or a row of another page with pc_open_page("PC Profiles");
 ```
-Ограничения: строк не больше 7 (экран 640x480), текст строки до 23 символов; свой макет —
-клонировать другой экран (`clone_object`/`build_page` в `pcmenu.cpp`).
+Limits: no more than 7 rows (the screen is 640x480), a row's text up to 23 characters; for a layout of your own,
+clone another screen (`clone_object`/`build_page` in `pcmenu.cpp`).
 
-## Exit в главном меню
+## Exit in the main menu
 
-Экран `NEW_MAIN_MENU` (`ae0f8aa1`, класс `NewMainMenu`) в данных имеет три строки с шагом 55, но код
-игры находит строки по именам: меню берёт `MENUITEM_n`, slide-in — `MENUITEM_n_GROUP` и `MI_n_MASK`,
-а `SelectionSet` — таблицу `0x31BE40`, где уже есть `MI_4_MASK` и `MI_5_MASK`. Поэтому `add_exit_row`
-при загрузке `FRONTB` просто клонирует объекты четвёртой строки и разрезает панель под третьей строкой
-(память освобождается с бандлом, как у страниц). `NewMainMenu::HandleEvent` знает только строки 1..3,
-поэтому хук разбирает для четвёртой Highlight (анимация, подсказка) и Select (`window_quit`, тот же
-путь, что закрытие окна). Подтверждения нет: Exit закрывает игру сразу.
+The screen `NEW_MAIN_MENU` (`ae0f8aa1`, the class `NewMainMenu`) has three rows 55 apart in its data, but the game's
+code finds the rows by their names: the menu takes `MENUITEM_n`, the slide-in `MENUITEM_n_GROUP` and `MI_n_MASK`,
+and `SelectionSet` the table at `0x31BE40`, which already has `MI_4_MASK` and `MI_5_MASK`. So when `FRONTB` loads,
+`add_exit_row` simply clones the objects of the fourth row and cuts the panel below the third row
+(the memory is freed with the bundle, as for the pages). `NewMainMenu::HandleEvent` knows only rows 1..3,
+so for the fourth the hook handles Highlight (the animation, the hint) and Select (`window_quit`, the same
+path as closing the window). There is no confirmation: Exit closes the game at once.
 
-## Следы PS2 (`pcplatform.cpp`)
+## Traces of the PS2 (`pcplatform.cpp`)
 
-- **Тексты.** `FE_ENGLISH` правится один раз при загрузке (хук `Loader__15LanguageManagerP6bChunk`): `kText` даёт
-  новую строку по `LanguageID`, запись в таблице ID и те же смещения в таблице английских хешей переставляются
-  на копию в гостевой памяти, поэтому все читатели видят новый текст. Заодно во всём пуле «✕ START» сжимается до
-  «✕»: это одна и та же кнопка меню. Заголовок титульного экрана — «PRESS ENTER» или «PRESS START» по устройству.
-- **Значки.** Символы 0x80..0x9d рисуются из листа `BUTTONSOUT` (4 бита, 128×256, swizzled, таблица глифов
-  `0x2f09c0`). `pc_paint_buttons` перерисовывает весь лист в гостевой памяти: клавиша — колпачок с подписью из
-  игрового `FONT_A`, геймпад — цветные A/B/X/Y, LB/RB/LT/RT, крестовина. Вызывается каждый кадр меню и при смене
-  режима игрока, работает только если изменились привязки, устройство или контекст. Игра загружает текстуры заново,
-  так что смена видна сразу (проверено).
-- **Убрано из меню.** Экраны Controller с DualShock (их строка теперь Controls) и Display → Calibrate Display (выравнивание
-  под ТВ). Экран Display называется HUD.
-- **Сохранения.** `saves/save.dat` рядом с exe, см. `work/memcard/README.md`.
+- **Texts.** `FE_ENGLISH` is changed once when it loads (a hook on `Loader__15LanguageManagerP6bChunk`): `kText` gives a
+  new string by `LanguageID`; its entry in the ID table and the same offsets in the table of English hashes are moved
+  to a copy in the guest's memory, so every reader sees the new text. On the way, "✕ START" is shortened to "✕" in the
+  whole pool: it is one and the same menu button. The title screen's caption is "PRESS ENTER" or "PRESS START" by the device.
+- **Icons.** The characters 0x80..0x9d are drawn from the sheet `BUTTONSOUT` (4 bits, 128x256, swizzled, the glyph table at
+  `0x2f09c0`). `pc_paint_buttons` paints the whole sheet again in the guest's memory: a key is a keycap with its label in
+  the game's `FONT_A`, a gamepad the coloured A/B/X/Y, LB/RB/LT/RT, the d-pad. It is called every menu frame and when the
+  player's mode changes, and works only if the bindings, the device or the context changed. The game loads the textures again,
+  so the change shows at once (checked).
+- **Taken out of the menus.** The Controller screens with the DualShock (their row is now Controls) and Display → Calibrate Display
+  (lining the picture up on a TV). The Display screen is called HUD.
+- **Saves.** `saves/save.dat` beside the exe, see `work/memcard/README.md`.
 
-## Управление
+## Controls
 
-Две раскладки, `pc_car_input()` (`pcmenu.cpp`) выбирает между ними по `Player::SetInputMode` (хук) и состоянию
-`CurrentGameFlowState`: режимы 2, 3, 4, 5, 7 — вождение, остальное и весь фронтенд — меню.
+Two layouts; `pc_car_input()` (`pcmenu.cpp`) chooses between them by `Player::SetInputMode` (a hook) and the state
+`CurrentGameFlowState`: the modes 2, 3, 4, 5, 7 are driving, the rest and all of the frontend are the menu.
 
-| | Клавиатура | Геймпад |
+| | Keyboard | Gamepad |
 |---|---|---|
-| Меню, постоянная | стрелки, Enter ✕, Esc △, F1 ○, Space □, Q/E L1/R1, 1/2 L2/R2, Backspace Select | крестовина, стик, A ✕, B △, Y ○ (на PlayStation как на PS2), X □, LB/RB, LT/RT, Start, Back |
-| Вождение, настраивается | `key_*` в `hp2.ini`: ↑/W газ, ↓/S тормоз, ←/A и →/D руль, Space ручник, C вид, Q назад, H гудок, Shift ускорение, Z/X передачи, R сброс, Tab HUD | `pad_*`: RT/A газ, LT/X тормоз, стик и крестовина руль, RB ручник, Y вид, LB назад, B гудок, ↓ ускорение, L3/R3 передачи, Back сброс, Start пауза |
+| Menu, fixed | arrows, Enter ✕, Esc △, F1 ○, Space □, Q/E L1/R1, 1/2 L2/R2, Backspace Select | d-pad, stick, A ✕, B △, Y ○ (on PlayStation as on the PS2), X □, LB/RB, LT/RT, Start, Back |
+| Driving, can be changed | `key_*` in `hp2.ini`: ↑/W throttle, ↓/S brake, ←/A and →/D steering, Space handbrake, C view, Q look back, H horn, Shift boost, Z/X gears, R reset, Tab HUD | `pad_*`: RT/A throttle, LT/X brake, stick and d-pad steering, RB handbrake, Y view, LB look back, B horn, ↓ boost, L3/R3 gears, Back reset, Start pause |
 
-Esc в гонке — всегда пауза (в экранах внутри гонки Enter = ✕). В паузе Esc посылает START (закрывает) и △ (в
-вопросе — «нет»). Действия подписаны по раскладке игры A; экрана выбора раскладки больше нет. R3 («Speed Boost»)
-раньше не был назначен вообще.
+Esc in a race is always the pause (on the screens inside a race Enter = ✕). In the pause Esc sends START (closes it) and △ (on a
+question, "no"). The actions are labelled after the game's layout A; there is no layout screen any more. R3 ("Speed Boost")
+had no binding at all before.
 
-## Настройки порта
+## The port's settings
 
-Options: Audio, Controls, Graphics, HUD, Save/Load, Player Names, Credits. Все семь строк экрана свои: строки 2 и 3
-открывают страницы порта, строки 4..7 при Select передают игре её пункт на номер меньше (`options_event`), подсказки — строки
-100021..100026 из `kText`. PC Settings больше нет.
+Options: Audio, Controls, Graphics, HUD, Save/Load, Player Names, Credits. All seven rows of the screen are the port's: rows 2 and 3
+open the port's pages, rows 4..7 on Select pass the game its item one number lower (`options_event`), the hints are the strings
+100021..100026 of `kText`. There is no PC Settings any more.
 
-| Где | Строка | Что делает | Когда действует |
+| Where | Row | What it does | When it takes effect |
 |---|---|---|---|
-| Audio | Master Volume | первая строка списка, 0..100% шагом 10 (только на динамики, не в `HP2_WAVOUT`) | сразу |
-| Graphics | Window | Windowed / Fullscreen (borderless), Alt+Enter тоже | сразу |
-| Graphics | Resolution | размер окна, 800×600..3840×2160; в полном экране запоминается на потом | сразу |
-| Graphics | Aspect Ratio | картинка гонки 4:3 / 16:10 / 16:9, меню всегда 4:3 | после перезапуска |
-| Graphics | Picture Quality | страница: Render Scale 1x..4x от 512×448, Anti-Aliasing Off/2x/4x/8x, Anisotropic Filtering Off/2x/4x/8x/16x | после перезапуска |
-| Graphics | Scaling | Smooth / Sharp | сразу |
-| Graphics | Show FPS | счётчик кадров в углу | сразу |
-| Controls | Keyboard | три страницы клавиш для вождения: Select, затем клавиша, Esc отмена | сразу |
-| Controls | Gamepad | Buttons, Stick Dead Zone, Steering, Vibration, Button Icons, Defaults | сразу |
+| Audio | Master Volume | the list's first row, 0..100% in steps of 10 (to the speakers only, not into `HP2_WAVOUT`) | at once |
+| Graphics | Window | Windowed / Fullscreen (borderless), Alt+Enter as well | at once |
+| Graphics | Resolution | the window's size, 800x600..3840x2160; in full screen it is kept for later | at once |
+| Graphics | Aspect Ratio | the race's picture 4:3 / 16:10 / 16:9, the menus always 4:3 | after a restart |
+| Graphics | Picture Quality | a page: Render Scale 1x..4x of 512x448, Anti-Aliasing Off/2x/4x/8x, Anisotropic Filtering Off/2x/4x/8x/16x | after a restart |
+| Graphics | Scaling | Smooth / Sharp | at once |
+| Graphics | Show FPS | the frame counter in the corner | at once |
+| Controls | Keyboard | three pages of keys for driving: Select, then the key, Esc cancels | at once |
+| Controls | Gamepad | Buttons, Stick Dead Zone, Steering, Vibration, Button Icons, Defaults | at once |
 
-Master Volume — объект `MENUITEM_0`: `FlailerMenu` собирает пункты 0..15, поэтому он становится первым. `add_master_row` при
-загрузке `FRONTB` сдвигает 26 объектов таблицы `0x2b9c30` на строку вниз, хук конструктора задаёт видимую область
-`MENUITEM_0..6` и начальную маску. У Audio подсказка в `this+372`, а `this+100` — громкости, писать туда нельзя.
+Master Volume is the object `MENUITEM_0`: `FlailerMenu` gathers the items 0..15, so it becomes the first. When `FRONTB` loads,
+`add_master_row` moves the 26 objects of the table at `0x2b9c30` one row down, and a hook on the constructor sets the visible range
+`MENUITEM_0..6` and the starting mask. Audio has its hint at `this+372`, and `this+100` is the volumes: nothing may be written there.
 
-Ловушка `gen.py`: хук по имени молча не создаётся, если замороженная таблица не даёт этого имени адресу (у функций с
-`how: neighbour` и низким `ratio`). Так было с `HandleEvent__18AudioOptionsScreen`. Проверка: в `work/recomp/gen` должен быть
-`HOOK_<имя>`, иначе в `hle_names.txt` нужен явный адрес.
+A trap of `gen.py`: a hook by name is silently not made if the frozen table does not give that name to the address (for functions with
+`how: neighbour` and a low `ratio`). That happened with `HandleEvent__18AudioOptionsScreen`. The check: `work/recomp/gen` must have
+`HOOK_<name>`, otherwise `hle_names.txt` needs the address written out.
 
-Цель соотношения сторон, масштаба 3x-4x и разрешения кадра — нативный рендер (`work/gsvk/README.md`); на старом пути их не
-делаем.
+The aspect ratio, the 3x-4x scale and the frame's resolution are aimed at the native renderer (`work/gsvk/README.md`); they are not
+done on the old path.
 
-## Геймпады (`pad.cpp`, SDL3)
+## Gamepads (`pad.cpp`, SDL3)
 
-SDL3 3.4.18 лежит в `work/ref/sdl3` и собирается статически, без звука и видео, только gamepad. Маски остаются битами XInput,
-поэтому `hp2.ini` от устройства не зависит. `pad_is_playstation` смотрит тип геймпада; `icons` в `hp2.ini` и Button Icons
-перекрывают его, это нужно, например, при DS4Windows, где DualSense виден как Xbox. От типа зависят значки и раскладка меню:
-PlayStation как на PS2 (✕ ввод, △ назад, ○ помощь), Xbox как на ПК (A, B, Y). На PlayStation `pc_paint_buttons` копирует в
-ячейки исходные значки диска, а для клавиатуры и Xbox рисует свои. В сценарии клавиш vk `FE` значит «как будто геймпад PlayStation».
+SDL3 3.4.18 is in `work/ref/sdl3` and is built statically, with no sound and no video, the gamepad only. The masks stay XInput bits,
+so `hp2.ini` does not depend on the device. `pad_is_playstation` looks at the gamepad's type; `icons` in `hp2.ini` and Button Icons
+override it, which is needed, for example, with DS4Windows, where a DualSense shows as an Xbox pad. The icons and the menu layout
+depend on the type: PlayStation as on the PS2 (✕ enter, △ back, ○ help), Xbox as on a PC (A, B, Y). On PlayStation `pc_paint_buttons` copies
+the disc's original icons into the cells, and for the keyboard and Xbox it draws its own. In a key script the vk `FE` means "as if a
+PlayStation gamepad".
 
-`hp2.ini` лежит рядом с exe (создаётся с умолчаниями; `HP2_INI=<путь>` — другой файл), переменные
-окружения перекрывают его. Рисует только новый рендер (`work/gsvk/README.md`): нужна видеокарта с Vulkan, картинка выводится через свопчейн. Привязка: клавиша, которая уже занята, меняется
-местами с кнопкой, которая её имела.
+`hp2.ini` is beside the exe (made with the defaults; `HP2_INI=<path>` for another file), and environment variables override it.
+Only the new renderer draws (`work/gsvk/README.md`): it needs a graphics card with Vulkan, the picture goes out through a swapchain.
+Binding: a key that is taken already swaps places with the button that had it.
 
-## Тесты
+## Tests
 
-- `HP2_PCGOTO="PC Settings,700"` — на 700-м тике фронтенда игра сама переходит на экран;
-  `HP2_PADSCRIPT` (см. `hle_iop.cpp`) — кнопки; `HP2_NATIVESHOT=<файл с %d>` и `HP2_NATIVESHOTN=<кадров>` — снимки картинки рендера;
-  `HP2_FLDUMP=<файл>` — дамп всех Flailer-проектов (имя, позиция, текст каждого объекта);
-  `HP2_CAPTEST=<vk>` — тестовое нажатие при привязке клавиши; всегда `HP2_INI=<тестовый файл>`
-  и `HP2_MEMCARD=<тестовая папка>`.
-- `HP2_KEYSCRIPT=<файл>` — клавиатура по сценарию через настоящие раскладки, без фокуса окна: строки
-  `<кадр или +N> <vk, hex> [кадров]`; vk `FF` — «как будто используется геймпад» (значки). `HP2_PADSCRIPT` обходит
-  раскладки: кнопки PS2 напрямую. Нажатия во время анимации смены экрана игра игнорирует.
-- Гонка: команда из задания; 30 fps держится, `FATAL` нет.
-- Ловушка: bash-подстановки съедают `\\` — файлы с обратной косой писать инструментом Write/Edit.
+- `HP2_PCGOTO="PC Settings,700"`: on the frontend's 700th tick the game goes to the screen by itself;
+  `HP2_PADSCRIPT` (see `hle_iop.cpp`): buttons; `HP2_NATIVESHOT=<file with %d>` and `HP2_NATIVESHOTN=<frames>`: shots of the renderer's
+  picture; `HP2_FLDUMP=<file>`: a dump of all Flailer projects (the name, place and text of every object);
+  `HP2_CAPTEST=<vk>`: a test key press while binding a key; always `HP2_INI=<test file>`
+  and `HP2_MEMCARD=<test folder>`.
+- `HP2_KEYSCRIPT=<file>`: the keyboard by a script through the real layouts, without the window's focus: lines
+  `<frame or +N> <vk, hex> [frames]`; vk `FF` is "as if a gamepad is in use" (the icons). `HP2_PADSCRIPT` goes around
+  the layouts: PS2 buttons directly. The game ignores presses during the animation of a change of screen.
+- A race: the command from the task; 30 fps holds, no `FATAL`.
+- A trap: bash substitutions eat `\\`, so files with backslashes are written with the Write/Edit tool.
 
-## Не сделано / известно
+## Not done / known
 
-- Настоящим геймпадом не проверено: кнопки, стик, чувствительность и вибрация (`scePadSetActDirect` → `SDL_RumbleGamepad`).
-- Display → Player 2 Options остаётся: второй игрок не подключён (`scePadRead` порта 1 пуст, кроме теста с `HP2_PAD2=1`), но игра его ещё считает.
-- Экраны внутри гонки показывают значки вождения, кроме ✕ и START; в режиме FINISH — значки меню.
+- Not checked with a real gamepad: the buttons, the stick, the sensitivity and the vibration (`scePadSetActDirect` → `SDL_RumbleGamepad`).
+- Display → Player 2 Options stays: the second player is not connected (`scePadRead` of port 1 is empty, except in a test with `HP2_PAD2=1`),
+  but the game still counts him.
+- The screens inside a race show the driving icons, except ✕ and START; in the FINISH mode, the menu's icons.
+- With `HP2_NOSOUND=1`, after going back from a race to the main menu an assert fires in `bSample::LockVoice`
+  (2026-11-03, one run, some 30 s into the menu). With the real driver (`HP2_NOAUDIO=1`) the same
+  path goes through, so long menu tests are better run with `HP2_NOAUDIO`.
 
-- С `HP2_NOSOUND=1` после возврата из гонки в главное меню срабатывает assert в `bSample::LockVoice`
-  (2026-11-03, один прогон, примерно через 30 с в меню). С настоящим драйвером (`HP2_NOAUDIO=1`) тот же
-  маршрут проходит, поэтому длинные тесты меню лучше гонять с `HP2_NOAUDIO`.
+## The mouse in the menus
 
-## Мышь в меню
+`mouse_frame` in `pcmenu.cpp`, once a frame from `Tick__17FlailerScreenList`. Pointing at a row of `FlailerMenu` moves the highlight
+there, a left click on a row is Enter, the right button does nothing. Everything goes as presses through `window_pad`, so the choice, the
+sound and the skipping of grey rows are done by the game's code.
+On screens without `FlailerMenu` rows (the car choice, the event tree) there is no pointing, and a click works as Enter. Value arrows:
+only the objects `LEFT_ARROW` and `RIGHT_ARROW`; `LEFT_ARROW_SELECT` and the others are not handled yet.
+An object's coordinates are in 640x480; on the screen `x * 0.8`, the middle of a row `y * 448 / 480 + 15` (measured on shots of Options and
+the pause).
+The pointer shows while the player is not driving. `data\ui\cursor.cur` or `data\ui\cursor.ani` replaces the Windows arrow.
+A check without a person: `HP2_MOUSESCRIPT=<file>`, lines `<frame> <x> <y> [1 pressed]` in 512x448 coordinates.
 
-`mouse_frame` в `pcmenu.cpp`, раз в кадр из `Tick__17FlailerScreenList`. Наведение на строку `FlailerMenu` переводит выделение, левый клик по строке — Enter, правая кнопка ничего не делает. Всё идёт нажатиями через `window_pad`, поэтому выбор, звук и пропуск серых строк делает код игры.
-На экранах без строк `FlailerMenu` (выбор машины, дерево событий) наведения нет, клик работает как Enter. Стрелки значений: только объекты `LEFT_ARROW` и `RIGHT_ARROW`; `LEFT_ARROW_SELECT` и другие пока не обрабатываются.
-Координаты объекта в 640×480, на экране `x * 0.8`, середина строки `y * 448 / 480 + 15` (измерено по снимкам на Options и паузе).
-Указатель виден, пока игрок не ведёт машину. `data\ui\cursor.cur` или `data\ui\cursor.ani` заменяет стрелку Windows.
-Проверка без человека: `HP2_MOUSESCRIPT=<файл>`, строки `<кадр> <x> <y> [1 нажата]` в координатах 512×448.
+## The pause menu
 
-## Меню паузы
-
-`center_pause_menu`: на экране `605d2bf1` всё, кроме затемнения, сдвинуто на -90 по X, логотип поставлен по центру над панелью. Выключается `HP2_NATIVEEXACT=1`. Другие экраны внутри паузы не менялись.
+`center_pause_menu`: on the screen `605d2bf1` everything but the darkening is moved by -90 in X, and the logo is centred over the panel.
+`HP2_NATIVEEXACT=1` turns it off. The other screens inside the pause are unchanged.

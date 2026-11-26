@@ -198,13 +198,22 @@ void phase_thread(const char *) {}
         Phase timed(phase); \
         orig(c); \
     }
-PHASE_HOOK(Think__3Carf, PH_AI)
+// (the cars' phases of World::DoTimestep also go by native.cpp's order check, a diagnostic: HP2_ORDERCHECK)
+void native_order_check(Ctx &c, void (*orig)(Ctx &), int which);
+#define CAR_PHASE_HOOK(name, phase, which) \
+    void HOOK_##name(Ctx &c, void (*orig)(Ctx &)) \
+    { \
+        Phase timed(phase); \
+        native_order_check(c, orig, which); \
+        orig(c); \
+    }
+CAR_PHASE_HOOK(Think__3Carf, PH_AI, 0)
 PHASE_HOOK(GlobalCopThink__Ff, PH_AI)
 PHASE_HOOK(DoWheelForces__3Car, PH_PHYSICS)
-PHASE_HOOK(Drive__3Carf, PH_PHYSICS)
-PHASE_HOOK(BeginMovement__3Carf, PH_PHYSICS)
+CAR_PHASE_HOOK(Drive__3Carf, PH_PHYSICS, 1)
+CAR_PHASE_HOOK(BeginMovement__3Carf, PH_PHYSICS, 2)
 PHASE_HOOK(DoTimestepMove__5Worldf, PH_PHYSICS)
-PHASE_HOOK(FinishMovement__3Carf, PH_PHYSICS)
+CAR_PHASE_HOOK(FinishMovement__3Carf, PH_PHYSICS, 3)
 PHASE_HOOK(DoTimestepCollisions__5Worldf, PH_COLLISIONS)
 void native_particles_step(Ctx &c, void (*orig)(Ctx &));
 void HOOK_DoTimeStep__16AcidEffectSystemf(Ctx &c, void (*orig)(Ctx &))

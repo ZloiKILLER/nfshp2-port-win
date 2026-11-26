@@ -8,6 +8,7 @@
 //   Graphics<TAB>Graphismes              one of the port's: its English, then what it is in this language
 // Lines starting with ; are comments. In a text, \xNN is that byte (the game's button icons are 0x80..0x8d) and @ breaks the line, as the
 // game's own strings do. The text goes to the game in Latin-1: the fonts have those letters and no others.
+// RUSSIAN_DISC.txt is the one file not of this kind: the port's strings for the Russian disc, whose English slot is Russian.
 #include <string>
 #include <vector>
 
@@ -20,6 +21,11 @@ struct PcLanguage {
 const std::vector<PcLanguage> &pc_languages();
 int pc_language_index();                        // the one in use, into pc_languages()
 void pc_language_choose(int index);             // switch the game to it now and keep it in hp2.ini (from a menu)
+void pc_language_start();                       // the main program, once hp2.ini is read: the list, and which fonts the disc gives
+// The Russian disc only (pclang.cpp): this language needs the other fonts, which the game loads at its start. Then the menu keeps
+// the choice in hp2.ini and starts the game again in place of pc_language_choose.
+bool pc_language_restarts(int index);
+void pc_language_keep(int index);
 void pc_language_apply();                       // the frontend is up: the game to hp2.ini's language, once
 const std::string &tr(const std::string &english);     // the port's string in the language in use, or the English itself
 // the port's texts of the game's strings for a language (by e_Languages slot): id -> Latin-1 text, the English ones from the code included

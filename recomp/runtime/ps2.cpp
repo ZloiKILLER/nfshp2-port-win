@@ -6,6 +6,8 @@
 #include "cores.h"
 #include "hw.h"
 #include "pcconfig.h"
+#include "pclang.h"
+#include "pcwheel.h"
 #include "disc.h"
 #include "setup_iso.h"
 #include "setup.h"
@@ -670,6 +672,12 @@ int main()
     // With it the DualShock 2 has eight setups, four with the throttle and the brake on the triggers. HP2_NOLAYOUTS: the game's four.
     if (!getenv("HP2_NOLAYOUTS"))
         for (const auto &w : kLayoutsPatch) SW(w[0], w[1]);
+    // The port's layouts (pcplatform.cpp): the ninth and the tenth of the DualShock 2's list of ten (the pad types' table,
+    // 0x2de558, 20 bytes a type: the DualShock 2 is the fourth, its layouts from +4, ten bytes and no more). The ninth, "I",
+    // is the modern one (0x3e), the tenth, "J", a player's own: the list has player 1's number (0x3c), and where the list
+    // is read for player 2's screen it is player 2's (0x3d: pcmenu.cpp, HOOK_GetJoystickConfigs).
+    SB(0x2de594 + 4 + 8, 0x3e);
+    SB(0x2de594 + 4 + 9, 0x3c);
     fprintf(g_log, "entry %08x\n", entry);
     profile_start();
     stall_watch_start();
@@ -677,10 +685,12 @@ int main()
     cores_thread(CORE_GAME);
     start_vblank_timer();
     pc_config_init();
+    pc_language_start();        // the Russian disc: which fonts it gives, before the game reads them
     if (!getenv("HP2_NOWINDOW")) {
         const int was = window_dpi_aware();
         fprintf(g_log, "window: the process's DPI awareness was %d, now per monitor\n", was);
         window_start();
+        pc_wheel_start();           // a steering wheel, if Windows has one (pcwheel.h)
     }
     static Ctx c;
     g_ctx = &c;

@@ -2,6 +2,7 @@
 // bytes (alpha 0x80 is 1.0): the shader does the GS's arithmetic on them.
 #include "native.h"
 
+#include "cores.h"
 #include "host.h"
 #include "ps2.h"
 #include "phase.h"
@@ -20,7 +21,7 @@
 
 // A flagged level goes to the GS as a PSMCT32 image, half as wide and half (8 bits) or a quarter (4 bits) as tall, and is read as
 // PSMT8 or PSMT4 (texture-pack.md): the same memory, here a small one, whatever the sizes. Where it lies in the GS's does not matter.
-static std::vector<u8> g_flagged;
+static thread_local std::vector<u8> g_flagged;      // (a thread's own: the workers decode too, native_textures_ahead)
 
 // GS memory's layout: pages of 32 blocks of 4 columns (a byte address, the nibble for 4 bits). Only these three formats are ever packed.
 enum { PSMCT32 = 0, PSMT8 = 0x13, PSMT4 = 0x14 };
@@ -337,16 +338,23 @@ uint16_t native_tex_mode(const NativeTexture &t)
 }
 
 // what decodes a texture is timed: a frame that waited on it shows in HP2_NATIVELOG's long frames
+// Asked for again in the same frame (every draw asks): the answer is the same texture while the info's image, palette and depth
+// are what they were, which is all native_texture_now would look at before it gave the same one back. No map, no clock.
+struct Asked {
+    uint32_t info, image, palette, frame;
+    int bpp;
+    NativeTexture *tex;
+};
+static Asked asked[1024];
+
+bool native_texture_recent(uint32_t info, uint32_t frame)
+{
+    const Asked &was = asked[info >> 4 & 1023];
+    return info && was.tex && was.info == info && frame - was.frame <= 1;
+}
+
 NativeTexture *native_texture(uint32_t info, uint32_t frame)
 {
-    // Asked for again in the same frame (every draw asks): the answer is the same texture while the info's image, palette and depth
-    // are what they were, which is all native_texture_now would look at before it gave the same one back. No map, no clock.
-    struct Asked {
-        uint32_t info, image, palette, frame;
-        int bpp;
-        NativeTexture *tex;
-    };
-    static Asked asked[1024];
     Asked &was = asked[info >> 4 & 1023];
     if (info && was.tex && was.info == info && was.frame == frame && was.image == LW(info + 0x90) && was.palette == LW(info + 0x94) &&
         was.bpp == (int)LB(info + 0x28))
@@ -359,9 +367,108 @@ NativeTexture *native_texture(uint32_t info, uint32_t frame)
     return t;
 }
 
+static std::unordered_map<u64, NativeTexture> cache;
+
+static u32 raw_sum_of(u32 info, const u8 *px, size_t bytes, const u8 *pal, size_t pal_bytes)
+{
+    const bool movie = !strncmp((const char *)host(info + 8), "MOVIE_", 6);
+    return checksum(px, bytes, bytes > 4096 && !movie ? (bytes / 512) | 1 : 1) ^ (pal ? checksum(pal, pal_bytes, 1) * 31 : 0);
+}
+
+// a texture's levels, one after another in out
+static void decode_levels(u32 *out, u32 info, int levels, int tex_w, int tex_h, int w, int h, const u8 *px, const u8 *pal, int bpp)
+{
+    const u8 *raw = px;
+    for (int l = 0; l < levels; l++) {
+        int tw = tex_w >> l, th = tex_h >> l, iw = w >> l, ih = h >> l;
+        if (!tw) tw = 1;
+        if (!th) th = 1;
+        if (!iw) iw = 1;
+        if (!ih) ih = 1;
+        decode(out, tw, th, iw, ih, raw, pal, bpp, LB(info + 0x54 + l * 4), (s8)LB(info + 0x55 + l * 4) == 1);
+        out += (size_t)tw * th;
+        raw += (size_t)iw * ih * bpp / 8;
+    }
+}
+
+// ---- textures decoded ahead by the workers (2026-11-24) ---------------------------------------------------------------------------
+// A race's first frame asks for every texture of the track at once, and each was decoded as its list came to be read, on the
+// game's thread: 50 ms for 179 of them. The scenery's own loop (native.cpp, stuff_scenery_native) knows which textures its models
+// name before any list is read; those of them that have never been decoded are decoded here, each by a worker, into pixels kept
+// by the texture's image and palette. native_texture_now, coming to such a texture, takes the pixels in place of decoding: if
+// the texture's sum and sizes are what they were here (the same test that says a texture has changed). The same decode on the
+// same bytes: the same pixels. What is not taken that frame is dropped. HP2_TEXAHEAD=0: none.
+struct TexAhead {
+    u32 info, sum;
+    int w, h, tex_w, tex_h, levels, bpp;
+    std::vector<u32> px;
+};
+static std::unordered_map<u64, TexAhead> g_tex_ahead;
+static u64 g_tex_ahead_made, g_tex_ahead_taken;
+
+void native_textures_ahead(const uint32_t *infos, size_t count, uint32_t frame)
+{
+    static const bool off = getenv("HP2_TEXAHEAD") && atoi(getenv("HP2_TEXAHEAD")) == 0;
+    static uint32_t last_frame = ~0u;
+    if (last_frame != frame) g_tex_ahead.clear(), last_frame = frame;
+    if (off || !cores_workers()) return;
+    static std::vector<TexAhead *> jobs;
+    jobs.clear();
+    for (size_t i = 0; i < count; i++) {
+        const u32 info = infos[i];
+        const u32 image = info ? LW(info + 0x90) : 0, palette = info ? LW(info + 0x94) : 0;
+        const int bpp = info ? LB(info + 0x28) : 0;
+        if (!image || (bpp != 4 && bpp != 8 && bpp != 32) || (bpp != 32 && !palette)) continue;
+        if (!strncmp((const char *)host(info + 8), "MOVIE_", 6)) continue;
+        const u64 key = (u64)image << 32 | palette;
+        if (g_tex_ahead.count(key)) continue;
+        {   // only what is not on the GPU: the first time, or after the renderer let it go
+            auto had = cache.find(key);
+            if (had != cache.end()) {
+                std::lock_guard<std::mutex> hold(g_native_tex_mutex);
+                if (had->second.loaded) continue;
+            }
+        }
+        const int w = LH(info + 0x24), h = LH(info + 0x26);
+        if (w <= 0 || h <= 0 || w > 2048 || h > 2048) continue;
+        const int tex_w = 1 << LB(info + 0x48), tex_h = 1 << LB(info + 0x49);
+        if (tex_w < w || tex_h < h || tex_w > 4096 || tex_h > 4096) continue;
+        const u32 mmin = LB(info + 0x70);
+        int levels = 1;
+        if (mmin >= 2) {
+            int most = 1;
+            for (int m = tex_w > tex_h ? tex_w : tex_h; m > 1; m >>= 1) most++;
+            levels = 1 + (s8)LB(info + 0x6e);
+            if (levels < 1) levels = 1;
+            if (levels > most) levels = most;
+        }
+        TexAhead &a = g_tex_ahead[key];
+        a.info = info;
+        a.w = w, a.h = h, a.tex_w = tex_w, a.tex_h = tex_h, a.levels = levels, a.bpp = bpp;
+        const size_t bytes = (size_t)w * h * bpp / 8, pal_bytes = bpp == 8 ? 1024 : bpp == 4 ? 64 : 0;
+        a.sum = raw_sum_of(info, host(image), bytes, pal_bytes ? host(palette) : nullptr, pal_bytes);
+        jobs.push_back(&a);
+    }
+    if (jobs.size() < 4) {                  // not worth waking anybody
+        for (TexAhead *a : jobs) g_tex_ahead.erase((u64)LW(a->info + 0x90) << 32 | LW(a->info + 0x94));
+        return;
+    }
+    jobs_each((int)jobs.size(), [&](int at, int) {
+        TexAhead &a = *jobs[(size_t)at];
+        size_t texels = 0;
+        for (int l = 0; l < a.levels; l++) {
+            const int lw = a.tex_w >> l, lh = a.tex_h >> l;
+            texels += (size_t)(lw ? lw : 1) * (lh ? lh : 1);
+        }
+        a.px.resize(texels);
+        const u32 image = LW(a.info + 0x90), palette = LW(a.info + 0x94);
+        decode_levels(a.px.data(), a.info, a.levels, a.tex_w, a.tex_h, a.w, a.h, host(image), a.bpp == 32 ? nullptr : host(palette), a.bpp);
+    });
+    g_tex_ahead_made += jobs.size();
+}
+
 static NativeTexture *native_texture_now(uint32_t info, uint32_t frame)
 {
-    static std::unordered_map<u64, NativeTexture> cache;
     u32 image = info ? LW(info + 0x90) : 0, palette = info ? LW(info + 0x94) : 0;
     int bpp = info ? LB(info + 0x28) : 0;
     if (!image || (bpp != 4 && bpp != 8 && bpp != 32) || (bpp != 32 && !palette)) return nullptr;
@@ -386,13 +493,12 @@ static NativeTexture *native_texture_now(uint32_t info, uint32_t frame)
     static const bool watch_check = getenv("HP2_TEXWATCHCHECK") != nullptr;
     const u32 raw_bytes = (u32)bytes;
     const auto raw_stamp = [&] { return memwatch_sum(image, raw_bytes) + (pal ? memwatch_sum(palette, (u32)pal_bytes) * 0x100000001ull : 0); };
-    const auto raw_sum = [&] {
-        const bool movie = !strncmp((const char *)host(info + 8), "MOVIE_", 6);
-        return checksum(px, bytes, bytes > 4096 && !movie ? (bytes / 512) | 1 : 1) ^ (pal ? checksum(pal, pal_bytes, 1) * 31 : 0);
-    };
+    const auto raw_sum = [&] { return raw_sum_of(info, px, bytes, pal, pal_bytes); };
+    u32 sum_raw = 0;                        // the pixels' and the palette's sum itself, before anything else is mixed in
     u32 sum;
     if (t.raw_watched && t.raw_bytes == raw_bytes && t.raw_stamp == raw_stamp()) {
         sum = t.raw_sum;
+        sum_raw = sum;
         g_tex_vouched++;
         if (watch_check && raw_sum() != sum && g_tex_vouched_bad++ < 10)
             fprintf(stderr, "texwatch: %s: its pages were not written, its sum is another\n", (const char *)host(info + 8));
@@ -400,6 +506,7 @@ static NativeTexture *native_texture_now(uint32_t info, uint32_t frame)
         t.raw_watched = image < 0x02000000u && memwatch_watch_range(image, raw_bytes) && (!pal || memwatch_watch_range(palette, (u32)pal_bytes));
         t.raw_stamp = t.raw_watched ? raw_stamp() : 0;
         sum = raw_sum();
+        sum_raw = sum;
         t.raw_sum = sum;
         t.raw_bytes = raw_bytes;
         g_tex_summed++;
@@ -442,18 +549,20 @@ static NativeTexture *native_texture_now(uint32_t info, uint32_t frame)
         int lw = t.w >> l, lh = t.h >> l;
         texels += (size_t)(lw ? lw : 1) * (lh ? lh : 1);
     }
-    t.px.resize(texels);
-    u32 *out = t.px.data();
-    const u8 *raw = px;
-    for (int l = 0; l < t.levels; l++) {
-        int tw = t.w >> l, th = t.h >> l, iw = w >> l, ih = h >> l;
-        if (!tw) tw = 1;
-        if (!th) th = 1;
-        if (!iw) iw = 1;
-        if (!ih) ih = 1;
-        decode(out, tw, th, iw, ih, raw, pal, bpp, LB(info + 0x54 + l * 4), (s8)LB(info + 0x55 + l * 4) == 1);
-        out += (size_t)tw * th;
-        raw += (size_t)iw * ih * bpp / 8;
+    {
+        // decoded ahead by a worker (native_textures_ahead), and still what it was then: its pixels
+        auto ahead = g_tex_ahead.find((u64)image << 32 | palette);
+        const bool take = ahead != g_tex_ahead.end() && ahead->second.sum == sum_raw && ahead->second.w == w && ahead->second.h == h &&
+                          ahead->second.tex_w == t.w && ahead->second.tex_h == t.h && ahead->second.levels == t.levels && ahead->second.bpp == bpp &&
+                          ahead->second.px.size() == texels;
+        if (take) {
+            t.px.swap(ahead->second.px);
+            g_tex_ahead_taken++;
+        } else {
+            t.px.resize(texels);
+            decode_levels(t.px.data(), info, t.levels, t.w, t.h, w, h, px, pal, bpp);
+        }
+        if (ahead != g_tex_ahead.end()) g_tex_ahead.erase(ahead);
     }
     // TEMP (HP2_TEXSTAT): a car skin's level 0 as decoded: the mean colour, and its alpha (the gloss map)
     if (getenv("HP2_TEXSTAT") && info == LW(0x32f6d8)) {     // the showroom's reflection map: its brightness by an 8x8 grid, and its alpha

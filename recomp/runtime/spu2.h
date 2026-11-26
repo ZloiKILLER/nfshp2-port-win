@@ -43,6 +43,16 @@ void spu2_clear_effect(int core);
 void spu2_write(u32 addr, const u8 *src, u32 size);
 void spu2_read(u32 addr, u8 *dst, u32 size);
 
+// The police radio on a gamepad's speaker (the user, 2026-11-25: "the policemen's talk through the gamepad's speaker").
+// The game plays its speech as stream 2 of its sound driver, one voice of the 48 (hle_iop.cpp watches the driver's commands and
+// says which: spu2_radio_voice; spu2_radio_stop when the stream is stopped, and the voice is the radio's until it has
+// rung out). While a speaker takes it (spu2_radio_sink: on, and its loudness in percent) that voice is left out of the mix and
+// its samples wait, mono, for spu2_radio_read; with no speaker it is mixed as ever.
+void spu2_radio_voice(int channel);     // 0..47: core = channel / 24, voice = channel % 24
+void spu2_radio_stop();
+void spu2_radio_sink(bool on, int percent);
+void spu2_radio_read(s16 *mono, int frames);    // the speaker's thread: the next samples, silence when there are none
+
 // audio thread: next `frames` stereo samples
 void spu2_render(s16 *out, int frames);
 // starts the host output pulling spu2_render (HP2_NOAUDIO: none, HP2_WAVOUT=<file>: record)
