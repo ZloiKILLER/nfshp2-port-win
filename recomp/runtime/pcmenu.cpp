@@ -257,6 +257,15 @@ static std::string screen_name()
 }
 
 bool pc_on_title() { return g_pc_ctx && screen_name() == "Title Screen"; }
+// A race's objective: before the start (PreRaceBlurb, PreRace2PBeACop) or a page of the pause menu (PauseRaceObjective). Its
+// lines say what to press in the race (a cop's target, helicopter, road block and boost), so the keyboard's icons there are the
+// driving keys (pc_paint_buttons).
+bool pc_objective_screen()
+{
+    if (!g_pc_ctx) return false;
+    const std::string s = screen_name();
+    return s == "Pre Race Blurb" || s == "Pre Race 2P Be A Cop" || s == "Race Objective" || s == "Race Objective 2PBAC";
+}
 std::string pc_screen() { return screen_name(); }
 
 // The pointer: in the front end, the pause menu, a replay and the screens after the finish; in a race and while one loads, none. And none
@@ -2550,6 +2559,45 @@ void HOOK_JoyHandler__17FlailerScreenList12JoystickPort8JoyEventUcPv(Ctx &c, voi
     orig(c);
 }
 
+// The highlight's flare (tHighlightAnimation, 0x248870: on a row's highlight a copy of the row's text swells and fades over it) is
+// a text object of each screen, 0xab671c9a. Animate (0x248970) copies the row into it with CopyFlailerText (0x1410a0), which takes
+// the object's 64 bytes from +40: the font, the format, the colour, the LanguageID and only the first four bytes of the string.
+// The game's rows have a LanguageID, and the copy shows the row's word. A text the port writes has none (SetString clears it), so
+// the copy was its first four letters and then what the flare object had before: a word of another length, swelling round the
+// wrong middle (the user, 2026-11-26: "the highlight's animation does not match the row's name, on every screen"). The string is
+// now copied whole (HOOK_CopyFlailerText), and here the flare object of every screen gets room for it: Options' had 5 letters.
+// A copy with 40, appended to the screen; the old one loses its name, so the game finds the new one (FindFlailerObject by name).
+static const u32 kHighlightText = 0xab671c9a;
+static void roomy_highlight_texts(u32 project)
+{
+    u32 sl = project + 12;
+    for (u32 s = LW(sl); s && s != sl; s = LW(s)) {
+        const u32 o = find_object(s, kHighlightText, 1);
+        if (!o || LW(o + 84) >= 40) continue;
+        clone_object(s, o, 40);
+        SW(o + 8, 0);
+    }
+}
+
+// CopyFlailerText (0x1410a0: to, from), the flare's copy above. A text with no LanguageID shows its own string: that is copied
+// whole, as far as `to` has room (its MaxChars before the copy, which the copy overwrites with `from`'s), and `to` keeps its own
+// MaxChars. A text with a LanguageID is the game's copy as it was.
+void HOOK_CopyFlailerText(Ctx &c, void (*orig)(Ctx &))
+{
+    const u32 to = c.r[4].w[0], from = c.r[5].w[0];
+    const u32 room = to ? LW(to + 84) : 0;
+    orig(c);
+    if (!to || !from || LW(from + 96) != 0 || room < 2) return;
+    const u32 from_room = LW(from + 84);
+    u32 n = 0;
+    while (n + 1 < room && n < from_room && LB(from + 100 + n)) {
+        SB(to + 100 + n, LB(from + 100 + n));
+        n++;
+    }
+    SB(to + 100 + n, 0);
+    SW(to + 84, room);
+}
+
 static void port_edits(u32 tail)
 {
     if (LW(tail + 8) != FRONTB_PROJECT) return;
@@ -2579,6 +2627,7 @@ static void port_edits(u32 tail)
     if (!g_profiles_page.empty()) add_name_grid(tail, g_profiles_page);
     g_project_gen++;
     add_options_arrows(tail);
+    roomy_highlight_texts(tail);
     g_page_alloc = false;
 }
 

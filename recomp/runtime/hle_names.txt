@@ -218,6 +218,10 @@ hook CopsOnModeSelectEvent 0x2170b0
 hook CopsOffModeSelectEvent 0x217768
 # Options > Extras > Speed Boost for All Cars (pcsettings.cpp): RealDriver::JoyHandler_NitroBoost
 hook NitroBoostHandler 0x13c228
+# the highlight's flare copies a row's text: the port's texts (no LanguageID) whole (pcmenu.cpp)
+hook CopyFlailerText 0x1410a0
+# the help character of an event's button: with the keyboard in use, layout A's (pcplatform.cpp; the objective's "%c")
+hook GetJoystickButtonChar 0x155270
 # a new profile's gamepads on layout I (pcsettings.cpp): Fred's defaults
 hook InitWithDefaults__16FrontendDatabase 0x183830
 # Options > Extras > Cinematic Replays (pcsettings.cpp): the replay's letterbox screen is never shown

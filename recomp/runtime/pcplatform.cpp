@@ -183,6 +183,24 @@ void pc_keyboard_layout(int port, bool keys)
     }
 }
 
+// GetJoystickButtonChar (0x155270: the port, an event): the help character of the button the port's layout gives the event. The
+// objective's lines fill a button in with it: a cop's "%c target/untarget speeders" is event 126, the horn / siren (PreRaceBlurb's
+// HandleEvent 0x1e34a8, PauseRaceObjective's 0x171a28). The keyboard's keys are layout A's buttons (pc_keyboard_layout), so with the
+// keyboard in use the character is asked of layout A, whatever the gamepad's layout is: a gamepad on layout I has the horn on R1,
+// and the keyboard's icon was R1's key where the target is the horn's (the user, 2026-11-26). The word is put back at once.
+void HOOK_GetJoystickButtonChar(Ctx &c, void (*orig)(Ctx &))
+{
+    const u32 at = 0x2f9530 + (c.r[4].w[0] & 1) * 0xcc + 0xc8;
+    const u32 was = LW(at);
+    if (window_input_kind() == 1 || was == kKeyboardLayout) {
+        orig(c);
+        return;
+    }
+    SW(at, kKeyboardLayout);
+    orig(c);
+    SW(at, was);
+}
+
 // ---- a DualSense's adaptive triggers ---------------------------------------------------------------------------------
 // The user, 2026-11-25: "let us first try to make the triggers adaptive for the DualSense". The pedal's trigger resists the
 // finger: the brake's harder than the throttle's. Which trigger is which pedal is the layout's to say, whichever layout the
@@ -1080,6 +1098,11 @@ void draw_pad(Cell &c, const Sheet &ft, u32 font, const std::string &name)
     c.text(ft, font, label, 13, 14, 19, 0.75f, WHITE);
 }
 
+// A race's objective on the screen (pc_objective_screen), painted for the keyboard: its L2 and R2 are a cop's calls for the
+// helicopter and the road block, which the keyboard has on the zone cameras' two keys (pcactions.cpp: events 129 and 128), not on
+// the gears' keys that L2 and R2 are while driving. The game's own lines put L2 and R2 there for nothing else.
+bool g_objective_keys;
+
 // A PS2 button as the device in use has it. In a race the strings name what a button does while
 // driving, but what they ask to press to go on (Cross) and pause (Start) are the fixed ones.
 void draw_button(Cell &c, const Sheet &ft, u32 font, int b, bool pad, bool driving)
@@ -1087,6 +1110,11 @@ void draw_button(Cell &c, const Sheet &ft, u32 font, int b, bool pad, bool drivi
     bool fixed = !driving || b == PCB_CROSS || b == PCB_START;
     if (pad) {
         draw_pad(c, ft, font, pc_pad_name(fixed ? pc_menu_pad(b) : g_cfg.pad[b]));
+        return;
+    }
+    if (g_objective_keys && (b == PCB_L2 || b == PCB_R2)) {
+        const int *zone = g_cfg.key_zone[b == PCB_L2 ? 0 : 1];
+        draw_key(c, ft, font, zone[0] ? zone[0] : zone[1]);
         return;
     }
     int vk = b == PCB_START && driving ? PC_BACK_KEY : fixed ? pc_menu_key(b) : g_cfg.key[b][0] ? g_cfg.key[b][0] : g_cfg.key[b][1];
@@ -1193,10 +1221,15 @@ void pc_paint_buttons()
     // three of the sticks' that no layout of a gamepad shows ('p', 'v', 'u': the help characters 0x90, 0x91, 0x93). They were
     // Select's and L3's until 2026-11-25; a layout of the player's own can give those two buttons a thing, and shows them.
     const bool hand = window_input_kind() == 1;
-    bool pad = hand || layouts, driving = (pc_racing() && !pc_race_menu()) || layouts;
+    // a race's objective, with the keyboard in use: its lines are about driving, so the keys are the driving ones (the boost's
+    // Shift was a "-" there, the menus having no key for R3; the user, 2026-11-26)
+    const bool objective = !hand && !layouts && pc_objective_screen();
+    g_objective_keys = objective;
+    bool pad = hand || layouts, driving = (pc_racing() && !pc_race_menu()) || layouts || objective;
     bool ps = layouts ? g_layout_playstation != 0 : pad && g_pad_playstation;
-    int state = (pad ? 1 : 0) | (driving ? 2 : 0) | (ps ? 4 : 0) | (layouts ? 8 : 0) | (hand ? 16 : 0) | (g_pad_nintendo ? 32 : 0);
-    if (state == last_state && !memcmp(last.key, g_cfg.key, sizeof last.key) && !memcmp(last.pad, g_cfg.pad, sizeof last.pad))
+    int state = (pad ? 1 : 0) | (driving ? 2 : 0) | (ps ? 4 : 0) | (layouts ? 8 : 0) | (hand ? 16 : 0) | (g_pad_nintendo ? 32 : 0) | (objective ? 64 : 0);
+    if (state == last_state && !memcmp(last.key, g_cfg.key, sizeof last.key) && !memcmp(last.pad, g_cfg.pad, sizeof last.pad) &&
+        !memcmp(last.key_zone, g_cfg.key_zone, sizeof last.key_zone))
         return;
     u32 buttons = pc_call(FindFont, pc_hash("BUTTONSOUT")), letters = pc_call(FindFont, pc_hash("FONT_A"));
     Sheet out, ft;
@@ -1206,6 +1239,7 @@ void pc_paint_buttons()
     last_state = state;
     memcpy(last.key, g_cfg.key, sizeof last.key);
     memcpy(last.pad, g_cfg.pad, sizeof last.pad);
+    memcpy(last.key_zone, g_cfg.key_zone, sizeof last.key_zone);
 
     // what the disc has, before the first paint: a PlayStation pad gets its own icons from it
     static std::vector<u8> disc_px;

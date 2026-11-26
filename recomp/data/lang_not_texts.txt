@@ -95,3 +95,7 @@ the screen's own help line
 the Options screen's help line
 the Help word
 PC_EDIT_WORD
+Pre Race Blurb
+Pre Race 2P Be A Cop
+Race Objective
+Race Objective 2PBAC

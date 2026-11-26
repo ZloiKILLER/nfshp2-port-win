@@ -38,6 +38,7 @@ int pc_layout_hint_cells();     // the layouts' screen's hints: 1 in cells of th
 bool pc_car_input_port(int port);        // the same for player 1 (0) or player 2 (1) of a race of two
 bool pc_car_input();            // the player has the car or a race's own controls (not a menu, the pause menu included)
 bool pc_race_menu();
+bool pc_objective_screen();     // a race's objective is on the screen, before the start or in the pause menu
 u32 pc_input_mode();            // Player::SetInputMode's last: 2 is a car being driven
 bool pc_pause_menu();           // the pause menu is up, whatever the player's mode is
 u32 pc_player_car();           // the first player's Car in a race (Player +4), 0 outside one
