@@ -33,4 +33,11 @@ Needs: Windows 10 or 11, 64-bit, a graphics card with Vulkan.
 
 How to build it, how the repository is laid out and whose work it uses: [TECHNICAL.md](TECHNICAL.md).
 
+## License
+
+The port is licensed under the [PolyForm Strict License 1.0.0](LICENSE.md): download it, build it and play it for your own,
+noncommercial use. Changing it, publishing it, hosting it or building on it needs the author's permission, and any commercial use
+(including ads and donations) a separate agreement: ask in [Discussions](https://github.com/ZloiKILLER/nfshp2-port-win/discussions).
+The details, and what the license does not cover, are at the top of [LICENSE.md](LICENSE.md).
+
 Need for Speed and Hot Pursuit are trademarks of Electronic Arts. This project is not affiliated with Electronic Arts.

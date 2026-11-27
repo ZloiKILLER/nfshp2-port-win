@@ -39,7 +39,7 @@ LIST = [
     ("work/ref/sdl3/SDL3-3.4.18.tar.gz", "third_party/SDL3-3.4.18.tar.gz"),
 ]
 SKIP = {"recomp/runtime/elf_image.cpp"}         # no longer built: the program comes from the disc
-OWN = {"README.md", "TECHNICAL.md", ".gitignore", ".gitattributes", ".git"}
+OWN = {"README.md", "TECHNICAL.md", "LICENSE.md", ".github", ".gitignore", ".gitattributes", ".git"}
 # what a build from the repository makes there (its .gitignore): not the repository's files, never touched
 BUILT = {"build", "work", "recompwin"}
 
