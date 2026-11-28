@@ -38,7 +38,7 @@ SETTINGS
                        Select GPU (the graphics card that draws the game; changing it restarts the game)
                        Advanced: antialiasing (off, MSAA or SMAA, 2x or 4x), particles (smoke, sparks, dust: Original,
                        or Advanced: the same with soft edges), anisotropic filtering, ambient occlusion (soft shading
-                       where surfaces meet), dithering, brightness, contrast, gamma.
+                       where surfaces meet), brightness, contrast, gamma.
                        They all apply at once, no restart (Select GPU alone restarts the game).
   Options > HUD        map, mirror, units, standings and other race display elements
   Options > Controls   Keyboard: a key for each thing the car does, both players' in one list (player 2's keys come
@@ -77,6 +77,9 @@ SETTINGS
                        (the Speed Boost key, or a press of the right stick); it lasts four seconds
                        Cinematic Replays: hiding a replay's controls hides its black bars too, so only the picture is left;
                        showing the controls again brings back the usual replay screen
+                       Cockpit View: the view from the driver's seat that the game has for the Ferrari F50, 360 Spider
+                       and 550 Barchetta (and the F50 and 550 Barchetta Hot Pursuit editions) and never showed; it is
+                       the fourth camera, after the two behind the car. For races started after the switch
   Alt+Enter toggles fullscreen.
   In hp2.ini / controls.ini only: [keyboard] actions=0 puts the keys back on the old way (each key presses a button of
                        a PS2 pad); it is there until the new way is proven; mouse_direct=0 puts the menus' pointer

@@ -581,10 +581,23 @@ static void key_script_step()
         if (t >= s.t && t < s.t + s.hold) g_script_key[s.vk & 255] = true;
 }
 
+static bool g_shift_with_win[4];          // VK_SHIFT 0x10, VK_LSHIFT 0xA0, VK_RSHIFT 0xA1 by their low two bits: 0, 0, 1
 static bool key(int vk)
 {
     if (g_key_script_on) return vk && g_script_key[vk & 255];
-    return vk && (GetAsyncKeyState(vk) & 0x8000) != 0;
+    if (!vk || !(GetAsyncKeyState(vk) & 0x8000)) {
+        if (vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT) g_shift_with_win[vk & 3] = false;
+        return false;
+    }
+    // A Shift pressed while a Windows key is down is Windows' shortcut, not a key of the game's: some keyboards' own keys send
+    // such a shortcut (the user's Logitech K380, 2026-11-27: its screenshot key, Win+Shift+S, gave the speed boost, which is Left
+    // Shift). It stays no key until it is let go, though the Windows key goes up first.
+    if (vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT) {
+        bool &latched = g_shift_with_win[vk & 3];
+        if ((GetAsyncKeyState(VK_LWIN) & 0x8000) || (GetAsyncKeyState(VK_RWIN) & 0x8000)) latched = true;
+        if (latched) return false;
+    }
+    return true;
 }
 
 bool window_key_down(int vk)

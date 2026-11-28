@@ -38,4 +38,5 @@ void main()
     float a = weights > 0.0 ? sum / weights * u.rect.y : 0.0;
     if (a <= 0.004) discard;
     o_col = vec4(0.0, 0.0, 0.0, a);
+    if (u.texel > 0.5) o_col = vec4(vec3(0.15, 0.35, 1.0) * a, a);     // HP2_SHADOWDEBUG: blue, as strong as it is
 }

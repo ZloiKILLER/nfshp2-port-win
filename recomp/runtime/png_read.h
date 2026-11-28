@@ -169,19 +169,10 @@ inline bool inflate(const uint8_t *src, size_t size, std::vector<uint8_t> &out)
 
 inline uint32_t be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | p[1] << 16 | p[2] << 8 | p[3]; }
 
-// rgba: w * h * 4 bytes. On failure why is set.
-inline bool load(const std::string &path, std::vector<uint8_t> &rgba, int &w, int &h, const char *&why)
+// a PNG's bytes (a file's, or a resource of the exe's): rgba w * h * 4 bytes. On failure why is set.
+inline bool load_bytes(const std::vector<uint8_t> &file, std::vector<uint8_t> &rgba, int &w, int &h, const char *&why)
 {
     static const uint8_t magic[8] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'};
-    FILE *f = fopen(path.c_str(), "rb");
-    if (!f) {
-        why = "cannot open";
-        return false;
-    }
-    std::vector<uint8_t> file;
-    uint8_t chunk[65536];
-    for (size_t n; (n = fread(chunk, 1, sizeof chunk, f)) > 0;) file.insert(file.end(), chunk, chunk + n);
-    fclose(f);
     if (file.size() < 33 || memcmp(file.data(), magic, 8)) {
         why = "not a PNG";
         return false;
@@ -279,6 +270,21 @@ inline bool load(const std::string &path, std::vector<uint8_t> &rgba, int &w, in
         }
     }
     return true;
+}
+
+// rgba: w * h * 4 bytes. On failure why is set.
+inline bool load(const std::string &path, std::vector<uint8_t> &rgba, int &w, int &h, const char *&why)
+{
+    FILE *f = fopen(path.c_str(), "rb");
+    if (!f) {
+        why = "cannot open";
+        return false;
+    }
+    std::vector<uint8_t> file;
+    uint8_t chunk[65536];
+    for (size_t n; (n = fread(chunk, 1, sizeof chunk, f)) > 0;) file.insert(file.end(), chunk, chunk + n);
+    fclose(f);
+    return load_bytes(file, rgba, w, h, why);
 }
 
 }  // namespace png_read

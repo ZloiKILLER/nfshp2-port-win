@@ -158,8 +158,10 @@ static void decode(u32 *out, int tw, int th, int w, int h, const u8 *px, const u
 }
 
 // ---- replacements: <name>.png or <name>@<crc>.png takes a texture's place (tools/recomp/export_textures.py) -----------------------
-// Since 2026-11-13 the game looks for none by itself (no data\replace: the user, "a tool for the assets comes later"). What is left
-// is for that tool and for the check of the decoder: HP2_REPLACE=<folder> names where the PNGs are.
+// Since 2026-11-13 the install makes no data\replace (the user, "a tool for the assets comes later"). HP2_REPLACE=<folder> names
+// where the PNGs are; with none, data\replace in the game's folder if there is one (2026-11-27: the main menu's NFS logo in 32-bit
+// colour, the user's choice of an upscale of the game's own; it goes in there, not in the release). A replacement may be the
+// texture's size or a whole multiple of it.
 
 struct ReplacementImage {
     std::vector<u32> px;    // the GS's bytes: alpha 0x80 is 1.0
@@ -177,9 +179,9 @@ static const std::unordered_map<std::string, std::string> &replacement_files()
     scanned = true;
     namespace fs = std::filesystem;
     const char *env = getenv("HP2_REPLACE");
-    if (!env || !*env) return files;
-    const fs::path dir = env;
     std::error_code ec;
+    const fs::path dir = env && *env ? fs::path(env) : fs::path(host_exe_dir()) / "data" / "replace";
+    if (!fs::is_directory(dir, ec)) return files;
     for (fs::recursive_directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
         if (!it->is_regular_file(ec) || it->path().extension() != ".png") continue;
         std::string stem = it->path().stem().string();
@@ -225,11 +227,75 @@ static const ReplacementImage *load_replacement(const std::string &path)
     return &r;
 }
 
+// The port's own: the game's NFS logo (NFS_LOGO_ALPHA, the main menu and the title; NFS_LOGO_ALPHA_FR in French) in 32-bit colour,
+// four times its size (2026-11-27, the user: "carry both logos in the exe, every install gets them; we release so from now on").
+// Made from the game's own pictures: their colour by Real-ESRGAN (x4plus-anime, D:\nfs3android\tools_upscale), their alpha the
+// game's, made smooth (bicubic), so the shapes are the game's (work/nshots/logo32). In speed.rc as LOGO_NFS and LOGO_NFS_FR.
+// Only where the disc's picture is the game's own: a disc or a mod with a logo of its own (the Russian rebuild, say) keeps it. The
+// test is by looks, not by bytes: the logo made small again (the mean of each 4 x 4) beside the disc's, over what is drawn, has to
+// be near it (a mean of under 20 a channel, under 2 % of the pixels off by more than 80; the upscale itself is 8-10 and 1 %).
+// A file in data\replace (replacement_files) comes before these.
+static const char *builtin_resource(const std::string &name)
+{
+    // (the title screen's picture, LOADING / LOADING_FR, was here for a day: the user's sharper picture and the upscaler's were both
+    // turned down, 2026-11-27, "the originals for now"; the work files stay in work/nshots/title)
+    return name == "nfs_logo_alpha" ? "LOGO_NFS" : name == "nfs_logo_alpha_fr" ? "LOGO_NFS_FR" : nullptr;
+}
+static const ReplacementImage *builtin_logo(const std::string &name, const NativeTexture &t, int w, int h)
+{
+    const char *res = builtin_resource(name);
+    if (!res) return nullptr;
+    static std::unordered_map<std::string, ReplacementImage> loaded;
+    auto found = loaded.find(name);
+    if (found == loaded.end()) {
+        ReplacementImage &r = loaded[name];
+        const uint8_t *p;
+        size_t n;
+        std::vector<u8> rgba;
+        const char *why = "not in the exe";
+        if (host_resource(res, p, n) && png_read::load_bytes(std::vector<u8>(p, p + n), rgba, r.w, r.h, why)) {
+            r.px.resize((size_t)r.w * r.h);
+            memcpy(r.px.data(), rgba.data(), r.px.size() * 4);
+            for (u32 &q : r.px) q = (q & 0xFFFFFF) | ((q >> 24) + 1) >> 1 << 24;
+        } else {
+            fprintf(stderr, "native: the port's %s: %s\n", res, why);
+        }
+        found = loaded.find(name);
+    }
+    const ReplacementImage &r = found->second;
+    if (r.px.empty() || w <= 0 || h <= 0 || r.w % w || r.h % h || r.w / w != r.h / h || t.w < w || (int)t.px.size() < t.w * h) return nullptr;
+    const int k = r.w / w;
+    double sum = 0;
+    size_t drawn = 0, far = 0;
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) {
+            const u32 g = t.px[(size_t)y * t.w + x];
+            if ((g >> 24) <= 16) continue;
+            int mean[4] = {};
+            for (int j = 0; j < k; j++)
+                for (int i = 0; i < k; i++) {
+                    const u32 q = r.px[(size_t)(y * k + j) * r.w + x * k + i];
+                    for (int c = 0; c < 4; c++) mean[c] += (q >> (c * 8)) & 255;
+                }
+            int off = 0;
+            for (int c = 0; c < 3; c++) off = std::max(off, std::abs(mean[c] / (k * k) - (int)((g >> (c * 8)) & 255)));
+            sum += off;
+            far += off > 80;
+            drawn++;
+        }
+    const bool same = drawn && sum / (double)drawn < 20.0 && far * 50 < drawn;
+    static int told;
+    if (told++ < 4)
+        fprintf(stderr, "native: the port's %s over the disc's %s: off by %.1f on the mean, %.2f %% far off: %s\n", res, name.c_str(),
+                drawn ? sum / (double)drawn : 0.0, drawn ? 100.0 * (double)far / (double)drawn : 0.0, same ? "taken" : "the disc's is another, left as it is");
+    return same ? &r : nullptr;
+}
+
 // after decode: t has the game's own levels
 static void replace_texture(NativeTexture &t, const char *debug_name, const u8 *px, size_t bytes, const u8 *pal, size_t pal_bytes, int w, int h)
 {
     const auto &files = replacement_files();
-    if (files.empty()) return;
+    if (files.empty() && strncmp(debug_name, "NFS_LOGO_ALPHA", 14) != 0) return;
     char raw[25] = {};
     memcpy(raw, debug_name, 24);
     std::string name = raw;
@@ -241,16 +307,18 @@ static void replace_texture(NativeTexture &t, const char *debug_name, const u8 *
     snprintf(exact, sizeof exact, "@%08x", crc);
     auto file = files.find(name + exact);
     if (file == files.end()) file = files.find(name);
-    if (file == files.end()) {
+    const ReplacementImage *r = nullptr;
+    if (file != files.end()) {
+        r = load_replacement(file->second);
+    } else if (!(r = builtin_logo(name, t, w, h))) {
         if (g_tex_check && g_tex_missing++ < 40) fprintf(stderr, "texcheck: %s%s is not among the files\n", name.c_str(), exact);
         return;
     }
-    const ReplacementImage *r = load_replacement(file->second);
     if (!r) return;
     const int k = r->w / w;
     if (k < 1 || r->w != k * w || r->h != k * h) {
         static int said;
-        if (said++ < 20) fprintf(stderr, "native: %s is %dx%d, it has to be a whole multiple of %dx%d\n", file->second.c_str(), r->w, r->h, w, h);
+        if (said++ < 20) fprintf(stderr, "native: %s is %dx%d, it has to be a whole multiple of %dx%d\n", file != files.end() ? file->second.c_str() : name.c_str(), r->w, r->h, w, h);
         return;
     }
     // the very picture of the game, as it comes out of the export: the game's own levels stay
@@ -600,10 +668,7 @@ static NativeTexture *native_texture_now(uint32_t info, uint32_t frame)
     snprintf(t.name, sizeof t.name, "%s", (const char *)host(info + 8));
     if (replay_bar && w == 640 && h >= 62) pc_replay_bar_retouch(t.px.data(), t.w);
     replace_texture(t, (const char *)host(info + 8), px, bytes, pal, pal_bytes, w, h);
-    if (!strncmp((const char *)host(info + 8), "FONT_", 5)) {
-        t.font_alpha.resize((size_t)t.w * t.h);
-        for (size_t i = 0; i < t.font_alpha.size(); i++) t.font_alpha[i] = (u8)(t.px[i] >> 24);
-    }
+    t.glyphs = !strncmp((const char *)host(info + 8), "FONT_", 5) || !strcmp((const char *)host(info + 8), "BUTTONSOUT");
     {   // the pixels go with the frame; the next decoding of this texture starts from an empty px
         NativeTexUpload up;
         up.tex = &t;

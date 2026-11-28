@@ -98,7 +98,7 @@ The PS2's was 30. Above 60 the game still runs at 60, with pictures drawn in bet
 Draw Distance	Distanza visiva
 How far away scenery still shows. Original: as on the PS2. Advanced: twice as far. High: four times. Maximum: six times.	Fin dove resta visibile lo scenario. Originale: come su PS2. Avanzate: il doppio. Alto: quattro volte. Massimo: sei volte.
 Level of Detail	Livello di dettaglio
-Maximum: scenery and cars always at their most detailed models. Original: as on the PS2.	Massimo: scenario e auto sempre con i modelli più dettagliati. Originale: come su PS2.
+Maximum: scenery and cars always at their most detailed models, textures sharpen smoothly as you come closer. Original: as on the PS2.	Massimo: scenario e auto sempre con i modelli più dettagliati, texture più nitide gradualmente avvicinandosi. Originale: come su PS2.
 Reflections	Riflessi
 Shadows	Ombre
 The cars' shadows. High: the body's own outline, lying on whatever is under it. Very High: finer, and the tunnels' lamps cast them too.	Le ombre delle auto. Alto: il contorno stesso della carrozzeria, posato su ciò che sta sotto. Molto alto: più fine, e le proiettano anche le lampade delle gallerie.
@@ -168,6 +168,8 @@ Disable Catchup	Senza accelerazione
 No catch-up boost for the opponents in Quick Race and the career.	Nessuna accelerazione per gli avversari nella Gara veloce e nella carriera.
 Cinematic Replays	Replay cinematografici
 Hiding the replay's controls hides the black bars too.	Nascondere i comandi del replay nasconde anche le bande nere.
+Cockpit View	Visuale abitacolo
+The view from the driver's seat, left unused in the game: Ferrari F50, 360 Spider and 550 Barchetta, and the F50 and 550 Barchetta Hot Pursuit editions. The fourth camera; for races started after the switch.	La visuale dal posto di guida, inutilizzata nel gioco: Ferrari F50, 360 Spider e 550 Barchetta, più F50 e 550 Barchetta Hot Pursuit. La quarta telecamera; per le gare avviate dopo il cambio.
 The slow motion key works. On a gamepad: both sticks pressed together.	Il tasto del rallentatore funziona. Sul gamepad: i due stick premuti insieme.
 Put player 2's keys back as they were.	Riporta i tasti del giocatore 2 come in origine.
 Gamepad	Controller

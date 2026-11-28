@@ -18,7 +18,26 @@ layout(push_constant) uniform Push {
     float mode;
     float texel;        // mode 1: a texel of the map in the cell's own 0..1
     float low, high;    // mode 0; mode 1: the soft edge's reach, in the cell's own 0..1: low at its widest, high at its narrowest
+    vec4 dbg;           // HP2_SHADOWDEBUG: the height above the car's lowest point = dot(dbg, (the shadow's own x, y, third, 1))
 } u;
+// The mode's bits: the kind in the low four, and with HP2_SHADOWDEBUG the car's number plus 1 above them (native_vk.cpp,
+// draw_shadows; native.cpp, "the shadows' colours"): then the shadow is laid on in the car's colour, its kind's pattern in it
+int g_kind = 0, g_car = -1;
+const vec3 kCarColours[8] = vec3[8](vec3(1.0, 0.1, 0.1), vec3(0.1, 0.9, 0.1), vec3(1.0, 0.9, 0.0), vec3(1.0, 0.0, 1.0),
+                                    vec3(1.0, 0.5, 0.0), vec3(0.0, 0.9, 0.9), vec3(0.6, 0.3, 1.0), vec3(0.6, 0.35, 0.1));
+// patterns: 0 solid, 1 diagonal stripes, 2 a chequer with white, 3 level stripes, 4 white
+vec4 debug_colour(float a, int pattern)
+{
+    if (!(a > 0.003)) discard;
+    a = max(a, 0.35);
+    vec3 col = g_car >= 0 && g_car < 254 ? kCarColours[g_car % 8] : vec3(0.5);
+    ivec2 c = ivec2(gl_FragCoord.xy);
+    if (pattern == 1 && ((c.x + c.y) / 6) % 2 == 0) col *= 0.25;
+    else if (pattern == 2 && ((c.x / 5 + c.y / 5) & 1) == 0) col = vec3(1.0);
+    else if (pattern == 3 && ((c.y / 4) & 1) == 0) col *= 0.25;
+    else if (pattern == 4) col = vec3(1.0);
+    return vec4(col * a, a);
+}
 // MSAA: the picture is in samples, and the shadow goes over the samples themselves, each by its own depth (the shader runs once a
 // sample: gl_SampleID). Over the resolved picture, as it was, a pixel on a car's edge was the car and the road mixed, with one depth
 // for both: a rim of the wrong shade round every car that stood over a shadow.
@@ -185,6 +204,7 @@ void lamps(vec2 at, float d)
     float a = u.colour.a * head.z * lost / (head.y + all);
     if (!(a > 0.0)) discard;
     o_col = vec4(0.0, 0.0, 0.0, a);
+    if (g_car >= 0) o_col = debug_colour(a, dot(u.dbg.xyz, P) + u.dbg.w < -1.0 ? 2 : 3);
 }
 
 void main()
@@ -199,7 +219,10 @@ void main()
     vec4 h = u.to * vec4(at, d, 1.0);
     if (h.w == 0.0) discard;
     vec3 p = h.xyz / h.w;
-    if (u.mode < 0.5) {
+    int m = int(u.mode + 0.5);
+    g_kind = m & 15;
+    g_car = (m >> 4) - 1;
+    if (g_kind == 0) {
         if (!(p.x >= 0.0 && p.x <= 1.0 && p.y >= 0.0 && p.y <= 1.0 && p.z >= u.low && p.z <= u.high)) discard;
         // the texel between its four neighbours, whatever the texture's own sampler is
         ivec2 size = textureSize(tex, 0);
@@ -215,7 +238,8 @@ void main()
         if (u.rect.x > 0.0) a *= smoothstep(0.45, 0.75, flatness(ivec2(gl_FragCoord.xy)));
         if (a <= 0.0) discard;
         o_col = vec4(min(t.rgb * u.colour.rgb, 1.0) * a, a);
-    } else if (u.mode > 2.5) {
+        if (g_car >= 0) o_col = debug_colour(a, 4);
+    } else if (g_kind == 3) {
         lamps(at, d);
     } else {
         if (!(p.x > 0.0 && p.x < 1.0 && p.y > 0.0 && p.y < 1.0 && p.z > 0.0 && p.z < 1.75)) discard;
@@ -328,5 +352,7 @@ void main()
         float a = u.colour.a * (shade + 0.6 * tinted) / 32.0 * (1.0 - smoothstep(1.0, 1.75, p.z));
         if (a <= 0.0) discard;
         o_col = vec4(0.0, 0.0, 0.0, a);
+        // the colours' debug: more than a metre below the car's lowest point a chequer, past 4 m beyond its middle stripes
+        if (g_car >= 0) o_col = debug_colour(a, u.dbg != vec4(0.0) && dot(u.dbg.xyz, p) + u.dbg.w < -1.0 ? 2 : p.z > 1.0 ? 1 : 0);
     }
 }

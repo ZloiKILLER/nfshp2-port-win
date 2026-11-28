@@ -180,12 +180,17 @@ int pc_menu_pad(int b)
     return kPad[b];
 }
 
-// The keyboard in two, on the screens where both players choose at once
+// The keyboard in two, on the screens where both players choose at once. Enter (player 1) and Space (player 2) are Cross alone
+// there, not Cross and Start: the menus' handler (FlailerScreenList::JoyHandler) turns Start into message 13 to the screen and
+// then, in the same call, message 1 (select) to whatever screen is up by then. On the two players' car select the last player's
+// Start ended the screen (13) and the select went on to the track select, which opened its lap box at once (the user, 2026-11-27:
+// "player 2's Space goes straight to the lap choice"; work/input_rework/docs/menus/A_flailer_engine.md §5). Cross alone is
+// message 1 once. These screens ask for nothing that only Start does.
 int pc_menu_key_split(int player, int b)
 {
     static const int kKey[2][PCB_COUNT] = {
-        {0x26, 0x28, 0x25, 0x27, 0x0D, 0xA3, 0x70, PC_BACK_KEY, 0xBC, 0xBE, 0, 0, 0, 0x0D, 0x08},   // comma, period, Backspace
-        {'W', 'S', 'A', 'D', 0x20, 'F', 0x71, 'C', 'Q', 'E', '1', '2', 0, 0x20, 'R'}};              // F2
+        {0x26, 0x28, 0x25, 0x27, 0x0D, 0xA3, 0x70, PC_BACK_KEY, 0xBC, 0xBE, 0, 0, 0, 0, 0x08},      // comma, period, Backspace
+        {'W', 'S', 'A', 'D', 0x20, 'F', 0x71, 'C', 'Q', 'E', '1', '2', 0, 0, 'R'}};                  // F2
     return kKey[player][b];
 }
 
@@ -401,7 +406,6 @@ void pc_config_save()
     fprintf(f, "aa_mode=%d          ; anti-aliasing: 0 = off, 1 = MSAA, 2 = SMAA\n", g_cfg.aa_mode);
     fprintf(f, "aa_level=%d         ; 2 or 4: MSAA samples, SMAA quality\n", g_cfg.aa_level);
     fprintf(f, "aniso=%d            ; anisotropic filtering: 0 = off, 2, 4, 8, 16\n", g_cfg.aniso);
-    fprintf(f, "dithering=%d        ; dithering against colour banding: 0 = off, 1 = on\n", g_cfg.deband);
     fprintf(f, "ambient_occlusion=%d ; soft shading where surfaces meet, in a race: 0 = off, 1 = on\n", g_cfg.ao);
     fprintf(f, "ambient_occlusion_strength=%d ; how dark it is, percent (10 to 300)\n", g_cfg.ao_strength);
     fprintf(f, "side_mirrors=%d     ; 1 = with Reflections at Advanced or High the mirrors of your own car show the rear-view mirror's picture (one player, with the HUD's mirror on); 0 = never\n", g_cfg.side_mirrors);
@@ -433,6 +437,7 @@ void pc_config_save()
     fprintf(f, "traffic_cars=%d     ; 1 = the mod \"Playable traffic cars\" by 379Felipe (Options > Extras > Playable Traffic Cars; the game restarts when it is switched there)\n", g_cfg.traffic_cars);
     fprintf(f, "no_catchup=%d       ; 1 = no catch-up for the opponents in Quick Race and the career (Options > Extras > Disable Catchup)\n", g_cfg.no_catchup);
     fprintf(f, "cinematic_replays=%d ; 1 = a replay with its controls hidden has no black bars either (Options > Extras > Cinematic Replays)\n", g_cfg.cinematic_replays);
+    fprintf(f, "cockpit_view=%d     ; 1 = the view from the driver's seat in the cars that have it: F50, 360 Spider, 550 Barchetta (Options > Extras > Cockpit View)\n", g_cfg.cockpit_view);
     fprintf(f, "slow_motion=%d      ; 1 = the Zone Slow Motion key works, and both sticks of a gamepad pressed together (Options > Extras > Slow Motion)\n", g_cfg.slow_motion);
     fprintf(f, "wheel=%d            ; 1 = a steering wheel Windows has is the game's wheel (its own layout, calibration and force feedback), 0 = wheels are left alone\n", g_cfg.wheel);
     fprintf(f, "wheel1=%s            ; player 1's wheel: nothing = automatic (the first one connected), none, or a wheel's name\n", g_cfg.wheel_device[0]);
@@ -506,7 +511,7 @@ static bool read_settings(const std::string &path, bool &old_controls)
         }
         else if (!strcmp(key, "aa_mode")) g_cfg.aa_mode = clampi(n, 0, 2);
         else if (!strcmp(key, "aa_level")) g_cfg.aa_level = n >= 4 ? 4 : 2;
-        else if (!strcmp(key, "dithering")) g_cfg.deband = n != 0;
+        // dithering=: gone 2026-11-27 (the user: no visible effect); an older hp2.ini's line is passed over
         else if (!strcmp(key, "ambient_occlusion")) g_cfg.ao = n != 0;     // (2 was High for a day)
         else if (!strcmp(key, "ambient_occlusion_strength")) g_cfg.ao_strength = clampi(n, 10, 300);
         else if (!strcmp(key, "hud_smooth")) g_cfg.hud_smooth = n != 0;
@@ -556,6 +561,7 @@ static bool read_settings(const std::string &path, bool &old_controls)
         else if (!strcmp(key, "wheel_pedals_inverted")) g_cfg.wheel_pedals_inverted = n != 0;
         else if (!strcmp(key, "no_catchup")) g_cfg.no_catchup = n != 0;
         else if (!strcmp(key, "cinematic_replays")) g_cfg.cinematic_replays = n != 0;
+        else if (!strcmp(key, "cockpit_view")) g_cfg.cockpit_view = n != 0;
         else if (!strcmp(key, "traffic_cars")) g_cfg.traffic_cars = n != 0;
         else if (!strcmp(key, "cheats")) {
             memset(g_cfg.cheats, 0, sizeof g_cfg.cheats);

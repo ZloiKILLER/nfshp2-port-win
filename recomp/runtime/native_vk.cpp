@@ -69,9 +69,6 @@ static const uint32_t kGradeFrag[] =
 static const uint32_t kOpaqueFrag[] =
 #include "native_opaque.frag.spv.h"
     ;
-static const uint32_t kExtraFrag[] =
-#include "native_extra.frag.spv.h"
-    ;
 static const uint32_t kShadowFrag[] =
 #include "native_shadow.frag.spv.h"
     ;
@@ -271,19 +268,10 @@ struct ShadowPush {
     float colour[4];
     float view[4];
     float mode, texel, low, high;
+    float dbg[4];               // HP2_SHADOWDEBUG: the height above the car's lowest point from the shadow's own space (NativeShadow::dbg_row)
 };
-
-// native_extra.frag's
-struct ExtraPush {
-    float rect[4];
-    float size[2];
-    float frame;
-    float lines;
-    float grain;            // the picture's pixels to a pixel of the window, 1 at the least
-    float wide;             // 1: the picture has 16 bits a channel (g_color_wide), the noise alone is laid on
-    float brightness, contrast, gamma, graded;      // graded 1: the settings' three in this pass (with wide only)
-    float opaque;           // 1: the picture's alpha to 1 here
-};
+// HP2_SHADOWDEBUG=1: the shadows coloured, a colour a car and a pattern a kind (native.cpp, "the shadows' colours")
+static const bool g_shadow_debug = getenv("HP2_SHADOWDEBUG") && atoi(getenv("HP2_SHADOWDEBUG")) != 0;
 
 static struct {
     bool ready, failed;
@@ -323,11 +311,6 @@ static struct {
     VkPipelineLayout smaa_layout[3];
     VkDescriptorSet smaa_scene_set, smaa_edges_set, smaa_weights_set, smaa_area_set, smaa_search_set;
     VkBuffer smaa_stage;
-    // The port's dithering (native_extra.frag)
-    VkPipeline extra_pipeline;
-    VkPipelineLayout extra_layout;
-    VkDescriptorSetLayout extra_set_layout;
-    VkDescriptorSet extra_set;
     // The draws merged: runs of draws alike but for the matrix and the light go out as one vkCmdDrawIndirect each. draws_buf has
     // each such draw's matrix and light (the vertex shader's D[]), cmds_buf the commands, a range of vertices each
     bool can_merge;
@@ -342,6 +325,11 @@ static struct {
     VkPipeline opaque_pipeline;             // the picture's alpha to 1, before the window
     VkPipelineLayout opaque_layout;
     int aniso;                              // the setting's anisotropy if the GPU has it, 0: the GS's own sampling
+    // The world's textures by the GPU's choice of level, linear between levels: with the anisotropic filter, and with Level of Detail at
+    // Maximum whatever the filter (2026-11-27, issue 37 of the release repo). The GS's own choice goes by the distance alone, by
+    // log2(1/Q) 2^L + K, and most of the world's textures take the nearest level: the leaves of a tree changed all at once as the car
+    // came near ("LOD pop-in", seen with the filter off). The anisotropy itself stays the filter's (aniso).
+    bool smooth;
     VkRenderPass pass;
     VkFramebuffer fb;
     // by the shaders (0 the clip distance's, 1 the discard's), without and with the alpha test, the blend, without and with depth writes,
@@ -1427,7 +1415,7 @@ static bool upload_texture(NativeTexUpload &tex, VkDeviceSize &at)
     VkTex *const was = (VkTex *)tex.tex->vk;
     const bool often = was && g.frame - was->born < 120;
     tex.gpu_levels = tex.levels;
-    if (g.aniso && !often) more_levels(tex);
+    if (g.smooth && !often) more_levels(tex);
     VkDeviceSize bytes = (VkDeviceSize)tex.px.size() * 4;
     if (bytes > g.staging_cap) {            // larger than all of the staging: that grows before the next frame's uploads (draw_frame)
         if (bytes > kStagingMost || (g.staging_refused && bytes >= g.staging_refused)) return true;     // never fits: it stays as it is
@@ -1477,8 +1465,8 @@ static bool upload_texture(NativeTexUpload &tex, VkDeviceSize &at)
     // The sampler is the GPU's filter's (a draw with tex_mode's bit 32); the GS's own sampling fetches texels and does not ask it. With the
     // setting's anisotropic filter every texture is taken linear between texels and levels when small: "nearest, mip linear", which most of
     // the world's textures have, is the GS's way of saving time, and it is what kept the filter off them.
-    bind_view(t->set, t->view, g.sampler[(tex.repeat_s ? 1 : 0) | (tex.repeat_t ? 2 : 0) | (tex.mag_linear ? 4 : 0) | (tex.min_linear || g.aniso ? 8 : 0) |
-                                         (tex.mip_linear || g.aniso ? 16 : 0)]);
+    bind_view(t->set, t->view, g.sampler[(tex.repeat_s ? 1 : 0) | (tex.repeat_t ? 2 : 0) | (tex.mag_linear ? 4 : 0) | (tex.min_linear || g.smooth ? 8 : 0) |
+                                         (tex.mip_linear || g.smooth ? 16 : 0)]);
     t->born = g.frame;
 
     memcpy((char *)g.staging_map + at, tex.px.data(), (size_t)bytes);
@@ -1721,50 +1709,15 @@ static bool setup()
 }
 
 // the picture's size, the multisampling, the filter: what the settings say
-// The picture's format. B8G8R8A8, the GS's own 8 bits a channel, as it always was; with Dithering on (2026-11-18, the user: "it does
-// not seem to work") R16G16B16A16_UNORM, 16 bits a channel. Dithering was a pass over the finished 8-bit picture that smoothed what
-// lay within a few steps of its neighbours: with every step of the way kept to 8 bits (each blend, the fog, the shadows, the
-// brightness and gamma) there was nothing between two steps left to show, and a band wider than the pass's reach stayed a band. Now
-// the picture keeps what the shading and the blends really give, the steps of 1 / 255 are made once, where the picture goes to the
-// window, and the noise laid on just before that (native_extra.frag) turns them into grain instead of bands. UNORM and not a float
-// format: the GS's colours stop at 255 at every blend, and so must these. Everything the game draws into has the format (the user,
-// 2026-11-18: "the whole render"): the picture, its multisampled twin, its copy for the effects and the last frame's copy; the
-// mirror; the six views of the reflections, the sphere map folded from them and its copy. One format for all of them is also what
-// lets one set of pipelines draw into the picture and into the views (without multisampling they share it: the passes must agree).
-// The textures are the game's own 8 bits, and what is banded in them stays so. Not where a test reads a picture back as 4 bytes a
-// pixel (HP2_NATIVESHOT, HP2_PIXAB, HP2_ENVLOG), not with HP2_NATIVEEXACT; HP2_COLOR8=1: never.
-static VkFormat g_color_format = VK_FORMAT_B8G8R8A8_UNORM;
-static bool g_color_wide;
-static void choose_color_format()
-{
-    static const bool never = getenv("HP2_NATIVEEXACT") || getenv("HP2_NATIVESHOT") || getenv("HP2_PIXAB") || getenv("HP2_ENVLOG") || getenv("HP2_COLOR8");
-    g_color_format = VK_FORMAT_B8G8R8A8_UNORM;
-    g_color_wide = false;
-    if (!g_cfg.deband || never) return;
-    const VkFormat wide = VK_FORMAT_R16G16B16A16_UNORM;
-    const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT | VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
-                                      VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT | VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT;
-    VkFormatProperties fp = {};
-    vkGetPhysicalDeviceFormatProperties(g.phys, wide, &fp);
-    bool ok = (fp.optimalTilingFeatures & need) == need;
-    if (ok && g.samples != VK_SAMPLE_COUNT_1_BIT) {
-        VkImageFormatProperties ip = {};
-        ok = vkGetPhysicalDeviceImageFormatProperties(g.phys, wide, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, 0, &ip) == VK_SUCCESS &&
-             (ip.sampleCounts & (VkSampleCountFlags)g.samples) != 0;
-    }
-    static int told = -1;
-    if (told != (int)ok) {
-        told = ok;
-        fprintf(g_hle_log, "native: dithering: the picture has %s\n", ok ? "16 bits a channel (the mirror and the reflections too), dithered as it goes to the window"
-                                                                        : "8 bits a channel (the card has no 16-bit picture for this): the old smoothing pass");
-    }
-    if (ok) g_color_format = wide, g_color_wide = true;
-}
+// The picture's format: B8G8R8A8, the GS's own 8 bits a channel, for everything the game draws into. Dithering (a 16-bit
+// picture with noise laid on as it went to the window, 2026-11-18) was taken out 2026-11-27, the user: no visible effect;
+// the kit to bring it back is in work/parked/dither.
+static const VkFormat g_color_format = VK_FORMAT_B8G8R8A8_UNORM;
 
 static uint64_t settings_key()
 {
     const uint32_t rest = (uint32_t)(g_cfg.msaa() << 8 | g_cfg.aniso << 16 | (g_cfg.aa_mode == 2) << 24 | (g_cfg.reflections == 2) << 25 |
-                                     (g_cfg.shadows >= 2 ? g_cfg.shadows - 1 : 0) << 26 | (g_cfg.deband != 0) << 28);
+                                     (g_cfg.shadows >= 2 ? g_cfg.shadows - 1 : 0) << 26 | (g_cfg.max_detail != 0) << 29);
     return (uint64_t)(uint32_t)native_aspect() << 32 | rest;
 }
 
@@ -1827,6 +1780,7 @@ static bool setup_resources()
     const uint32_t family = g.family;
     static const bool exact = getenv("HP2_NATIVEEXACT") != nullptr;
     g.aniso = !exact && g.can_aniso ? std::min(g_cfg.aniso, (int)props.limits.maxSamplerAnisotropy) : 0;
+    g.smooth = !exact && (g.aniso > 0 || g_cfg.max_detail != 0);
     g.samples = VK_SAMPLE_COUNT_1_BIT;
     if (!exact && g_cfg.msaa() > 1 && props.apiVersion >= VK_API_VERSION_1_2) {
         VkSampleCountFlags can = props.limits.framebufferColorSampleCounts & props.limits.framebufferDepthSampleCounts;
@@ -1853,7 +1807,6 @@ static bool setup_resources()
         !make_buffer(g.readback, &g.rb_map, (VkDeviceSize)W * H * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT))
         return false;
     VkImageView cv, dv;
-    choose_color_format();
     if (!make_image(g.color, cv, g_color_format, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                     VK_IMAGE_ASPECT_COLOR_BIT) ||
         !make_image(g.depth, dv, VK_FORMAT_D32_SFLOAT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
@@ -2247,7 +2200,7 @@ static bool setup_resources()
         sa.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
         sa.magFilter = i & 4 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
         sa.minFilter = i & 8 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
-        sa.mipmapMode = i & 16 || g.aniso ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        sa.mipmapMode = i & 16 || g.smooth ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
         sa.maxLod = VK_LOD_CLAMP_NONE;
         if (g.aniso && (i & 8)) {
             sa.anisotropyEnable = VK_TRUE;
@@ -2360,14 +2313,10 @@ static bool setup_resources()
     const VkShaderModule frag_clip = g.clip_far ? shader(kFragClip, sizeof kFragClip) : VK_NULL_HANDLE;
     // the old shaders as well only for HP2_PERFAB's comparison, or where there is no clip distance
     const bool old_too = getenv("HP2_PERFAB") != nullptr || getenv("HP2_PIXAB") != nullptr;
-    // the shader's constants: ALPHA_TEST, and WIDE with the picture of 16 bits a channel (Dithering on: nothing rounded to a byte)
-    VkBool32 spec_data[2] = {VK_TRUE, g_color_wide ? VK_TRUE : VK_FALSE};
-    VkBool32 &spec_alpha_test = spec_data[0];
-    VkSpecializationMapEntry spec_entry[2] = {{0, 0, sizeof(VkBool32)}, {1, sizeof(VkBool32), sizeof(VkBool32)}};
-    VkSpecializationInfo spec = {2, spec_entry, sizeof spec_data, spec_data};
-    // the fold's: WIDE alone
-    VkSpecializationMapEntry fold_spec_entry = {0, 0, sizeof(VkBool32)};
-    VkSpecializationInfo fold_spec = {1, &fold_spec_entry, sizeof(VkBool32), &spec_data[1]};
+    // the shader's constant: ALPHA_TEST
+    VkBool32 spec_alpha_test = VK_TRUE;
+    VkSpecializationMapEntry spec_entry = {0, 0, sizeof(VkBool32)};
+    VkSpecializationInfo spec = {1, &spec_entry, sizeof spec_alpha_test, &spec_alpha_test};
     // the second binding is the same buffer again, for the place of a vertex in the picture halfway (a_pos_mid): from further on
     // in the buffer for a draw with a second copy of its vertices (NativeDraw::mid_verts), else the vertex itself
     VkVertexInputBindingDescription bind[2] = {{0, sizeof(NativeVertex), VK_VERTEX_INPUT_RATE_VERTEX}, {1, sizeof(NativeVertex), VK_VERTEX_INPUT_RATE_VERTEX}};
@@ -2551,9 +2500,7 @@ static bool setup_resources()
     pi.layout = g.fold_layout;
     pi.renderPass = g.fold_pass;
     pi.pDepthStencilState = nullptr;
-    st[1].pSpecializationInfo = &fold_spec;
     if (vkCreateGraphicsPipelines(g.dev, VK_NULL_HANDLE, 1, &pi, nullptr, &g.fold_pipeline)) return false;
-    st[1].pSpecializationInfo = nullptr;
     ba.blendEnable = VK_TRUE;
     ba.colorBlendOp = VK_BLEND_OP_ADD;
 
@@ -2667,44 +2614,6 @@ static bool setup_resources()
         pi.layout = g.grade_layout;
         pi.renderPass = g.post_pass;
         if (vkCreateGraphicsPipelines(g.dev, VK_NULL_HANDLE, 1, &pi, nullptr, &g.grade_pipeline)) return false;
-    }
-
-    // The port's dithering (native_extra.frag): one pipeline over the finished picture, reading its copy. Made whatever the
-    // settings say: turning it on is then no remaking of the renderer.
-    {
-        VkDescriptorSetLayoutBinding eb = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr};
-        VkDescriptorSetLayoutCreateInfo esl = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-        esl.bindingCount = 1;
-        esl.pBindings = &eb;
-        if (vkCreateDescriptorSetLayout(g.dev, &esl, nullptr, &g.extra_set_layout)) return false;
-        la.pSetLayouts = &g.extra_set_layout;
-        if (vkAllocateDescriptorSets(g.dev, &la, &g.extra_set)) return false;
-        la.pSetLayouts = &g.set_layout;
-        // the picture between its texels, clamped
-        VkDescriptorImageInfo ei = {g.sampler[4 | 8], scene_view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
-        VkWriteDescriptorSet ew = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-        ew.dstSet = g.extra_set;
-        ew.dstBinding = 0;
-        ew.descriptorCount = 1;
-        ew.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        ew.pImageInfo = &ei;
-        vkUpdateDescriptorSets(g.dev, 1, &ew, 0, nullptr);
-        VkPushConstantRange epc = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(ExtraPush)};
-        VkPipelineLayoutCreateInfo el = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-        el.setLayoutCount = 1;
-        el.pSetLayouts = &g.extra_set_layout;
-        el.pushConstantRangeCount = 1;
-        el.pPushConstantRanges = &epc;
-        if (vkCreatePipelineLayout(g.dev, &el, nullptr, &g.extra_layout)) return false;
-        st[0].module = shader(kPostVert, sizeof kPostVert);
-        st[1].module = shader(kExtraFrag, sizeof kExtraFrag);
-        ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-        ba.blendEnable = VK_FALSE;
-        ba.colorWriteMask = 0xf;
-        pi.pDepthStencilState = nullptr;
-        pi.layout = g.extra_layout;
-        pi.renderPass = g.post_pass;
-        if (vkCreateGraphicsPipelines(g.dev, VK_NULL_HANDLE, 1, &pi, nullptr, &g.extra_pipeline)) return false;
     }
 
     // SMAA: two images of the picture's size for the edges and the weights, the two tables, and a pipeline a pass
@@ -2865,14 +2774,11 @@ static void active_region(const NativeFrame &frame, float &ox, float &sx, float 
 static void copy_scene(bool levels = true);
 
 // ---- the picture's last passes, cheaper (2026-11-24) ---------------------------------------------------------------------------
-// Intel's UHD 630 at 3840x2180 (the user's ride, speed_uhd630_prof.log): the brightness / contrast / gamma and the dithering took
-// some 20 ms of a frame, SMAA 20 more and the alpha's pass before the window its share of 6. Each of the three read a copy of the
+// Intel's UHD 630 at 3840x2180 (the user's ride, speed_uhd630_prof.log): the brightness / contrast / gamma and the dithering (since
+// taken out) took some 20 ms of a frame, SMAA 20 more and the alpha's pass before the window its share of 6. Each read a copy of the
 // picture made for it, and every copy came with the five smaller levels the blur effects need and these never read (texelFetch
 // and textureLod at level 0; SMAA's sampler has the first level only). Now:
 //   - their copies are the picture's first level alone (copy_scene(false));
-//   - with the picture at 16 bits a channel the three settings are worked in the dithering's pass (native_extra.frag does
-//     native_grade.frag's sums, and rounds to the 16 bits the picture would have kept them in): one copy and one pass in place of
-//     two and two. With a picture of 8 bits, or one of the two off, the passes are as they were;
 //   - the last of these passes writes the alpha 1 that opaque_picture wrote after it, over the same part of the picture the
 //     window is shown (blit_to_window takes the scissor's own columns), and opaque_picture is then left out. Not with
 //     HP2_NATIVESHOT: a shot is read between the two and has the game's alpha.
@@ -2885,11 +2791,6 @@ static bool post_graded()
     static const bool exact = getenv("HP2_NATIVEEXACT") != nullptr;
     return !exact && !(g_cfg.brightness == 0 && g_cfg.contrast == 100 && g_cfg.gamma == 100);
 }
-static bool post_dithered()
-{
-    static const bool exact = getenv("HP2_NATIVEEXACT") != nullptr;
-    return !exact && g_cfg.deband;
-}
 static bool post_folds_alpha()
 {
     static const bool shots = getenv("HP2_NATIVESHOT") != nullptr;
@@ -2901,8 +2802,7 @@ static bool post_folds_alpha()
 static void grade_picture(const NativeFrame &frame)
 {
     if (!post_graded()) return;
-    if (g_post_merge && g_color_wide && post_dithered()) return;       // in dither_picture's pass
-    const bool last = !post_dithered() && post_folds_alpha();
+    const bool last = post_folds_alpha();
     copy_scene(false);
     float ox, sx, sy;
     active_region(frame, ox, sx, sy);
@@ -3208,7 +3108,7 @@ static void draw_target(const NativeFrame &frame, int target, int vw, int vh, si
         // 120 frames, for two pictures of one place
         static const bool af_old = getenv("HP2_AFOLD") != nullptr, af_flip = getenv("HP2_AFFLIP") != nullptr;
         const bool af_every = af_flip ? (g.frame / 120 & 1) != 0 : !af_old;
-        if (which == 0 && d.tex && d.rt < 0 && (d.tex_upscaled || (g.aniso && (af_every || d.tex_min_linear) && d.snap_x != 0 && target < 8))) p.tex_mode |= 32;
+        if (which == 0 && d.tex && d.rt < 0 && (d.tex_upscaled || (g.smooth && (af_every || d.tex_min_linear) && d.snap_x != 0 && target < 8))) p.tex_mode |= 32;
         if (g_merge_stat && target == 1) {
             g_ms.passes++;
             g_ms.pipelines += pipeline != bound_pipeline;
@@ -3544,6 +3444,7 @@ static void draw_shadows(const NativeFrame &frame, int target, bool mirror, bool
             memcpy(p.to, s.to, sizeof p.to);
         }
         p.view[0] = vp.x, p.view[1] = vp.y, p.view[2] = vp.width, p.view[3] = vp.height;
+        memcpy(p.dbg, s.dbg_row, sizeof p.dbg);
         VkDescriptorSet set;
         if (s.kind == 1) {
             if (!g.shadow_ready || s.cell >= kShadowAcross * kShadowDown) continue;
@@ -3579,6 +3480,8 @@ static void draw_shadows(const NativeFrame &frame, int target, bool mirror, bool
             p.rect[0] = s.metres[0], p.rect[1] = s.metres[1];
             set = t->set;
         }
+        // the colours' debug: the car's number plus 1 in the mode's bits above the kind (native_shadow.frag); 0 none
+        if (g_shadow_debug) p.mode += 16.0f * (float)(s.dbg_car ? s.dbg_car : 255);
         vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.shadow_layout, 1, 1, &set, 0, nullptr);
         vkCmdSetViewport(g.cmd, 0, 1, &vp);
         vkCmdSetScissor(g.cmd, 0, 1, &sc);
@@ -4375,56 +4278,6 @@ static void copy_scene(bool levels)
     g.scene_ready = true;
 }
 
-// Dithering (Advanced), on the finished picture of every frame, a race's or a menu's or a film's. With the picture at 16 bits a
-// channel (g_color_wide, choose_color_format): a step's worth of noise, a grain to each pixel of the window, so that the steps of
-// 1 / 255 the window's 8 bits make of it come out as grain and not as bands. With a picture of 8 bits (a card without the wide
-// format): the old pass, where the pixels around one are all within a few steps of its colour it takes their average, and the
-// noise goes over the lot (native_extra.frag). The picture's last step: after the antialiasing and the
-// brightness, contrast and gamma, and after the copy the next frame may blend with, so the noise does not build up.
-static void dither_picture(const NativeFrame &frame)
-{
-    if (!post_dithered()) return;
-    copy_scene(false);
-    float ox, sx, sy;
-    active_region(frame, ox, sx, sy);
-    ExtraPush p = {};
-    p.rect[0] = ox;
-    p.rect[1] = 0;
-    p.rect[2] = (float)W - ox;
-    p.rect[3] = (float)H;
-    p.size[0] = (float)W;
-    p.size[1] = (float)H;
-    p.frame = (float)(frame.number & 255);
-    p.lines = sy;
-    // the noise's grain is a pixel of the window: a picture drawn finer than the window (Render Scale above 100) is averaged down
-    // as it is shown, and noise of its own pixels would be averaged away with it
-    p.grain = g.swap_h > 0 && H > g.swap_h ? (float)H / (float)g.swap_h : 1.0f;
-    p.wide = g_color_wide ? 1.0f : 0.0f;
-    // the settings' brightness, contrast and gamma here too (grade_picture has left them to this pass)
-    if (g_post_merge && g_color_wide && post_graded()) {
-        p.brightness = g_cfg.brightness / 100.0f, p.contrast = g_cfg.contrast / 100.0f, p.gamma = g_cfg.gamma / 100.0f;
-        p.graded = 1.0f;
-    }
-    const bool last = post_folds_alpha();
-    p.opaque = last ? 1.0f : 0.0f;
-    if (last) g_opaque_done = true;
-    VkRenderPassBeginInfo rb = {VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
-    rb.renderPass = g.post_pass;
-    rb.framebuffer = g.post_fb;
-    rb.renderArea.extent = {(uint32_t)W, (uint32_t)H};
-    vkCmdBeginRenderPass(g.cmd, &rb, VK_SUBPASS_CONTENTS_INLINE);
-    VkViewport vp = {0, 0, (float)W, (float)H, 0, 1};
-    VkRect2D sc = {{(int32_t)ox, 0}, {(uint32_t)(W - 2 * (int)ox), (uint32_t)H}};
-    vkCmdSetViewport(g.cmd, 0, 1, &vp);
-    vkCmdSetScissor(g.cmd, 0, 1, &sc);
-    vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.extra_pipeline);
-    vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g.extra_layout, 0, 1, &g.extra_set, 0, nullptr);
-    vkCmdPushConstants(g.cmd, g.extra_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof p, &p);
-    vkCmdDraw(g.cmd, 3, 1, 0, 0);
-    vkCmdEndRenderPass(g.cmd);
-    all_barrier();
-}
-
 // Particles: High, the soft sprites: the picture's depth as it is now, for the sprites to read (between two of the picture's passes)
 static void copy_depth_soft()
 {
@@ -4541,6 +4394,7 @@ static void draw_fx(const NativeFrame &frame, const NativeFx &f, int row)
         ao.rect[1] = (float)g_cfg.ao_strength * 0.01f;      // the strength
         ao.rect[2] = 2.0f;                  // the image is half the picture each way
         ao.mode = f.world && g.world_ready ? 1.0f : 0.0f;   // 1: the view's world depth is in depth_world (FX_AO_WORLD)
+        ao.texel = g_shadow_debug ? 1.0f : 0.0f;          // HP2_SHADOWDEBUG: native_ao_apply.frag lays it on blue
         if (!g.world_ready) {               // never copied into: bound all the same, so in the layout the set says, with nothing in it
             VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
             b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
@@ -5283,7 +5137,6 @@ static bool draw_frame(const NativeFrame &frame, bool &uploaded)
     g_opaque_done = false;
     smaa_picture();
     grade_picture(frame);
-    dither_picture(frame);
     gpu_mark(3);
     // HP2_MIDSHOTS=1: the pictures taken are those drawn between (for looking at them), not the frames' own
     static const bool shots_asked = getenv("HP2_NATIVESHOT") != nullptr, mid_shots = getenv("HP2_MIDSHOTS") != nullptr;

@@ -24,9 +24,8 @@ contribution as part of the port under these terms, and under any terms the auth
 
 ## What these terms do not cover
 
-- **The game.** Need for Speed: Hot Pursuit 2, its program, data, sounds, pictures and texts belong to Electronic Arts. They are
-  not in this repository and the port's license gives no rights to them. Need for Speed and Hot Pursuit are trademarks of
-  Electronic Arts. This project is not affiliated with Electronic Arts.
+- **The game.** Need for Speed: Hot Pursuit 2, its program and assets belong to Electronic Arts. The port's license gives no rights
+  to them. Need for Speed and Hot Pursuit are trademarks of Electronic Arts. This project is not affiliated with Electronic Arts.
 - **Other people's code** in this repository keeps its own license:
   - SMAA by Jorge Jimenez and others, MIT license (`recomp/runtime/shaders/smaa/LICENSE.txt`);
   - SDL3, zlib license (`third_party/`).

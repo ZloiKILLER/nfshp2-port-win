@@ -363,9 +363,20 @@ void pc_profile_loaded()
 }
 
 // the window's thread, as the window goes
+static bool profile_write(const char *why);
 void pc_save_on_exit()
 {
     if (!g_fred_ready || pc_racing()) return;
+    profile_write("as the game is left");
+}
+
+// In place of the game's "Autosave" screen (pcmenu.cpp, HOOK_ChangeToScreen__17FlailerScreenList): the same save, written by the
+// port at once. The game's own Autosave saves Fred also after a race (the progress), so this one is written in a race too.
+bool pc_profile_save_ready() { return g_fred_ready; }
+bool pc_save_profile_now() { return g_fred_ready && profile_write("in place of the game's Autosave"); }
+
+static bool profile_write(const char *why)
+{
     const u32 kSaveSize = 0x114e0;
     std::vector<u8> image(kSaveSize), old;
     memcpy(image.data(), host(kFred), kSaveSize);
@@ -383,15 +394,16 @@ void pc_save_on_exit()
         old.resize(fread(old.data(), 1, old.size(), f));
         fclose(f);
     }
-    if (old == image) return;
+    if (old == image) return true;
     FILE *f = fopen(part.c_str(), "wb");
-    if (!f) return;
+    if (!f) return false;
     const bool whole = fwrite(image.data(), 1, kSaveSize, f) == kSaveSize;
     fclose(f);
     std::error_code ec;
     if (whole) std::filesystem::rename(part, file, ec);     // over the old one, at once
     if (!whole || ec) std::filesystem::remove(part, ec);
-    fprintf(stderr, "profiles: the save is written as the game is left (%s)%c", whole && !ec ? "done" : "failed", 10);
+    fprintf(stderr, "profiles: the save is written %s (%s)%c", why, whole && !ec ? "done" : "failed", 10);
+    return whole && !ec;
 }
 
 static void use_profile(const std::string &name)
@@ -636,9 +648,61 @@ void HOOK_NitroBoostHandler(Ctx &c, void (*orig)(Ctx &))
 // value back). A demo of the attract mode brings its own race parameters (DemoModeReplay::RestoreRaceParametersSnapshot), as on
 // a patched PS2. The author is not named in the row (as with the speed boost: for the credits' technical part).
 static const u32 kCatchup = 0x31ab90;           // TheRaceParameters +760
+
+// ---- The car select's windows open on the last choice ---------------------------------------------
+// The user, 2026-11-27: "can the game remember the last choice of the transmission and the handling, and the windows start from
+// it?"; his choice: from the profile, and a quick race does not change it. The car select's two windows (CarSelector::SummonPopup,
+// 0x196bb0): TRANSMISSION (Automatic, Manual, Semi-Auto) and HANDLING (Classic, Extreme). The row a window opens on is the
+// PopupConfig's +52, which SummonPopup takes from the selector's +120 (the transmission) and +124 (the handling); the window's
+// answers (ScreenCallback, 0x197390) write the row's number back there, 0..2 and 0..1. SelectCarScreen::SetSelectedCars (0x1986c8)
+// then puts them in the player's FrontendPlayerInfo, +1607 and +1606, in the same numbers. The player infos are in Fred
+// (FrontendDatabase, 0x2fc050) from +0x10738, 1744 bytes each, and the profile's save is the whole of Fred (its checksum,
+// CalculateChecksum 0x1878b0, runs over 0x114dc bytes): the last choice of each player is in the profile already. The game only
+// never reads it back: CarSelector's constructor (0x1950d0) sets +120 and +124 to 0 every time the screen opens, so the windows
+// open on Automatic and Classic. Here the constructor's two zeros become the player's bytes. Its player: view_id (+28) is 1 for
+// the first player and 2 for the second (SelectCarScreen::ActivateCarSelector, 0x198518). A profile from before has 0 there, as
+// the windows had.
+static const u32 kPlayerInfos = 0x2fc050 + 0x10738;
+static u32 player_info(int player) { return kPlayerInfos + 1744u * (u32)player; }
+
+// StartQuickRace (0x216c18) writes the first player's transmission byte too: Manual with L1 held at the main menu, otherwise
+// Automatic. The race takes its copy of the player infos in StartRace (0x184f68, called by StartQuickRace), and the loading screen
+// reads the byte for its Manual mark (tLoadingScreenAnimation::Tick, 0x16fcd8, only while loading). So the byte the player chose
+// at the car select is kept here and given back when the race is on (TheRaceIsOn, from Race::SetRaceStage, before any save), or
+// at the next car select if the race never came to that.
+static int g_quick_tranny = -1;
+static void give_back_quick_tranny()
+{
+    if (g_quick_tranny < 0) return;
+    SB(player_info(0) + 1607, (u8)g_quick_tranny);
+    g_quick_tranny = -1;
+}
+
+void HOOK___11CarSelector12JoystickPortiiUiR13VisibleCarSeti(Ctx &c, void (*orig)(Ctx &))
+{
+    const u32 self = c.r[4].w[0];
+    orig(c);
+    give_back_quick_tranny();
+    if (!self) return;
+    const int player = (int)LW(self + 28) - 1;
+    if (player < 0 || player > 1) return;
+    const u32 info = player_info(player);
+    const s8 tranny = (s8)LB(info + 1607), handling = (s8)LB(info + 1606);
+    SW(self + 120, tranny >= 0 && tranny <= 2 ? (u32)tranny : 0);
+    SW(self + 124, handling >= 0 && handling <= 1 ? (u32)handling : 0);
+}
+
+void HOOK_TheRaceIsOn__16FrontendDatabaseP4Race(Ctx &c, void (*orig)(Ctx &))
+{
+    give_back_quick_tranny();
+    orig(c);
+}
+
 void HOOK_StartQuickRace(Ctx &c, void (*orig)(Ctx &))
 {
+    const int chosen = LB(player_info(0) + 1607);
     orig(c);
+    g_quick_tranny = chosen;
     if (g_cfg.no_catchup) SW(kCatchup, 0);
 }
 
@@ -675,6 +739,73 @@ void HOOK_SetFlailerScreenVisibility__FUi23FlailerScreenVisibility(Ctx &c, void 
 {
     if (g_cfg.cinematic_replays && c.r[4].w[0] == kReplayLetterbox && c.r[5].w[0] == 0) c.r[5].d[0] = 1;
     orig(c);
+}
+
+// ---- Extras > Cockpit View ------------------------------------------------------------------------
+// The view from the driver's seat, which the game has whole and almost never shows (the user, 2026-11-27: "let's turn it on for
+// fun"). Three cars have it on the disc: the CarTypeInfo of F50, F50HP, SPIDER, BARCHETTA and BARCHETTAHP has a fourth POV of
+// type POV_INCAR (at the driver's head) and a DashGeometryFilename (CARS\<car>\DASHGEOM: <car>_DASH, _DASH_WHEEL, _SPEED_NEEDLE,
+// _TACH_NEEDLE). SPIDERHP has the POV but no file (its body is the 360 Challenge's), so it is left out by the file's name.
+// What makes it shown is the ride's HasDash (RideInfo +6): CarLoader::Load (0x1b0560) then loads the dash's file beside the body,
+// CycleDriveCameraPOVIndex (0x1786d0) lets the camera key reach the INCAR POV, DriveCameraMover::Update puts the camera at the
+// head and sets the Camera's dash flag (+448), RenderDashboards (0x1242a8, every frame from eDisplayFrame) draws the dash, the
+// steering wheel and the two needles, and RenderCars leaves the body out as it does for the bumper view. The game sets HasDash
+// in FrontendPlayerInfo::BuildRideInfo only when the car's row of the player's list has dash_available (+20), which the
+// challenge cars' and most events' rows do not have: so it was never seen.
+// With the switch on, the player's ride is given HasDash as the race's drivers are made: SetupCarsForRace makes the player's
+// DriverInfo (its ctor, 0x188610: a2 the driver's type, 1 the player; the ride copied to +12) for every race, so the switch
+// holds for races started after it. Off, the ride is the game's. The split screen's POVs have no INCAR, so there the view is
+// not reached (the dash's file is loaded all the same).
+static const u32 kCarTypeInfoArray = 0x3358f0 - 20616;     // gp-20616: the pointer to the 64 CarTypeInfo of 1376 bytes
+void HOOK___10DriverInfoi14DriverTypeEnumP8RideInfoiii(Ctx &c, void (*orig)(Ctx &))
+{
+    const u32 self = c.r[4].w[0], type = c.r[6].w[0];
+    orig(c);
+    if (!g_cfg.cockpit_view || type != 1 || !self) return;
+    const u32 ride = self + 12, car = LW(ride), table = LW(kCarTypeInfoArray);
+    if (car >= 64 || !table) return;
+    if (*host(table + car * 1376 + 128)) *host(ride + 6) = 1;      // DashGeometryFilename not empty
+}
+
+// The cockpit's steering wheel by the player's input (the user, 2026-11-27: "it turns strangely"; his choice, "from the player's
+// input"). CarRenderInfo::RenderDashboard (0x123570) turns <car>_DASH_WHEEL about its X by the car's steering, CarDriver +528
+// (this +0 the Car, Car +44 its CarDriver), which is the front tyres' angle itself: RealDriver::DoSteering (0x13b630) makes it
+// the input, moved at the game's steering speed, through its curve, times the most the tyres may turn at this speed (for a pad
+// 45 degrees standing, 13 at the table's second step, 2.9 at its last; for a wheel 45 to 6) and the car's Steering, plus the
+// counter-steer of a power slide. So the wheel turned 45 degrees standing and hardly at all at speed, and jerked by itself in a
+// slide. Now, for the drawing of the dash alone, +528 holds the input instead: RealDriver +596, -1 full right to 1 full left (its
+// JoyHandler_Steer, 0x13b5b0, from the D-pad's or the stick's byte), as a turn of the wheel of up to kCockpitWheelLock degrees
+// each way, and the game's value is put back after. A key gives the input at once, all or nothing: the drawn wheel follows it at
+// most kCockpitWheelRate a second (full left to full right in a third of a second), so a key turns it and a stick is not slowed
+// noticeably. Only a RealDriver (its vtable at +556, 0x2aee30) has the input; any other driver keeps the game's angle.
+static const u32 kRealDriverVtable = 0x2aee30;
+static const float kCockpitWheelLock = 180.0f, kCockpitWheelRate = 6.0f;
+void HOOK_RenderDashboard__13CarRenderInfoP5eViewP8bVector3P8bMatrix4(Ctx &c, void (*orig)(Ctx &))
+{
+    const u32 info = c.r[4].w[0], car = info ? LW(info) : 0, driver = car ? LW(car + 44) : 0;
+    if (!g_cfg.cockpit_view || !driver || LW(driver + 556) != kRealDriverVtable) {
+        orig(c);
+        return;
+    }
+    static float shown;
+    static std::chrono::steady_clock::time_point last;
+    const auto now = std::chrono::steady_clock::now();
+    float dt = std::chrono::duration<float>(now - last).count();
+    last = now;
+    float input;
+    memcpy(&input, host(driver + 596), 4);
+    if (!(input >= -1.0f)) input = -1.0f;          // (a NaN too)
+    if (input > 1.0f) input = 1.0f;
+    if (dt > 0.25f || dt < 0) shown = input;        // the first drawing, or after a pause: where the input is
+    else {
+        const float step = kCockpitWheelRate * dt;
+        shown += std::clamp(input - shown, -step, step);
+    }
+    u16 *steer = (u16 *)host(driver + 528);
+    const u16 was = *steer;
+    *steer = (u16)(s16)lrintf(shown * kCockpitWheelLock * (65536.0f / 360.0f));
+    orig(c);
+    *steer = was;
 }
 
 // ---- Graphics, Controls -----------------------------------------------------------------------
@@ -908,6 +1039,12 @@ void pc_settings_register()
     // page scrolls from here on
     extras.rows.push_back({"Cinematic Replays", "Hiding the replay's controls hides the black bars too.", [] { return onoff(g_cfg.cinematic_replays); },
                            [](int) { g_cfg.cinematic_replays ^= 1; pc_config_save(); }});
+    // the game's own cockpit view of three Ferraris (HOOK___10DriverInfo... above): races started after the switch
+    extras.rows.push_back({"Cockpit View",
+                           "The view from the driver's seat, left unused in the game: Ferrari F50, 360 Spider and 550 Barchetta, and the "
+                           "F50 and 550 Barchetta Hot Pursuit editions. The fourth camera; for races started after the switch.",
+                           [] { return onoff(g_cfg.cockpit_view); },
+                           [](int) { g_cfg.cockpit_view ^= 1; pc_config_save(); }});
     PcPage &cheats = pc_add_page("PC Cheats", "Cheats");
     static const char *const kSections[4][2] = {{"Effects", "The game's easter eggs."},
                                                  {"Cars", "Cars a code opens."},
@@ -969,7 +1106,7 @@ void pc_settings_register()
                           g_cfg.draw_distance = kSteps[(at + (d < 0 ? 3 : 1)) % 4];
                           pc_config_save();
                       }});
-    v.rows.push_back({"Level of Detail", "Maximum: scenery and cars always at their most detailed models. Original: as on the PS2.",
+    v.rows.push_back({"Level of Detail", "Maximum: scenery and cars always at their most detailed models, textures sharpen smoothly as you come closer. Original: as on the PS2.",
                       [] { return std::string(g_cfg.max_detail ? "Maximum" : "Original"); },
                       [](int) {
                           g_cfg.max_detail ^= 1;
@@ -1151,8 +1288,6 @@ void pc_settings_register()
 
     q.rows.push_back({"Ambient Occlusion", "Soft shading where surfaces meet: under cars, by walls and kerbs.", [] { return onoff(g_cfg.ao); },
                       [](int) { g_cfg.ao ^= 1; pc_config_save(); }});
-    q.rows.push_back({"Dithering", "Smooth gradients without colour steps.", [] { return onoff(g_cfg.deband); },
-                      [](int) { g_cfg.deband ^= 1; pc_config_save(); }});
     // the picture's look: left and right step it, Select goes on up and round
     auto stepped = [](int &v, int d, int lo, int hi, int step) {
         int x = v + (d < 0 ? -step : step);

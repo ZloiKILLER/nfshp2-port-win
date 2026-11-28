@@ -98,7 +98,7 @@ The PS2's was 30. Above 60 the game still runs at 60, with pictures drawn in bet
 Draw Distance	Siktavstånd
 How far away scenery still shows. Original: as on the PS2. Advanced: twice as far. High: four times. Maximum: six times.	Hur långt bort miljön syns. Original: som på PS2. Avancerat: dubbelt så långt. Hög: fyra gånger. Maximal: sex gånger.
 Level of Detail	Detaljnivå
-Maximum: scenery and cars always at their most detailed models. Original: as on the PS2.	Maximal: miljö och bilar alltid med sina mest detaljerade modeller. Original: som på PS2.
+Maximum: scenery and cars always at their most detailed models, textures sharpen smoothly as you come closer. Original: as on the PS2.	Maximal: miljö och bilar alltid med sina mest detaljerade modeller, texturer blir mjukt skarpare när du kommer närmare. Original: som på PS2.
 Reflections	Reflektioner
 Shadows	Skuggor
 The cars' shadows. High: the body's own outline, lying on whatever is under it. Very High: finer, and the tunnels' lamps cast them too.	Bilarnas skuggor. Hög: karossens egen kontur, lagd på det som finns under. Mycket hög: finare, och tunnlarnas lampor kastar dem också.
@@ -168,6 +168,8 @@ Disable Catchup	Ingen upphämtning
 No catch-up boost for the opponents in Quick Race and the career.	Ingen upphämtning för motståndarna i Snabblopp och i karriären.
 Cinematic Replays	Filmiska repriser
 Hiding the replay's controls hides the black bars too.	Döljer du reprisens kontroller döljs även de svarta fälten.
+Cockpit View	Förarvy
+The view from the driver's seat, left unused in the game: Ferrari F50, 360 Spider and 550 Barchetta, and the F50 and 550 Barchetta Hot Pursuit editions. The fourth camera; for races started after the switch.	Vyn från förarplatsen, oanvänd i spelet: Ferrari F50, 360 Spider och 550 Barchetta, samt F50 och 550 Barchetta i Hot Pursuit-utförande. Den fjärde kameran; för lopp som startas efter bytet.
 The slow motion key works. On a gamepad: both sticks pressed together.	Slowmotion-tangenten fungerar. På handkontroll: båda spakarna intryckta samtidigt.
 Put player 2's keys back as they were.	Återställ spelare 2:s tangenter.
 Gamepad	Handkontroll

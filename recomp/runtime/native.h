@@ -58,7 +58,7 @@ struct NativeTexture {
     int levels = 1;                 // the game's own
     int gpu_levels = 1;             // what the GPU's image has: the game's, or all of them down to one texel (native_vk's more_levels)
     std::vector<uint32_t> px;       // while it is decoded: the levels one after another. They leave with its NativeTexUpload
-    std::vector<uint8_t> font_alpha;  // the fonts' level 0: their glyphs' seams are looked for here (native.cpp)
+    bool glyphs = false;              // a sheet of glyphs (FONT_*, BUTTONSOUT): each quad of it is sampled inside its own cell (native.cpp, rect_quads)
     uint32_t sum = 0, frame = 0;
     // the pixels' and the palette's sum as last made, and what vouches that their bytes are still those (native_texture_now, memwatch.h)
     uint32_t raw_sum = 0, raw_bytes = 0;
@@ -84,6 +84,10 @@ struct NativeTexUpload {
 extern std::mutex g_native_tex_mutex;
 void native_texture_take_uploads(std::vector<NativeTexUpload> &out);    // what was decoded since the last call, in order
 uint16_t native_tex_mode(const NativeTexture &t);                       // the sampling's bits a draw carries (NativeDraw::tex_mode)
+const uint16_t kNativeTexGrid = 0x8000;     // NativeDraw::tex_mode: the menu's grid drawn by native.frag's grid_texel, not sampled
+// The menus' wide pilot (native.cpp, the car select screen): a Flailer object's part of a wide picture, 0 by the left edge, 1 by the
+// right one. Put as the frontend's file loads (pcmenu.cpp); object 0 forgets them all (the file unloaded).
+void native_menu_part(uint32_t object, float k);
 void native_texture_watch_stats(uint64_t *vouched, uint64_t *summed, uint64_t *bad);
 
 enum NativeBlend {
@@ -196,6 +200,10 @@ struct NativeShadow {
     uint32_t block;                         // kind 3: its lamps' first quad in the lights (L[] of the shaders), 22 to a light
     float soft;                             // kind 1: how far the soft edge reaches at its widest, in the cell's own 0..1; its `low`
                                             // is the narrowest, its `high` how much wider it gets for each 1 of the third the car is above
+    // HP2_SHADOWDEBUG=1 (native.cpp, "the shadows' colours"): whose shadow it is, the car's number among the frame's plus 1 (0: not
+    // known), and how far a place is above the car's lowest point: that height = dot(dbg_row, (the shadow's own x, y, third, 1))
+    uint16_t dbg_car;
+    float dbg_row[4];
 };
 
 struct NativeDepthRect {
@@ -236,6 +244,10 @@ struct NativeFrame {
     uint8_t back_samples[4 * 49 * 28];      // frame's end
     bool env_linear = true;                 // the envmap views' MMag
     bool wide = false;                      // this frame fills the picture; the menus keep to 4:3 in the middle of it
+    // A view's 3D moved across, in its own -1..1 (the two players' car select: each showroom's car to the screen's middle, the user's
+    // choice of 2026-11-27); 0 for the rest. Put into the 3D draws' clip matrices once, by native_frame_clips (view_shifted).
+    float view_shift[3] = {};
+    bool view_shifted = false;
     bool doubled = false;                   // more pictures a second than frames: drawn several times, each at its place between the
     int pictures = 0;                       // frame before and this one (clip_mid and clip give the line); so many a second are asked
     bool queued = false;                    // handed over while the renderer may still have the frame before in hand (native.cpp's

@@ -18,16 +18,12 @@ layout(push_constant) uniform Push {
 layout(set = 0, binding = 0) uniform sampler2D tex;
 // false for the pipelines of draws without the alpha test: a shader with no discard in it keeps the GPU's early depth test
 layout(constant_id = 0) const bool ALPHA_TEST = true;
-// Dithering on (native_vk.cpp, g_color_wide): the picture, the mirror and the reflections' views have 16 bits a channel, and the colour
-// of a pixel keeps what lies between two of the GS's bytes: the texels are filtered and the vertex's colour is multiplied in as
-// fractions, nothing is rounded down to a byte (or, in a reflection's view, to 5 bits) on the way. With every draw rounded as the
-// GS rounds there was nothing between two steps for the dithering to show, whatever the picture could hold. A colour that is a whole
-// byte stays that byte. false: the GS's own integers, as always.
-layout(constant_id = 1) const bool WIDE = false;
 layout(location = 0) in vec4 v_col;
 layout(location = 1) in vec2 v_st;
 layout(location = 2) in float v_k;
 layout(location = 3) in float v_far;
+// a glyph's own rectangle of the texture, s0 t0 s1 t1 (native.vert; native.cpp, rect_quads); z <= x: none
+layout(location = 7) flat in vec4 v_rect;
 layout(location = 0) out vec4 o_col;
 #ifdef SOFT
 // Particles: High, the soft sprite (2026-11-17). A sprite is a flat sheet at the depth of its middle, and the road cut a large
@@ -67,26 +63,6 @@ ivec4 texel(int level, ivec2 at, ivec2 size)
     ivec4 t = ivec4(texelFetch(tex, at, level) * 255.0 + 0.5);
     if (u.pass == 2 && (u.tex_mode & 64) == 0) t.rgb = t.rgb / 8 * 8;     // the sphere map keeps 5 bits; CARSELECTENVMAP its own
     return t;
-}
-
-vec4 texel_wide(int level, ivec2 at, ivec2 size)
-{
-    if ((u.tex_mode & 1) != 0) at.x &= size.x - 1; else at.x = clamp(at.x, 0, size.x - 1);
-    if ((u.tex_mode & 2) != 0) at.y &= size.y - 1; else at.y = clamp(at.y, 0, size.y - 1);
-    return texelFetch(tex, at, level) * 255.0;
-}
-
-vec4 sample_level_wide(int level, vec2 uv, bool linear)
-{
-    ivec2 size = textureSize(tex, level);
-    uv /= float(1 << level);
-    if (!linear) return texel_wide(level, ivec2(floor(uv)), size);
-    uv -= 0.5;
-    vec2 f = floor(uv), w = uv - f;
-    ivec2 i = ivec2(f);
-    vec4 top = mix(texel_wide(level, i, size), texel_wide(level, i + ivec2(1, 0), size), w.x);
-    vec4 bottom = mix(texel_wide(level, i + ivec2(0, 1), size), texel_wide(level, i + ivec2(1, 1), size), w.x);
-    return mix(top, bottom, w.y);
 }
 
 ivec4 sample_level(int level, vec2 uv, bool linear)
@@ -133,20 +109,89 @@ vec4 sample_glass(vec4 c)
     return sum * 255.0;
 }
 
-vec4 sample_tex(float lod)
+// The menus' grid (tex_mode 0x8000; native.cpp, the car select screen's GRID, the pilot of wide menus, 2026-11-27). The texture is
+// 512 x 384 texels of squares, its lines straight but not evenly spaced (the steps go from 12.9 to 16.1 texels) nor of one
+// thickness (1.4 to 2.8 texels), the upright ones lighter than the ones across. The user, 2026-11-27: "it must repeat it one to
+// one, only wider, and a little less sharp". So the lines are the texture's own: every line's middle and thickness as measured
+// from it (work/nshots/menugrid: the centroid of its alpha over every row or column clear of the other lines, which the lines
+// keep to within 0.02 texel; its thickness the alpha's sum over the full alpha), in texels with a texel's middle at .5. Past the
+// texture's edge the same lines come again, the copy put on so that the step across the join is the mean step (14.3776 across,
+// 14.3636 down): the texture's own edges do not meet (6.1 texels from the left edge to the first line, 2.7 from the last to the
+// right edge), and laid end to end it would show a narrow cell. Worked out per pixel rather than read, so a line is as sharp as
+// the screen, with an edge of GRID_SOFT pixels; its colour fades to the gaps' grey with the cover, as the texture's own edge
+// texels do. The colours are the texture's: an upright line's middle (20, 94), a line across (10, 4), a gap (149, 94).
+const float GRID_X[36] = float[](
+    6.106, 20.660, 35.000, 49.340, 63.894, 78.047, 94.106, 108.660, 122.106, 136.660, 151.000, 165.340,
+    180.661, 195.000, 207.894, 222.047, 236.660, 251.000, 265.340, 279.953, 294.106, 308.660, 323.000, 337.340,
+    351.894, 366.047, 381.340, 395.953, 409.340, 423.953, 438.106, 452.660, 467.000, 481.340, 495.000, 509.340);
+const float GRID_XW[36] = float[](
+    1.677, 1.920, 1.788, 1.920, 1.677, 1.912, 1.677, 1.920, 1.677, 1.920, 1.788, 1.920,
+    1.894, 1.968, 1.677, 1.912, 1.892, 1.968, 1.891, 1.912, 1.677, 1.920, 1.788, 1.920,
+    1.677, 1.912, 1.891, 1.912, 1.891, 1.912, 1.677, 1.920, 1.788, 1.920, 1.380, 1.920);
+const float GRID_Y[27] = float[](
+    3.655, 18.139, 30.125, 44.500, 58.875, 73.263, 87.655, 102.095, 116.500, 130.905, 145.345, 159.737,
+    174.125, 188.500, 202.875, 217.263, 231.655, 246.095, 260.500, 274.905, 289.345, 303.737, 318.125, 332.500,
+    346.875, 361.263, 375.655);
+const float GRID_YW[27] = float[](
+    2.638, 1.527, 2.543, 2.257, 2.543, 2.206, 2.638, 2.297, 2.763, 2.297, 2.638, 2.206,
+    2.543, 2.257, 2.543, 2.206, 2.638, 2.297, 2.763, 2.297, 2.638, 2.206, 2.543, 2.257,
+    2.543, 2.206, 2.638);
+const float GRID_STEP_X = 14.3776, GRID_STEP_Y = 14.3636;
+const float GRID_SOFT = 1.75;
+float grid_cover_x(float u, float w)
+{
+    float period = GRID_X[35] + GRID_STEP_X - GRID_X[0];
+    float start = GRID_X[0] - GRID_STEP_X * 0.5;
+    float local = u - floor((u - start) / period) * period;
+    int i = int(floor((local - GRID_X[0]) / GRID_STEP_X + 0.5));
+    float best = 0.0;
+    for (int j = i - 1; j <= i + 1; j++) {
+        int k = j < 0 ? j + 36 : j > 35 ? j - 36 : j;
+        float c = GRID_X[k] + (j < 0 ? -period : j > 35 ? period : 0.0);
+        best = max(best, clamp((GRID_XW[k] * 0.5 - abs(local - c)) / w + 0.5, 0.0, 1.0));
+    }
+    return best;
+}
+float grid_cover_y(float v, float w)
+{
+    float period = GRID_Y[26] + GRID_STEP_Y - GRID_Y[0];
+    float start = GRID_Y[0] - GRID_STEP_Y * 0.5;
+    float local = v - floor((v - start) / period) * period;
+    int i = int(floor((local - GRID_Y[0]) / GRID_STEP_Y + 0.5));
+    float best = 0.0;
+    for (int j = i - 1; j <= i + 1; j++) {
+        int k = j < 0 ? j + 27 : j > 26 ? j - 27 : j;
+        float c = GRID_Y[k] + (j < 0 ? -period : j > 26 ? period : 0.0);
+        best = max(best, clamp((GRID_YW[k] * 0.5 - abs(local - c)) / w + 0.5, 0.0, 1.0));
+    }
+    return best;
+}
+vec4 grid_texel()
 {
     vec2 uv = v_st * vec2(textureSize(tex, 0));
-    int mxl = u.tex_mode >> 8;
+    vec2 w = max(fwidth(uv) * GRID_SOFT, vec2(1e-4));
+    float cx = grid_cover_x(uv.x, w.x), cy = grid_cover_y(uv.y, w.y);
+    vec4 upright = texelFetch(tex, ivec2(20, 94), 0) * 255.0;
+    vec4 across = texelFetch(tex, ivec2(10, 4), 0) * 255.0;
+    vec3 gap = texelFetch(tex, ivec2(149, 94), 0).rgb * 255.0;
+    vec3 rgb = cx >= cy ? mix(gap, upright.rgb, cx) : mix(gap, across.rgb, cy);
+    return vec4(rgb, upright.a * max(cx, cy));
+}
+
+// A glyph's place on its sheet held inside its own cell, half a texel in: the filter then takes nothing of the next glyph, also where
+// multisampling shades a pixel at its middle out past the quad's edge (native.cpp, rect_quads). In texels of level 0.
+vec2 in_cell(vec2 uv, vec2 size)
+{
+    if (v_rect.z <= v_rect.x) return uv;
+    vec2 lo = v_rect.xy * size + 0.5, hi = max(v_rect.zw * size - 0.5, lo);
+    return clamp(uv, lo, hi);
+}
+
+vec4 sample_tex(float lod)
+{
+    vec2 uv = in_cell(v_st * vec2(textureSize(tex, 0)), vec2(textureSize(tex, 0)));
+    int mxl = (u.tex_mode >> 8) & 0x7f;
     bool min_linear = (u.tex_mode & 8) != 0;
-    if (WIDE) {
-        if (lod <= 0.0) return sample_level_wide(0, uv, (u.tex_mode & 4) != 0);
-        if (mxl == 0) return sample_level_wide(0, uv, min_linear);
-        if ((u.tex_mode & 16) == 0) return sample_level_wide(min(int(lod + 0.5), mxl), uv, min_linear);
-        int l0 = min(int(lod), mxl);
-        vec4 t = sample_level_wide(l0, uv, min_linear);
-        if (l0 != mxl) t = mix(t, sample_level_wide(l0 + 1, uv, min_linear), lod - float(l0));
-        return t;
-    }
     ivec4 t;
     if (lod <= 0.0) {
         t = sample_level(0, uv, (u.tex_mode & 4) != 0);
@@ -166,22 +211,22 @@ vec4 sample_tex(float lod)
 }
 
 // what the GS rounds down to a byte
-vec3 gs(vec3 x) { return WIDE ? x : floor(x); }
-float gs(float x) { return WIDE ? x : floor(x); }
+vec3 gs(vec3 x) { return floor(x); }
+float gs(float x) { return floor(x); }
 
 void main()
 {
 #ifndef CLIP_FAR
     if (v_far < 0.0) discard;               // past the far plane: the depth clamp would have kept it
 #endif
-    vec4 c = WIDE ? max(v_col * gl_FragCoord.w * 255.0, vec4(0.0)) : floor(v_col * gl_FragCoord.w * 255.0 + 0.01);
+    vec4 c = floor(v_col * gl_FragCoord.w * 255.0 + 0.01);
     vec3 rgb;
     float a8;
     if (u.textured > 0.5) {
         // the GS's level goes by Q alone: (log2(1 / Q) << L) + K, and Q is 1 / w
         float lod = u.pass == 2 ? 0.0 : log2(1.0 / gl_FragCoord.w) * pow(2.0, u.lod_l) + (u.pass == 0 ? v_k : 0.0);
         // the setting's anisotropic filter: the level goes by how the texture lies on the screen, not by Q
-        vec4 t = (u.tex_mode & 128) != 0 ? sample_glass(c) : (u.tex_mode & 32) != 0 ? texture(tex, v_st) * 255.0 : sample_tex(lod);
+        vec4 t = (u.tex_mode & 0x8000) != 0 ? grid_texel() : (u.tex_mode & 128) != 0 ? sample_glass(c) : (u.tex_mode & 32) != 0 ? texture(tex, in_cell(v_st * vec2(textureSize(tex, 0)), vec2(textureSize(tex, 0))) / vec2(textureSize(tex, 0))) * 255.0 : sample_tex(lod);
         // the sphere map: its alpha is 1. The showroom's own map (bit 64) is 32 bits, and its alpha goes into As as any texture's
         if (u.pass == 2 && (u.tex_mode & 64) == 0) t.a = 128.0;
         if (u.tfx == 1) {                   // DECAL
@@ -198,12 +243,25 @@ void main()
         rgb = c.rgb / 255.0;
         a8 = c.a;
     }
-    // the test is of the byte: with fractions kept, 48.9 is the byte 48
-    if (ALPHA_TEST && u.alpha_test > 0.5 && (WIDE ? a8 < 49.0 : a8 <= 48.0)) discard;
+    if (ALPHA_TEST && u.alpha_test > 0.5 && a8 <= 48.0) discard;
     if (u.bits16 != 0) {                    // what such a target keeps
-        if (!WIDE) rgb = floor(rgb * 255.0 / 8.0 + 1e-3) * 8.0 / 255.0;
+        rgb = floor(rgb * 255.0 / 8.0 + 1e-3) * 8.0 / 255.0;
         // the env map's views have FBA 1 in their register block: whatever is drawn there sets the alpha bit, the clear's grey has it clear
         if (u.blend_alpha < -1.5) a8 = 128.0;
+    }
+    // HP2_SHADOWDEBUG: one of the game's own shadow polygons (a car with no cell of the port's map): a black and white chequer,
+    // 35 % at least (native.cpp, "the shadows' colours")
+    if ((u.flags & 0x100000) != 0 && a8 > 1.0) {
+        ivec2 q = ivec2(gl_FragCoord.xy) / 5;
+        rgb = vec3(float((q.x + q.y) & 1));
+        a8 = max(a8, 45.0);
+    }
+    // and one of the track's own shadow polygons: upright stripes, its texture's colour (bits 22-24) and black
+    if ((u.flags & 0x200000) != 0 && a8 > 1.0) {
+        const vec3 kColours[8] = vec3[8](vec3(1.0, 0.1, 0.1), vec3(0.1, 0.9, 0.1), vec3(1.0, 0.9, 0.0), vec3(1.0, 0.0, 1.0),
+                                         vec3(1.0, 0.5, 0.0), vec3(0.0, 0.9, 0.9), vec3(0.6, 0.3, 1.0), vec3(0.6, 0.35, 0.1));
+        rgb = ((int(gl_FragCoord.x) / 4) & 1) == 0 ? kColours[(u.flags >> 22) & 7] : vec3(0.0);
+        a8 = max(a8, 45.0);
     }
     // The frame's alpha holds As as it is, a byte. Cs Ad, with 0x80 as 1.0, comes to twice Cs Ad / 256: drawn twice, -3.
     if (u.blend_alpha < -3.5) {
@@ -219,7 +277,6 @@ void main()
 #ifdef SOFT
         f *= soft_share();
 #endif
-        // (with fractions kept there is no byte to round to, and a whole colour laid whole stays whole)
-        o_col = vec4(max(rgb * f - (WIDE ? 0.0 : 0.49 / 255.0), vec3(0.0)), min(f, 1.0));
+        o_col = vec4(max(rgb * f - 0.49 / 255.0, vec3(0.0)), min(f, 1.0));
     }
 }

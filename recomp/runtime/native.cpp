@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <unordered_map>
+#include <unordered_set>
 #include <cstring>
 #include <condition_variable>
 #include <mutex>
@@ -191,6 +192,54 @@ static NativeFrame g_frame;
 static u32 g_light_garbage;              // directions out of range cleared (HP2_NATIVELOG)
 static u32 g_mode;                     // the texture's, from EDMA_SETTARGET
 static u32 g_texture;                  // the TextureInfo of AttachTextureEnvDirect
+// The car select screen (SELECT_CAR, 0xb5074ab4), the pilot of wide menus (the user, 2026-11-27: "let the car's preview have the
+// race's aspect, and let us try the grid as a shader"). With a race aspect wider than 4:3 its frame is wide as a race's is: the
+// showroom's 3D by the game's own view widened (HOOK_CreateViewMatricies), the 2D to the edges (unstretch_2d: the hints by
+// the left edge, the colours' column by the right one, the rest, the car's name with it, in the middle), and the grid at the top is drawn by
+// native.frag (grid_texel) across the whole width with square cells, sharp at any size. Taken once a frame (HOOK_eDisplayFrame).
+static const u32 kCarSelectScreen = 0xb5074ab4;
+// (and by the same rules the two players' car select, 0x18dc8e52 the upper half and 0x18dc8e53 the lower, its two showrooms widened;
+// the user, 2026-11-27, "as on one player", then his variant 2: names and specs by the left edge, the cars in the middle)
+static const u32 kCarSelect2P = 0x18dc8e52, kCarSelectOther = 0x18dc8e53;
+static bool g_carsel_2p;
+static bool g_carsel_now;
+// The track select screen (SELECT_TRACK, 0x15417b53) by the car select's rules (the user, 2026-11-27, the menus' second group: the
+// track's picture as on 4:3 in the middle, the track's figures by the left edge, the time of day and the rows by the right one):
+// pcmenu.cpp, tracksel_parts. Its lap window and its "locked" window slide in as the car select's windows do (the same fractions).
+static const u32 kTrackSelectScreen = 0x15417b53;
+static bool g_tracksel_now;
+// The main menu (NEW_MAIN_MENU, 0xae0f8aa1), the second (the user, 2026-11-27: "the video's place and size stay as they are; only
+// the squares are drawn wider"; his answers: the grid's dark fade by the screen's edge, the running line cut at 4:3, the top bar and
+// its red line across the screen). Everything of it stays where 4:3 has it and is cut at the 4:3 block's edges (a row sliding in
+// from the right, the running line's text coming in, the panel's bars that run past 640), but for the background: the grid
+// (native.frag), the two car blueprints that fade one into the other (their black goes on past their edges), and what runs from
+// edge to edge (the fade, the shadows, the top bar and its line), which runs across the wide screen (unstretch_2d).
+// Since the same day every screen with the main menu's background by its rules (pcmenu.cpp, pc_wide_menu: the modes, Race Setup,
+// Challenge, Options and its screens, the gamepad's, the jukebox, the credits, the port's pages), and a window over one of them
+// (pc_popup_screen, a question over the screen) keeps it wide, the window in the middle (the user: "all the other screens the same").
+static bool g_wide_menu_now;
+// The title screen (TITLE_SCREEN, 0xb5761d00), the third (the user, 2026-11-27: "upscale this screen and make it wide as the
+// others"), while it waits for a button (pc_title_waiting: not its logos and films). Its picture, LOADING (the logo with its lights,
+// the grey line above and the orange one below, 512x184 drawn 0..640, the game's own), keeps its
+// 4:3 size in the middle, and past its edges its edge columns go on (no repeat): the lines run to the screen's edges, bright on
+// the left and dim on the right as the picture has them. The bar under it (TOP_BORDER, edge to edge) runs across; the texts stay
+// in the middle as 4:3 has them. The rules are the main menu's (unstretch_2d).
+static const u32 kTitleScreen = 0xb5761d00;
+static bool g_title_now;
+static bool grid_texture() { return g_texture && !strcmp((const char *)host(g_texture + 8), "GRID"); }
+// (the background's moving picture: the blueprints; on the event tree the same objects show the cars' logos, CARLOGO_*)
+static bool blueprint_texture()
+{
+    if (!g_texture) return false;
+    const char *n = (const char *)host(g_texture + 8);
+    return !strncmp(n, "GRID_BLUEPRINT", 14) || !strncmp(n, "CARLOGO_", 8);
+}
+static bool title_texture()
+{
+    if (!g_texture) return false;
+    const char *n = (const char *)host(g_texture + 8);
+    return !strcmp(n, "LOADING") || !strcmp(n, "LOADING_FR");
+}
 static u32 g_frame_no;
 
 // The state of a draw from the texture and the mode. AlphaBits is ALPHA_1's low byte: A, B, C, D by two bits,
@@ -207,6 +256,50 @@ static const MidOwner *g_owner;             // the car whose node the list's rea
 
 static u32 g_rvm_texture, g_rvm_target;  // the mirror's TextureInfo and target
 static u32 g_prev_texture, g_prev_target;  // the screen buffer that holds the last frame
+
+// The shadows' colours (HP2_SHADOWDEBUG=1; the user, 2026-11-27: "a debug build with all the shadows coloured, a colour each").
+// Each car's shadows get its own colour (native_shadow.frag, kCarColours: eight, by the car's number in the frame) and each kind
+// its own pattern: the sun's solid, its tail past 4 m beyond the car's middle along the ray in diagonal stripes, what lies more
+// than a metre below the car's lowest point in a chequer with white; the patch under the car white; the tunnel lamps' in level
+// stripes; the game's own polygons (a car with no cell of the map) in a black and white chequer (native.frag); the Ambient
+// Occlusion blue. Faint shadows are shown at 35 % at least. Off: as before.
+// The track's own shadows too (the user, the same evening: "and the shadows on the track coloured as well"): the tracks lay
+// them as polygons of their own over the road and the ground, textures named for a shadow (TREESHADOW, SHADOWBRIDGE,
+// W_TREESHADLONGA, ST_BUSH_SHAD ...), all of them near black, laid on by their alpha, (Cs - Cd) As + Cd (AlphaBits 0x44).
+// Such a draw of the world's is laid on in upright stripes, a colour a texture by its name (the eight of the cars'), and each
+// texture's name goes to speed.log once with its colour.
+static const bool g_shadow_debug = getenv("HP2_SHADOWDEBUG") && atoi(getenv("HP2_SHADOWDEBUG")) != 0;
+static const u32 kDebugTintFlag = 0x100000;         // NativeDraw::flags: one of the game's shadow polygons (native.frag)
+static bool g_debug_tint;                           // the node being read is one
+static const u32 kTrackShadowFlag = 0x200000;       // NativeDraw::flags: one of the track's shadow polygons; its colour in bits 22-24
+// a texture of the game's shadows of a car: SHADOWRAMP from the sun, <car>_SHADOWIG the patch under it
+static bool shadow_texture(u32 texture)
+{
+    const char *name = (const char *)host(texture + 8);
+    const size_t len = strnlen(name, 40);
+    return !strcmp(name, "SHADOWRAMP") || (len > 9 && len < 40 && !strcmp(name + len - 9, "_SHADOWIG"));
+}
+// what HP2_SHADOWDEBUG adds to a draw's flags: the game's shadow polygon of a car, or one of the track's own shadows
+static u32 debug_flags()
+{
+    if (!g_shadow_debug) return 0;
+    if (g_debug_tint) return kDebugTintFlag;
+    if (!g_texture || g_owner || LB(g_texture + 118) != 0x44) return 0;
+    char name[41] = {};
+    memcpy(name, host(g_texture + 8), 40);
+    const size_t len = strlen(name);
+    char up[41] = {};
+    for (size_t i = 0; i < len; i++) up[i] = (char)toupper((unsigned char)name[i]);
+    if (!strstr(up, "SHAD")) return 0;
+    if ((len > 7 && !strcmp(up + len - 7, "_SHADED")) || (len > 6 && !strcmp(up + len - 6, "_SHADE"))) return 0;      // trees
+    u32 hash = 2166136261u;
+    for (size_t i = 0; i < len; i++) hash = (hash ^ (u8)up[i]) * 16777619u;
+    const u32 colour = hash % 8;
+    static std::unordered_set<std::string> told;
+    if (told.size() < 4096 && told.insert(name).second)
+        fprintf(g_hle_log, "shadows debug: the track's shadow %s, colour %u (red green yellow magenta orange cyan purple brown)\n", name, colour);
+    return kTrackShadowFlag | colour << 22;
+}
 
 // ALPHA_1's low byte: A, B, C, D by two bits, (A - B) C + D with 0 Cs, 1 Cd, 2 zero for A, B, D and 0 As, 1 Ad, 2 FIX for C.
 static void set_blend(NativeDraw &d, u32 bits, u32 fix)
@@ -239,7 +332,7 @@ static void set_draw_state(NativeDraw &d)
     d.lod_l = 0;
     d.depth_test = !g_target_ptr || LW(g_target_ptr + 0x44) != 1;
     d.target = (u8)g_draw_target;
-    d.flags = (u16)g_strip_flags;
+    d.flags = (u16)g_strip_flags | debug_flags();
     d.car = g_owner != nullptr;
     d.light = g_light;
     d.depth_write = (g_mode & 2) != 0;
@@ -271,6 +364,13 @@ static void set_draw_state(NativeDraw &d)
     else if (g_texture == g_prev_texture) d.rt = NATIVE_RT_PREVIOUS;
     else d.tex = native_texture(g_texture, g_frame_no);
     if (d.tex) d.tex_mode = native_tex_mode(*d.tex), d.tex_upscaled = d.tex->upscaled, d.tex_min_linear = d.tex->min_linear;
+    // the car select's grid: its lines by native.frag's formula, from the texture's own colour (grid_texel)
+    if (d.tex && (g_carsel_now || g_tracksel_now || g_wide_menu_now || g_title_now) && g_target_ptr && (LW(g_target_ptr) == 0 || LW(g_target_ptr) == 3)) {
+        if (g_title_now) {
+            if (title_texture()) d.tex_mode &= (uint16_t)~1u;      // past its own edges, its edge columns: the lines go on
+        } else if (grid_texture()) d.tex_mode |= kNativeTexGrid;
+        else if (g_wide_menu_now && blueprint_texture()) d.tex_mode &= (uint16_t)~1u;   // past its own edges, its black edge (unstretch_2d)
+    }
 }
 
 // ---- a strip draw's state once a list (2026-11-24) ------------------------------------------------------------------------------
@@ -307,7 +407,7 @@ static void strip_state(NativeDraw &d)
         d.scroll_s = s.scroll_s, d.scroll_t = s.scroll_t;
         d.tex = s.tex;
         d.tex_mode = s.tex_mode, d.tex_upscaled = s.tex_upscaled, d.tex_min_linear = s.tex_min_linear;
-        d.flags = (u16)g_strip_flags;
+        d.flags = (u16)g_strip_flags | debug_flags();
         d.car = g_owner != nullptr;
         d.light = g_light;
         if (g_texture) g_alpha_seen[k.bits]++;          // (HP2_NATIVESTATS counts the draws by their blend)
@@ -401,41 +501,64 @@ static bool pc_fixes()
     return on;
 }
 
-// A font's cells are cut a column too wide: a glyph's quad can take in the edge of its neighbour in the atlas, a dark line beside the
-// character. Such a column shows by a gap of nothing between it and the glyph. It goes, with half the next for the filter's sake.
-static void trim_glyph(u32 first)
+// Each glyph sampled inside its own cell (issue 34 of the release repo, "black vertical lines between characters", 2026-11-27). On the
+// glyph sheets the glyphs stand edge to edge (FONT_IMPACTNORMAL, the menu's rows: the column right after 'a' is the outline of 'E',
+// a capital's height). FlailerTextChunk::RenderCharacter (0x141a98; the button icons too, through RenderHelpCharacter) gives a glyph
+// of the cell x..x+w the texture's place (x + 0.5) / W to (x + w + 0.5) / W, and the same down: half a texel on, so that at the PS2's
+// own size each pixel falls on a texel's middle. On a larger picture the quad's last pixels go on toward the middle of the column
+// past the cell, the next glyph's, and the filter takes nearly all of it there: a dark line at the right of a letter (a|c, E|x, R|).
+// Multisampling adds to it: a pixel the edge only partly covers is shaded at its middle, out past the quad. So the sampling is held
+// inside the glyph's own cell, the quad's rectangle half a texel back, from the middle of its first texel to that of its last, in
+// the fragment shader (native.frag, in_cell). (Tried first and not enough: moving the quads in by half a texel, and holding the
+// sampling inside the quad's rectangle as it is, both of which still left half of the next glyph's column.)
+//  - Only the glyph sheets (NativeTexture::glyphs): a picture laid out of several quads wants its filter across their seams.
+//  - The rectangles go among the frame's lights (native.vert's L, vec4s), 22 to a NativeLight; a quad's vertices carry the number
+//    of its rectangle + 1 in their normal's bytes (7 bits of each, x lowest), which a draw of the 2D layer does not use; the draw has
+//    kRectFlag. A quad: two triangles over one upright rectangle, straight (w 1), the texture the way up the quad is.
+static const u32 kRectFlag = 0x80000;       // native.vert's RECT
+static u32 g_rect_frame = ~0u;
+static int g_rect_light = -1, g_rect_used = 22;
+static void rect_quads(u32 first, size_t first_draw)
 {
-    if (g_frame.vertices.size() != first + 6 || g_frame.draws.empty()) return;
+    const size_t n = g_frame.vertices.size() - first;
+    if (!n || n % 6 || g_frame.draws.size() <= first_draw) return;
     const NativeTexture *t = g_frame.draws.back().tex;
-    if (!t || t->font_alpha.empty()) return;
-    NativeVertex *v = &g_frame.vertices[first];
-    float x0 = v[0].x, x1 = v[0].x, s0 = v[0].s, s1 = v[0].s, t0 = v[0].t, t1 = v[0].t;
-    for (int i = 1; i < 6; i++) {
-        x0 = std::min(x0, v[i].x), x1 = std::max(x1, v[i].x);
-        s0 = std::min(s0, v[i].s), s1 = std::max(s1, v[i].s);
-        t0 = std::min(t0, v[i].t), t1 = std::max(t1, v[i].t);
-    }
-    int y0 = (int)(t0 * t->h), y1 = std::min((int)(t1 * t->h), t->h - 1);
-    int c0 = (int)(s0 * t->w), c1 = (int)(s1 * t->w - 0.01f);
-    if (c1 - c0 < 3 || x1 <= x0 || c0 < 0 || c1 >= t->w || y0 < 0) return;
-    auto alone = [&](int edge, int inner) {
-        bool any = false;
-        for (int y = y0; y <= y1; y++) {
-            const u8 *row = &t->font_alpha[(size_t)y * t->w];
-            if (row[edge] > 8) {
-                if (row[inner] > 8) return false;
-                any = true;
-            }
+    if (!t || !t->glyphs || t->repeat_s || t->repeat_t) return;
+    for (size_t i = first_draw; i < g_frame.draws.size(); i++)
+        if (g_frame.draws[i].tex != t || g_frame.draws[i].rt >= 0) return;
+    if (!g_texture) return;
+    if (g_rect_frame != g_frame_no || g_rect_light < 0 || g_rect_light >= (int)g_frame.lights.size()) g_rect_frame = g_frame_no, g_rect_light = -1, g_rect_used = 22;
+    const float half_s = 0.5f / (float)(1 << LB(g_texture + 0x48)), half_t = 0.5f / (float)(1 << LB(g_texture + 0x49));
+    bool any = false;
+    for (size_t at = 0; at < n; at += 6) {
+        NativeVertex *v = &g_frame.vertices[first + at];
+        float x0 = v[0].x, x1 = v[0].x, y0 = v[0].y, y1 = v[0].y, s0 = v[0].s, s1 = v[0].s, t0 = v[0].t, t1 = v[0].t;
+        for (int i = 1; i < 6; i++) {
+            x0 = std::min(x0, v[i].x), x1 = std::max(x1, v[i].x), y0 = std::min(y0, v[i].y), y1 = std::max(y1, v[i].y);
+            s0 = std::min(s0, v[i].s), s1 = std::max(s1, v[i].s), t0 = std::min(t0, v[i].t), t1 = std::max(t1, v[i].t);
         }
-        return any;
-    };
-    float per_texel = (x1 - x0) / ((s1 - s0) * t->w), cut = 1.5f;
-    if (alone(c1, c1 - 1))
-        for (int i = 0; i < 6; i++)
-            if (v[i].x == x1) v[i].x -= cut * per_texel, v[i].s -= cut / t->w;
-    if (alone(c0, c0 + 1))
-        for (int i = 0; i < 6; i++)
-            if (v[i].x == x0) v[i].x += cut * per_texel, v[i].s += cut / t->w;
+        if (x1 <= x0 || y1 <= y0 || s1 <= s0 || t1 <= t0) continue;
+        bool quad = true;
+        for (int i = 0; i < 6 && quad; i++)
+            quad = (v[i].x == x0 || v[i].x == x1) && (v[i].y == y0 || v[i].y == y1) && (v[i].x == x1) == (v[i].s == s1) &&
+                   (v[i].y == y1) == (v[i].t == t1) && v[i].w == 1.0f;
+        if (!quad) continue;
+        if (g_rect_used == 22) {
+            if ((int)g_frame.lights.size() + 1 > (int)kNativeLightsMost) return;
+            g_rect_light = (int)g_frame.lights.size();
+            g_frame.lights.emplace_back();
+            g_rect_used = 0;
+        }
+        const u32 index = (u32)g_rect_light * 22 + (u32)g_rect_used + 1;
+        if (index >= (1u << 21)) return;
+        // the glyph's cell: the quad's rectangle half a texel back (RenderCharacter's +0.5, above), in the game's texels
+        float *r = g_frame.lights[g_rect_light].q[g_rect_used++];
+        r[0] = s0 - half_s, r[1] = t0 - half_t, r[2] = s1 - half_s, r[3] = t1 - half_t;
+        for (int i = 0; i < 6; i++) v[i].nx = (s8)(index & 127), v[i].ny = (s8)(index >> 7 & 127), v[i].nz = (s8)(index >> 14 & 127);
+        any = true;
+    }
+    if (any)
+        for (size_t i = first_draw; i < g_frame.draws.size(); i++) g_frame.draws[i].flags |= kRectFlag;
 }
 
 // The mirror's frame starts a column in on its target and its texture's last column is not clean, so the target's first two columns are a
@@ -576,6 +699,22 @@ void native_hud_part(uint32_t object, const NativeHudPart *part)
     if (!object || !part) g_hud_part.clear();
     else g_hud_part[object] = *part;
 }
+// the menus' own (the car select pilot): a Flailer object's part, as native_menu_part was told (pcmenu.cpp)
+static std::unordered_map<u32, float> g_menu_part;
+// A text's span on the screen, its letters together: the game draws a text's letters a few at a time, so one draw's middle is not
+// the text's. Each frame gathers every placed object's (parts 3 and 4) from its draws, as the game gives them, and the next frame
+// places it by that (a text that does not move: the car select's windows).
+// (and its part, and how high it is: the selection's flash finds by them the text it copies)
+struct MenuSpan {
+    float x0, x1, y0, y1, part;
+};
+static std::unordered_map<u32, MenuSpan> g_span_now, g_span_last;
+static std::unordered_map<u32, float> g_anchor_now;           // a text's left end this frame: its first draw's
+void native_menu_part(uint32_t object, float k)
+{
+    if (!object) g_menu_part.clear();
+    else g_menu_part[object] = k;
+}
 
 // the parts' numbers blended, by a middle in the layout's 640: 0 to the left of 147.5, 0.5 from 227.5 to 400, 1 past 480
 static float hud_blend(float m)
@@ -593,11 +732,94 @@ static void unstretch_2d(u32 first, u32 data, float ox)
     size_t n = g_frame.vertices.size() - first;
     if (!n) return;
     bool layer = id == 0 || id == 3;
+    if (g_carsel_2p) {                      // (which targets the two players' car select draws its 2D into: said once each)
+        static u32 told;
+        if (!(told & (1u << (id & 31)))) told |= 1u << (id & 31), fprintf(g_hle_log, "native: the two players' car select draws 2D into target %u%c", id, 10);
+    }
     u32 radial = LW(g_pc_ctx->r[28].w[0] - 25124);          // pTextureInfoRadialBlur
     if (!layer && g_texture && (g_texture == radial || g_texture == g_prev_texture)) return;    // the whole view, cut in four
-    bool edges = pc_hud_up() || g_packet_edge.count(data) != 0;
+    bool edges = pc_hud_up() || g_packet_edge.count(data) != 0 || g_carsel_now || g_tracksel_now;
     const auto owner = g_packet_who.find(data);
     const u64 who = owner != g_packet_who.end() ? owner->second.group : 0;
+    // The song's window (the jukebox's chyron, GLOBALB 0x54987eb2: part 9, pcmenu.cpp chyron_parts) in the menus: by the left edge
+    // at its 4:3 margin and size, raised above the hints' row (on 4:3 it covers Help for its 5 s). Shown and hidden as the game
+    // does it (the user, 2026-11-27: "the song's window by the edge on every aspect"; 2026-11-28, after a slide in and out: "take
+    // the animation off altogether, the game's own behaviour, only keep it by the side"). Not in a race (the HUD's anchors).
+    if (layer && who >> 60 == 1 && !pc_racing())
+        if (const auto known = g_menu_part.find((u32)who); known != g_menu_part.end() && known->second > 8.5f) {
+            const float raise = 36.0f * (float)(s32)LW(g_target_ptr + 0x20) / 480.0f;     // 36 of 480, above the hints' row
+            for (size_t i = 0; i < n; i++) {
+                NativeVertex &v = g_frame.vertices[first + i];
+                v.x = ox + (v.x - ox) * f;
+                v.y -= raise;
+            }
+            return;
+        }
+    // The car select's grid: not narrowed, not stretched. Its quads keep their places across the whole wide picture, and their
+    // texture's s is spread about the middle by as much, so the cells stay square and more of them reach the sides (native.frag
+    // draws the lines, so past the texture's own edge there is grid as well). A quad's s goes linearly with its x; that line is
+    // spread about x = 256, the 4:3 middle, so a grid of several quads stays one grid.
+    // The wide menus (g_wide_menu_now: the main menu and the screens with its background): their own rules, whole. The title screen (g_title_now) by the same.
+    if (layer && (g_wide_menu_now || g_title_now)) {
+        const float lo = ox + 256.0f - 256.0f * f, hi = ox + 256.0f + 256.0f * f;     // the 4:3 block, in the target's numbers
+        float menu_part = -1.0f;
+        if (who >> 60 == 1)
+            if (const auto known = g_menu_part.find((u32)who); known != g_menu_part.end()) menu_part = known->second;
+        const bool spread = g_title_now ? title_texture() : grid_texture(), blueprint = !g_title_now && blueprint_texture();
+        size_t group = n % 6 ? n : 6;
+        for (size_t at = 0; at < n; at += group) {
+            NativeVertex *v = &g_frame.vertices[first + at];
+            float x0 = v[0].x, x1 = v[0].x, s0 = v[0].s, s1 = v[0].s;
+            for (size_t i = 1; i < group; i++) {
+                if (v[i].x < x0) x0 = v[i].x, s0 = v[i].s;
+                if (v[i].x > x1) x1 = v[i].x, s1 = v[i].s;
+            }
+            if (x1 - x0 < 0.01f) continue;
+            const float per_x = (s1 - s0) / (x1 - x0);
+            // The grid: across the screen, its s spread about the screen's middle (the cells square, more of them at the sides).
+            // A blueprint, which the game moves every frame (tGlobalBackgroundAnimation::Tick, 0x249ae8: SetCenter along a cubic
+            // from x 160..165 to 300..400 of 640, in 50 s, 47.6 by ps2.cpp): its quad where the game put it, as the wide screen stretches
+            // it, and its s spread about the quad's own middle: the picture keeps its 4:3 size and its middle goes where the game's
+            // goes, so its path runs over the whole wide screen (on 16:9 its right edge stops short of the screen's). Past its own
+            // edges, its black (no repeat: set_draw_state). The user, 2026-11-27: tried "as 4:3" twice, then a path stretched to
+            // the right edge (a jump in the middle of the screen), then "back from the left edge as the game means it".
+            if (spread || blueprint) {
+                const float s_mid = blueprint ? (s0 + s1) * 0.5f : s0 + (256.0f + ox - x0) * per_x;
+                for (size_t i = 0; i < group; i++) v[i].s = s_mid + (v[i].s - s_mid) / f;
+                continue;
+            }
+            if (x0 - ox <= 0.5f && x1 - ox >= 511.5f) continue;         // edge to edge: across the wide screen as well
+            // by an edge of the screen, as its object's part says (the Help hint, the logo: pcmenu.cpp, mainmenu_parts), uncut
+            if (menu_part >= 0.0f && menu_part <= 1.0f) {
+                for (size_t i = 0; i < group; i++) v[i].x = ox + (v[i].x - ox) * f + menu_part * 512.0f * (1.0f - f);
+                continue;
+            }
+            // the rest: in the middle as 4:3 has it, and cut at the block's edges (its s cut with it: a sprite's s goes with its x)
+            const float per_narrow = per_x / f;
+            for (size_t i = 0; i < group; i++) {
+                const float x = ox + 256.0f + (v[i].x - ox - 256.0f) * f;
+                const float cut = x < lo ? lo : x > hi ? hi : x;
+                v[i].s += (cut - x) * per_narrow;
+                v[i].x = cut;
+            }
+        }
+        return;
+    }
+    if (layer && (g_carsel_now || g_tracksel_now) && grid_texture()) {
+        size_t group = n % 6 ? n : 6;
+        for (size_t at = 0; at < n; at += group) {
+            NativeVertex *v = &g_frame.vertices[first + at];
+            float x0 = v[0].x, x1 = v[0].x, s0 = v[0].s, s1 = v[0].s;
+            for (size_t i = 1; i < group; i++) {
+                if (v[i].x < x0) x0 = v[i].x, s0 = v[i].s;
+                if (v[i].x > x1) x1 = v[i].x, s1 = v[i].s;
+            }
+            if (x1 - x0 < 0.5f) continue;
+            const float per_x = (s1 - s0) / (x1 - x0), s_mid = s0 + (256.0f + ox - x0) * per_x;
+            for (size_t i = 0; i < group; i++) v[i].s = s_mid + (v[i].s - s_mid) / f;
+        }
+        return;
+    }
     // (the object's part, if the layout's table has one for it: a Flailer object's strip, with the HUD up)
     float part = -1.0f;
     if (layer && edges && who >> 60 == 1 && g_cfg.hud_anchors && !g_hud_part.empty())
@@ -613,6 +835,48 @@ static void unstretch_2d(u32 first, u32 data, float ox)
                 part = part < 0.0f ? 0.0f : part > 1.0f ? 1.0f : part;
             }
         }
+    if (part < 0.0f && layer && (g_carsel_now || g_tracksel_now) && who >> 60 == 1)
+        if (const auto known = g_menu_part.find((u32)who); known != g_menu_part.end()) part = known->second;
+    // The car select's windows (pcmenu.cpp, carsel_parts: the transmission's and the handling's choice). The user, 2026-11-27, on
+    // his pictures, after "across the whole width" and "10% off at each side, the title in the middle": "as 4:3 has them, in the
+    // same proportion, sliding in from the right; the empty part from the screen's left edge to the window's the same per cent".
+    // So the window's bands (part 2) keep the game's numbers: on the wide picture they are the same fractions of the screen as on
+    // 4:3 (the window from 86 of 640, 13.4%, past the right edge, coming in from the right as the game moves it). Its texts, the
+    // title (part 3) and the choices (part 4), keep their left ends at the game's fraction and their letters at the 4:3 size:
+    // narrowed by f about their left end, which is where their first letters are drawn (a text comes a few letters a draw). The
+    // selection's flash (part 5), the chosen row's copy the game blows up about the row's middle (ScaleAboutCenter moves its left
+    // end), is narrowed about its row's left end: its row is the choice with the nearest middle, so it stays over it.
+    float anchor = 0.0f;
+    if (part >= 0.0f && n && who >> 60 == 1 && (g_carsel_now || g_tracksel_now)) {
+        const NativeVertex *w = &g_frame.vertices[first];
+        float a = w[0].x, b = a, ya = w[0].y, yb = ya;
+        for (size_t i = 1; i < n; i++)
+            a = std::min(a, w[i].x), b = std::max(b, w[i].x), ya = std::min(ya, w[i].y), yb = std::max(yb, w[i].y);
+        a -= ox, b -= ox;
+        auto now = g_span_now.try_emplace((u32)who, MenuSpan{a, b, ya, yb, part}).first;
+        MenuSpan &sp = now->second;
+        sp.x0 = std::min(sp.x0, a), sp.x1 = std::max(sp.x1, b), sp.y0 = std::min(sp.y0, ya), sp.y1 = std::max(sp.y1, yb);
+        anchor = g_anchor_now.try_emplace((u32)who, a).first->second;
+        // The selection's flash (part 5): the copy of the chosen row the game blows up about the row's middle, on whichever row is
+        // chosen (a choice of a window, a row by the right edge, the lap count). It is placed as the text it copies: the text whose
+        // middle, as the game draws it, is nearest the flash's (last frame's spans: across and, twice as much, up and down).
+        if (part > 4.5f && part < 5.5f) {
+            const auto own = g_span_last.find((u32)who);
+            const float mx = own != g_span_last.end() ? (own->second.x0 + own->second.x1) * 0.5f : (a + b) * 0.5f;
+            const float my = own != g_span_last.end() ? (own->second.y0 + own->second.y1) * 0.5f : (ya + yb) * 0.5f;
+            float best = 1e9f;
+            part = 0.5f;
+            for (const auto &[obj, cs] : g_span_last) {
+                if (obj == (u32)who || cs.part < 0.0f || (cs.part > 1.5f && cs.part < 2.5f) || cs.part > 4.5f) continue;
+                const float d = std::fabs((cs.x0 + cs.x1) * 0.5f - mx) + 2.0f * std::fabs((cs.y0 + cs.y1) * 0.5f - my);
+                if (d >= best) continue;
+                best = d;
+                part = cs.part;
+                const auto drawn = g_anchor_now.find(obj);
+                anchor = drawn != g_anchor_now.end() ? drawn->second : cs.x0;
+            }
+        }
+    }
     size_t group = n % 6 ? n : 6;
     for (size_t at = 0; at < n; at += group) {
         NativeVertex *v = &g_frame.vertices[first + at];
@@ -622,6 +886,13 @@ static void unstretch_2d(u32 first, u32 data, float ox)
             y0 = std::min(y0, v[i].y), y1 = std::max(y1, v[i].y);
         }
         x0 -= ox, x1 -= ox;
+        if (part > 1.5f) {                              // a band as the game has it; a text narrowed about its left end
+            if (part > 5.5f)                            // (6: a picture as 4:3 has it, in the middle: the track's)
+                for (size_t i = 0; i < group; i++) v[i].x = ox + 256.0f + (v[i].x - ox - 256.0f) * f;
+            else if (part > 2.5f)
+                for (size_t i = 0; i < group; i++) v[i].x = ox + anchor + (v[i].x - ox - anchor) * f;
+            continue;
+        }
         if (dumping() && x1 - x0 >= 200)
             fprintf(g_hle_log, "dump wide quad target %u x %.1f..%.1f y %.1f..%.1f texture %08x %dx%d colour %02x%02x%02x%02x packet %08x%c", id, x0, x1, y0, y1, g_texture,
                     g_texture ? LH(g_texture + 0x24) : 0, g_texture ? LH(g_texture + 0x26) : 0, v[0].r, v[0].g, v[0].b, v[0].a, data, 10);
@@ -1444,6 +1715,19 @@ void native_frame_clips(NativeFrame &frame)
         memcpy(local, d.clip, sizeof local);
         clip_matrix_host(d.clip, k.p, k.q, local, k.half_w, k.half_h, k.z_scale);
     }
+    // a view's 3D moved across (NativeFrame::view_shift): x + shift * w in the clip matrix of each draw VU1 transformed (snap_x: the
+    // 2D's are not), and in its halfway one; once a frame, a frame drawn again keeps it
+    if (!frame.view_shifted && (frame.view_shift[1] != 0.0f || frame.view_shift[2] != 0.0f)) {
+        frame.view_shifted = true;
+        for (NativeDraw &d : frame.draws) {
+            if (d.target < 1 || d.target > 2 || d.snap_x == 0.0f) continue;
+            const float sh = frame.view_shift[d.target];
+            if (sh == 0.0f) continue;
+            for (int c = 0; c < 4; c++) d.clip[c * 4] += sh * d.clip[c * 4 + 3];
+            if (d.has_mid)
+                for (int c = 0; c < 4; c++) d.clip_mid[c * 4] += sh * d.clip_mid[c * 4 + 3];
+        }
+    }
 }
 
 // HP2_CLIPCHECK: the frame's draws left to the renderer, each against the matrix made at once when the draw began
@@ -2197,9 +2481,15 @@ static void add_direct(u32 data, u32 qwords)
         if (eop) break;
     }
     if (pc_fixes()) {
-        trim_glyph(first_vertex);
+        rect_quads(first_vertex, first_draw);
         if (g_texture && g_texture == g_rvm_texture && LW(g_target) != 7) trim_mirror(first_vertex);
     }
+    // The main menu's grid a little quieter (the user, 2026-11-27, on its picture: "a touch more muted, as on the car select
+    // screen"). Its quad's alpha is 0x64 there, where the car select's grid fades from 0x3C to nothing: its vertices' alpha taken
+    // to 65 % of the game's, wide or not.
+    if (g_wide_menu_now && grid_texture())
+        for (size_t i = first_vertex; i < g_frame.vertices.size(); i++)
+            g_frame.vertices[i].a = (u8)(g_frame.vertices[i].a * 0.65f + 0.5f);
     if (g_frame.wide) unstretch_2d(first_vertex, data, ox);
     if (const u32 id = LW(g_target); id == 0 || id == 3) {          // the 2D layer: whose the packet is (hud_between)
         auto who = g_packet_who.find(data);
@@ -4335,6 +4625,7 @@ void native_read_list(u32 list)
             }
             if (main_target() && g_pack && g_local) {
                 if (type == EDMA_POLY3D && shadow_poly(node)) break;       // Shadows: High: one of a car's two, drawn the port's way
+                g_debug_tint = g_shadow_debug && type == EDMA_POLY3D && g_texture && shadow_texture(g_texture);
                 g_draw_target = LW(g_target);
                 u32 count = LH(node + 8);
                 g_node_poly = type == EDMA_POLY3D;
@@ -4352,6 +4643,7 @@ void native_read_list(u32 list)
                         }
                     add_strip(LW(node + 12 + i * 8), LH(node + 10 + i * 8), LH(node + 6), g_ahead_on ? &g_ahead[ahead_at + i] : nullptr);
                 }
+                g_debug_tint = false;
             }
             break;
         }
@@ -4948,6 +5240,7 @@ struct ShadowCar {
     bool moves;                             // MidOwner's: where the car was a frame before
     float move[16];
     double radius;                          // a ball about the car's middle (pose + half a metre up) that holds all of it
+    double bottom;                          // the world's height of the lowest point of its collision box (HP2_SHADOWDEBUG)
     struct Lamp {                           // Very High and Ultra: one of its tunnel lamps ("the tunnels' lamps" below)
         double clip[16];                    // the world to the lamp's cell: x, y -1..1 over w, the third K (z - n) over w = z
         double n, k, tn, fade;              // the near distance, K, the half-width's tangent; where its shadow has faded out
@@ -5586,13 +5879,14 @@ static int shadow_car(Ctx &c, u32 info, const float pose[16], bool moves, const 
     // and the points at +32, 20 bytes each with x, y, z at +4 in the car's own space). Never smaller than it was for every car.
     double reach = kShadowReach, deep = kShadowDeep;
     double car_across = 2.5, car_tall = 1.0;        // a car's, when its box cannot be read
+    s.bottom = pose[14] - 0.6;
     {
         const auto in_game = [](u32 a) { return a >= 0x100000 && a < 0x2000000 - 64 && !(a & 3); };
         const u32 car = in_game(info) ? LW(info) : 0, body = in_game(car) ? LW(car + 52) : 0, box = in_game(body) ? LW(body + 8) : 0;
         const s32 count = in_game(box) ? (s16)LH(box + 16) : 0;
         const u32 points = in_game(box) ? LW(box + 32) : 0;
         if (count >= 4 && count <= 64 && in_game(points) && in_game(points + (u32)count * 20)) {
-            double across = 0, tall = 0;
+            double across = 0, tall = 0, lowest = 1e30;
             bool sane = true;
             for (s32 i = 0; i < count; i++) {
                 float at[3];
@@ -5600,9 +5894,11 @@ static int shadow_car(Ctx &c, u32 info, const float pose[16], bool moves, const 
                 if (!(fabsf(at[0]) < 40.0f && fabsf(at[1]) < 40.0f && fabsf(at[2]) < 40.0f)) sane = false;
                 across = std::max(across, sqrt((double)at[0] * at[0] + (double)at[1] * at[1]));
                 tall = std::max(tall, fabs((double)at[2] - 0.5));
+                lowest = std::min(lowest, (double)pose[2] * at[0] + (double)pose[6] * at[1] + (double)pose[10] * at[2] + pose[14]);
             }
             if (sane) {
                 car_across = across, car_tall = tall;
+                s.bottom = lowest;
                 reach = std::min(std::max(reach, across + tall + 0.3), 16.0);
                 deep = std::min(std::max(deep, sqrt(across * across + tall * tall) + 1.2), 18.0);
             }
@@ -5708,6 +6004,12 @@ static void shadow_sun(ShadowCar &s, u32 id)
     n.low = (float)(kShadowSoftLeast / (2.0 * s.reach));
     n.high = (float)(kShadowSoftRise * softer * s.deep / s.reach);      // a metre along the ray is 1 / (2 deep) of the third
     n.metres[0] = (float)(2.0 * s.reach), n.metres[1] = (float)(2.0 * s.deep);   // the cell in metres (native_shadow.frag: what faces the sun)
+    n.dbg_car = (u16)(&s - g_shadow_cars.data() + 1);
+    {   // the world's height in the shadow's own space, less the car's lowest point
+        double back[16];
+        if (invert4d(space, back)) n.dbg_row[0] = (float)back[2], n.dbg_row[1] = (float)back[6], n.dbg_row[2] = (float)back[10],
+                                   n.dbg_row[3] = (float)(back[14] - s.bottom);
+    }
     ShadowFrom from;
     if (!shadow_matrices(n, s, space, id, from)) {
         s.made &= ~(1u << id);
@@ -5729,6 +6031,8 @@ static void shadow_lamps(ShadowCar &s, u32 id)
     NativeShadow n = {};
     n.kind = 3;
     n.block = (u32)s.block * 22;
+    n.dbg_car = (u16)(&s - g_shadow_cars.data() + 1);
+    n.dbg_row[2] = 1.0f, n.dbg_row[3] = (float)-s.bottom;          // its own space is the world
     ShadowFrom from;
     if (!shadow_matrices(n, s, identity, id, from)) return;
     const double r = s.radius + kLampFade, lo[3] = {s.pose[12] - r, s.pose[13] - r, s.pose[14] - 3.0};
@@ -5920,6 +6224,7 @@ static bool shadow_poly(u32 node)
         p = g_frame.shadows[s.patch[id]];
     } else {
         p.kind = 0;
+        p.dbg_car = (u16)(&s - g_shadow_cars.data() + 1);
         for (int k = 0; k < 4; k++) p.colour[k] = (float)(rgba >> (k * 8) & 255) / 128.0f;
         p.tex = native_texture(g_texture, g_frame_no);
         if (!p.tex) return false;
@@ -6766,7 +7071,14 @@ void HOOK_CreateViewMatricies__FP5eViewP8bMatrix4T1T1T1T1T1fff(Ctx &c, void (*or
         if (far_z > 0 && far_z < 10000.0f) memcpy(&c.f[13].u, &far_z, 4);
     }
     float f = native_narrow();
-    if (f >= 1 || id > 2 || !pc_racing()) {
+    if (g_carsel_now) {                     // (which views the showroom has: said once, for the pilot's first look)
+        static u32 told;
+        if (!(told & (1u << (id & 31)))) {
+            told |= 1u << (id & 31);
+            fprintf(g_hle_log, "native: the car select screen draws a view of target %u%s%c", id, id <= 2 && f < 1 ? ", widened" : "", 10);
+        }
+    }
+    if (f >= 1 || id > 2 || !(pc_racing() || g_carsel_now)) {
         orig(c);
         return;
     }
@@ -9392,7 +9704,38 @@ void HOOK_eDisplayFrame__Fv(Ctx &c, void (*orig)(Ctx &))
     set_frame_rate(c);
     speed_log(c);
     pc_paint_buttons();         // the device changes in a race too
-    g_frame.wide = native_narrow() < 1 && pc_racing();
+    g_span_last.swap(g_span_now);
+    g_span_now.clear();
+    g_anchor_now.clear();
+    {
+        const u32 screen = pc_screen_hash();
+        g_carsel_2p = !pc_racing() && (screen == kCarSelect2P || screen == kCarSelectOther);
+        const bool was = g_carsel_now;          // (a window over it, a question, keeps its frame: pcmenu.cpp, window_parts)
+        g_carsel_now = !pc_racing() && (screen == kCarSelectScreen || screen == kCarSelect2P || screen == kCarSelectOther ||
+                                        (was && (pc_popup_screen(screen) || pc_popup_up())));
+    }
+    // The two players' car select: each showroom's car to the screen's middle (the user, 2026-11-27, "variant 2": the specs and names
+    // by the left edge, the strip and the colours by the right, the cars in the middle). In 4:3 the car stands right of the middle,
+    // about a tenth of the 4:3 picture's width (from his picture: 138 px of a 1440 px 4:3 block on 1920); the widened view keeps it
+    // so many pixels off, so its 3D moves by that much to the left: 2 x 0.096 x f of the view's -1..1. The view's right edge then
+    // shows that much of nothing (the showroom is dark there).
+    {
+        const float f = native_narrow(), sh = g_carsel_2p && f < 1.0f ? -0.192f * f : 0.0f;
+        g_frame.view_shift[1] = g_frame.view_shift[2] = sh;
+        g_frame.view_shifted = false;
+    }
+    {   // (a window over it, the track's blurb or a question, keeps its frame: pcmenu.cpp, window_parts)
+        const u32 screen = pc_screen_hash();
+        const bool was = g_tracksel_now;
+        g_tracksel_now = !pc_racing() && (screen == kTrackSelectScreen || (was && (screen == 0xa744ba7b || pc_popup_screen(screen) || pc_popup_up())));
+    }
+    {
+        const u32 screen = pc_screen_hash();
+        const bool was = g_wide_menu_now;
+        g_wide_menu_now = !pc_racing() && (pc_wide_menu(screen) || (was && (pc_popup_screen(screen) || pc_popup_up())));
+    }
+    g_title_now = !pc_racing() && pc_screen_hash() == kTitleScreen && pc_title_waiting();
+    g_frame.wide = native_narrow() < 1 && (pc_racing() || g_carsel_now || g_tracksel_now || g_wide_menu_now || g_title_now);
     mid_frame();
     g_frame.doubled = g_double_now;
     g_frame.pictures = g_double_now ? pc_picture_rate() : 0;

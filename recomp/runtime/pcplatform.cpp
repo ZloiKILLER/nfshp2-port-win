@@ -795,7 +795,12 @@ void HOOK_FindScannerConfigByName(Ctx &c, void (*orig)(Ctx &))
 // not in a replay. The stick is read here, from the gamepad: it is no event of the game's, a replay has nothing of it.
 static std::atomic<int> g_stick_yaw{0};     // while a race camera's Update runs: what its look-back turn gets added (0: nothing)
 
-static int stick_camera(u32 player, float step)
+// In the cockpit view (Extras > Cockpit View, pcsettings.cpp) the stick turns nothing (the user, 2026-11-27: "block the camera's
+// turn by the right stick in the view from inside"): the camera is at the driver's head and the dash is drawn fixed to the car,
+// so a turn showed the dash from the side. That view's Update takes the same rigid turn as the bumper's (the call back to
+// 0x15d2e0); Player::IsCameraPOVInCar (0x178808) says it is the INCAR POV. The stick is then read as let go, so a turn it had
+// eases back to nothing there too, and the next view does not start from an old one. The bumper view keeps the stick.
+static int stick_camera(u32 player, float step, bool blocked)
 {
     static float yaw[2];                    // a player's turn now, in turns: to the right above 0, -0.5..0.5
     static int side[2] = {1, 1};
@@ -805,7 +810,7 @@ static int stick_camera(u32 player, float step)
     // (whose stick is the camera: the modern layout's always, a player's own layout's by its Right Stick row)
     const u32 layout = LW(0x2f9530 + (u32)p * 0xcc + 0xc8);
     const bool camera = layout == PC_MODERN_LAYOUT || (pc_custom_layout(layout) && g_cfg.custom_right_stick[layout - PC_CUSTOM_LAYOUT] == 2);
-    if (camera && pc_racing() && !pc_replay_playing() && window_right_stick(p, x, y)) {
+    if (camera && !blocked && pc_racing() && !pc_replay_playing() && window_right_stick(p, x, y)) {
         const float kDead = 0.25f, m = sqrtf(x * x + y * y);
         if (m > kDead) {
             amount = m >= 1.0f ? 1.0f : (m - kDead) / (1.0f - kDead);
@@ -834,7 +839,9 @@ void HOOK_DriveCameraUpdate(Ctx &c, void (*orig)(Ctx &))
         const u32 bits = LW(c.r[28].w[0] - 19560);      // the step Update itself goes by
         float step;
         memcpy(&step, &bits, 4);
-        yaw = stick_camera(player, step);
+        const bool in_car = pc_call(0x178808, player) != 0;        // Player::IsCameraPOVInCar: the cockpit view
+        yaw = stick_camera(player, step, in_car);
+        if (in_car) yaw = 0;
     }
     bool forced = false;
     if (yaw && !LW(player + 44)) {

@@ -98,7 +98,7 @@ The PS2's was 30. Above 60 the game still runs at 60, with pictures drawn in bet
 Draw Distance	Distancia de dibujado
 How far away scenery still shows. Original: as on the PS2. Advanced: twice as far. High: four times. Maximum: six times.	Hasta dónde se ve el escenario. Original: como en PS2. Avanzado: el doble. Alto: cuatro veces. Máximo: seis veces.
 Level of Detail	Nivel de detalle
-Maximum: scenery and cars always at their most detailed models. Original: as on the PS2.	Máximo: escenario y coches siempre con sus modelos más detallados. Original: como en PS2.
+Maximum: scenery and cars always at their most detailed models, textures sharpen smoothly as you come closer. Original: as on the PS2.	Máximo: escenario y coches siempre con sus modelos más detallados, texturas más nítidas gradualmente al acercarse. Original: como en PS2.
 Reflections	Reflejos
 Shadows	Sombras
 The cars' shadows. High: the body's own outline, lying on whatever is under it. Very High: finer, and the tunnels' lamps cast them too.	Las sombras de los coches. Alto: el contorno de la propia carrocería, sobre lo que haya debajo. Muy alto: más fino, y también las proyectan las lámparas de los túneles.
@@ -168,6 +168,8 @@ Disable Catchup	Sin propulsor
 No catch-up boost for the opponents in Quick Race and the career.	Sin propulsor para los rivales en Carrera rápida y en el modo carrera.
 Cinematic Replays	Repeticiones de cine
 Hiding the replay's controls hides the black bars too.	Ocultar los controles de la repetición oculta también las franjas negras.
+Cockpit View	Vista de cabina
+The view from the driver's seat, left unused in the game: Ferrari F50, 360 Spider and 550 Barchetta, and the F50 and 550 Barchetta Hot Pursuit editions. The fourth camera; for races started after the switch.	La vista desde el asiento del piloto, sin usar en el juego: Ferrari F50, 360 Spider y 550 Barchetta, y los F50 y 550 Barchetta Hot Pursuit. La cuarta cámara; para las carreras iniciadas después del cambio.
 The slow motion key works. On a gamepad: both sticks pressed together.	La tecla de cámara lenta funciona. En el mando: los dos sticks pulsados a la vez.
 Put player 2's keys back as they were.	Devuelve las teclas del jugador 2 a como estaban.
 Gamepad	Mando

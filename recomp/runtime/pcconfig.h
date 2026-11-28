@@ -31,7 +31,7 @@ struct PcConfig {
     int aa_level = 4;           // 2 or 4: MSAA's samples, SMAA's quality
     int msaa() const { return aa_mode == 1 ? aa_level : 0; }
     int aniso = 0;              // anisotropic filtering: 0 off (the GS's own sampling), 2, 4, 8, 16
-    // The port's own effects on a race's 3D picture (native_extra.frag); the PS2 had none of them, so off as they come
+    // The port's own effects on a race's 3D picture; the PS2 had none of them, so off as they come
     // Ambient Occlusion in a race (native.cpp, ao_end): 0 off, 1 on (it reaches 7 m). Off / Low / High for a day; the user,
     // 2026-11-26: "back to On / Off, the current High our only one"
     int ao = 0;
@@ -51,7 +51,6 @@ struct PcConfig {
     int shadow_softness = 100;  // the cars' shadows at High and up: how wide the soft edge gets, percent (hp2.ini only)
     int monitor = 0;            // the screen the game is shown on: 0 where the window is, 1 and up that screen (window.cpp)
     char gpu[128] = {};         // the graphics card that draws the game, by its name; empty: the game's choice (native_vk.cpp)
-    int deband = 0;             // dithering against the steps of smooth gradients: 0 off, 1 on. On every picture, the menus' too
     int brightness = 0;         // percent added, -50..50
     int contrast = 100;         // percent, 50..150
     int gamma = 100;            // percent, 50..200: 100 changes nothing, above it lighter
@@ -64,6 +63,7 @@ struct PcConfig {
     int traffic_cars = 0;       // Extras, Playable Traffic Cars: the mod by 379Felipe, laid over the game while it is on (traffic.cpp)
     int no_catchup = 0;         // Extras, Disable Catchup: Quick Race and the career start with the game's Catch-up off (pcsettings.cpp)
     int cinematic_replays = 0;  // Extras, Cinematic Replays: a replay with its controls hidden has no black bars either (pcsettings.cpp)
+    int cockpit_view = 0;       // Extras, Cockpit View: the player's ride has the game's dash, for the cars that have one (pcsettings.cpp)
     // A steering wheel (pcwheel.h): hp2.ini only so far, no menu rows
     int wheel = 1;              // 1: a wheel Windows has is the game's wheel; 0: wheels are not looked for
     // Whose a wheel is (the Controller screen as the wheels', its Select Device; pcwheel.cpp): "" Automatic (player 1 has the first

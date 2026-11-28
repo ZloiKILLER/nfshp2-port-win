@@ -108,6 +108,7 @@ hook Tick__17FlailerScreenList
 hook HandleEvent__11NewMainMenu13ScreenMessageP18ScreenCallbackData
 hook UnloaderFlailerChunk__FP6bChunk
 hook __21tDisplayOptionsScreeni
+hook HandleEvent__21tDisplayOptionsScreeniP18ScreenCallbackData 0x1f3a28
 hook Loader__15LanguageManagerP6bChunk
 hook ShouldSeeLanguageSelectScreen__Fv
 hook SetLanguage__15LanguageManager11e_Languages
@@ -116,6 +117,9 @@ hook SetInputMode__6Player16PlayerInputModes
 hook DetermineInputMode__6Player 0x177608
 # a help line of the menus that is too long for its place runs (pcmenu.cpp)
 hook BlurbAnimate 0x249348
+# the game's "Autosave" screen (an empty one: a black moment) not entered; the port writes the profile's save (pcmenu.cpp)
+hook ChangeToScreen__17FlailerScreenListPCci 0x16c4c0
+hook SetAutosaveCompletionCallback__FPFv_v 0x247d98
 # Zone Slow Motion's key pressed again ends the slow motion (pcmenu.cpp)
 hook RacingJoyHandler 0x178978
 # the Debug menu's Environment row is a switch of the wipers (pcmenu.cpp): the retail storm functions are stubs
@@ -199,6 +203,8 @@ hook ClassifyAABB__FPC8bVector4T0PC8bMatrix4 0x10ccb0
 hook ToImage__8DCTImagePUcici 0x234b38
 # when the keyboard is shared by two players (pcmenu.cpp)
 hook SetTwoPlayerScreenMode__Fi 0x16caa8
+# the event tree's car logos kept out of the menus' background blueprints (pcmenu.cpp, issue 39)
+hook SetEvent__17tCarLogoAnimationP9EventInfo 0x1f8e18
 # memory and maths as C++ (native_mem.cpp, hot_math.cpp)
 hook bMemCpy 0x250288
 hook bMemSet 0x250340
@@ -216,6 +222,10 @@ hook StartQuickRace 0x216c18
 hook RaceParametersDefaults 0x1ed5c8
 hook CopsOnModeSelectEvent 0x2170b0
 hook CopsOffModeSelectEvent 0x217768
+# the car select's windows open on the player's last choice (pcsettings.cpp): CarSelector's constructor, and the race start
+# that gives the choice back after a quick race (StartQuickRace above)
+hook __11CarSelector12JoystickPortiiUiR13VisibleCarSeti 0x1950d0
+hook TheRaceIsOn__16FrontendDatabaseP4Race 0x187570
 # Options > Extras > Speed Boost for All Cars (pcsettings.cpp): RealDriver::JoyHandler_NitroBoost
 hook NitroBoostHandler 0x13c228
 # the highlight's flare copies a row's text: the port's texts (no LanguageID) whole (pcmenu.cpp)
@@ -226,6 +236,10 @@ hook GetJoystickButtonChar 0x155270
 hook InitWithDefaults__16FrontendDatabase 0x183830
 # Options > Extras > Cinematic Replays (pcsettings.cpp): the replay's letterbox screen is never shown
 hook SetFlailerScreenVisibility__FUi23FlailerScreenVisibility 0x14cbf8
+# Options > Extras > Cockpit View (pcsettings.cpp): the player's DriverInfo, its ride given the game's dash
+hook __10DriverInfoi14DriverTypeEnumP8RideInfoiii 0x188610
+# and its steering wheel turned by the player's input (pcsettings.cpp)
+hook RenderDashboard__13CarRenderInfoP5eViewP8bVector3P8bMatrix4 0x123570
 # the developers' readout (the screen's printf) keeps to the left edge of a wide picture (native.cpp, g_packet_edge)
 hook RenderScreenPrintf 0x146190
 # Options > Extras > Playable Traffic Cars (traffic.cpp): the mod's places of the program

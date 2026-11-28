@@ -3,6 +3,9 @@
 #include <string>
 
 std::string host_exe_dir();             // the exe's folder, with the separator at the end
+#include <cstddef>
+#include <cstdint>
+bool host_resource(const char *name, const uint8_t *&p, size_t &n);  // a file speed.rc puts in the exe (RCDATA), by its name
 void host_log_start(bool wanted);       // started without a console: the log goes to speed.log (4 MB at most), or nowhere if not wanted
 void host_log_close();                  // speed.log is finished and let go: before this program starts itself again, which opens it anew
 void host_log_flush();                  // what was written is in speed.log when this returns: before the program ends

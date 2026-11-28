@@ -113,6 +113,7 @@ static void free_pages()
     g_wheel_was.clear();
     g_pad_was.clear();
     g_row_home_clear();
+    native_menu_part(0, 0.0f);              // the car select's parts were of the file's objects
 }
 
 // The ring of strings below, and after it some lasting room (pc_keep): one block, taken when the first string is made, early,
@@ -183,6 +184,20 @@ void HOOK_SetTwoPlayerScreenMode__Fi(Ctx &c, void (*orig)(Ctx &))
 {
     g_two_player_screens = c.r[4].w[0];
     orig(c);
+}
+
+// The event tree (Championship / Ultimate Racer, issue 39): tCarLogoAnimation::SetEvent (0x1f8e18) also puts the event's car logos
+// (CARLOGO_...) into the texture list of the menus' background animation (FlailerScreenList +456, tGlobalBackgroundAnimation;
+// AddTextureHash 0x249730), the only place in the game that does. ChangeToScreen activates the screen (0x16c548) before it resets
+// the background (ChangeScreenHash 0x16c558), and the reset, as every 50 s cycle after it, takes a random texture of that list:
+// with a one-car event a logo in the left grid instead of a blueprint one time in three, for a whole cycle. The list is put back
+// to the two blueprints (DefaultTextureList 0x249828) after the call; the logo over the map (FADING_LOGO_1) is the call's own.
+void HOOK_SetEvent__17tCarLogoAnimationP9EventInfo(Ctx &c, void (*orig)(Ctx &))
+{
+    orig(c);
+    g_pc_ctx = &c;
+    const u32 list = LW(gp() - 21324), bg = list ? LW(list + 456) : 0;
+    if (bg) pc_call(0x249828, bg);
 }
 
 // ReplayManager (gp-22440): +0 it plays back
@@ -267,6 +282,12 @@ bool pc_objective_screen()
     return s == "Pre Race Blurb" || s == "Pre Race 2P Be A Cop" || s == "Race Objective" || s == "Race Objective 2PBAC";
 }
 std::string pc_screen() { return screen_name(); }
+// The title screen waits for a button: TitleScreen::pInstance (gp-21156), its State +12 is 1 (2 while it plays its logos and films)
+bool pc_title_waiting()
+{
+    const u32 title = g_pc_ctx ? LW(gp() - 21156) : 0;
+    return title && LW(title + 12) == 1;
+}
 
 // The pointer: in the front end, the pause menu, a replay and the screens after the finish; in a race and while one loads, none. And none
 // at the start. There the game is on "BootAutoload" for a second, and then on "Title Screen" all through the logos and the opening film:
@@ -607,16 +628,19 @@ static PcPage *g_current_page;
 static u32 g_current_self;      // the page's tOptionsScreen object
 
 // ---- a list that scrolls, as Audio's does --------------------------------------------------
-// The game's own list (tScrollingMenuList) slides its rows to their new places and pulses its two arrows' alpha by a sine
-// (tfeSineWave: up to 128, 10 radians a second). The port's lists are seven slots whose texts change, so the same is shown with what
-// they have: after a step the seven rows start a row away from their places and slide home, the one that comes in fading up, and the
-// arrows pulse while they show.
+// The game's own list (tScrollingMenuList) slides its rows to their new places in 0.5 s by a smoothstep (3u^2 - 2u^3: its Tick and
+// SetDesiredTopLeftY) and pulses its two arrows' alpha by a sine (tfeSineWave: 0 to 128, 10 radians a second), as the value's two
+// arrows pulse (tLeftRightArrowScroll, the same wave). At its ends it goes no further: the screen refuses the move (Display's
+// Up on its first row, Down on its last; Audio's the same). The port's lists are seven slots whose texts change, so the same is
+// shown with what they have: after a step the seven rows start a row away from their places and slide home, the one that comes in
+// fading up. (The user, 2026-11-28: "the long pages as Audio: there is the game's own code for how a menu behaves"; his choice of
+// the port's slots behaving as the game's list, as a page may have more rows than the game's menu takes, MENUITEM_0..15.)
 static std::map<u32, float> g_row_home;     // a row's text or value: its own Y on the screen
 static float g_slide;                       // rows: where the texts are from home now, in rows; 0 at rest
 static double g_slide_from;                 // when the slide began, seconds
 static int g_slide_dir;
 static const float kRowStep = 37.0f;        // between two rows of the Options screen
-static const double kSlideSeconds = 0.2;
+static const double kSlideSeconds = 0.5;
 
 static void g_row_home_clear() { g_row_home.clear(); }
 
@@ -633,27 +657,56 @@ static float row_home(u32 obj)
     return it->second;
 }
 
+// No pulse while a list scrolls. The pulse (tHighlightAnimation, OptionsScreenBase +28: a copy of the row's text, the object
+// ANIMATING_MENUITEM, swells 1 -> 2 and fades 128 -> 0 in 0.5 s, from the row's text where it is, and again every 4 s; a new row
+// starts it at once) is an object of its own, outside the list's clip and the port's fade of the row that comes in: the row
+// coming up under the window was seen pulsing before it was in (the user, 2026-11-28: "the highlight's animation stayed; take it
+// off where a list scrolls"). For the 0.5 s of a scroll, the port's lists' slide and the game's list's (Audio, HUD), the pulse's
+// clock is held at its end (Animate draws nothing past 0.5 s and starts the next after 4) and the copy is put out; the next
+// pulse comes 3.5 s after the scroll. The screen up is the one at gp-16888 (a tOptionsScreen, an AudioOptionsScreen, a
+// tDisplayOptionsScreen: all OptionsScreenBase).
+static const u32 ANIMATING_MENUITEM = 0xab671c9a;
+static double g_pulse_quiet_until;          // menu_seconds()
+static void pulse_quiet_apply()
+{
+    if (menu_seconds() >= g_pulse_quiet_until) return;
+    const u32 live = LW(gp() - 16888), hash = live ? LW(live) : 0;
+    const u32 project = hash ? find_project(FRONTB_PROJECT) : 0, s = project ? find_screen(project, hash) : 0;
+    if (!s) return;
+    SW(live + 28 + 8, LW(gp() - 19608) - 2000);             // its timer: RealTimeNow (4000 a second) less the pulse's 0.5 s
+    if (u32 o = find_object(s, ANIMATING_MENUITEM, 1)) pc_call(fn::SetAlpha, o, 0);
+}
+static void pulse_quiet_start()
+{
+    g_pulse_quiet_until = menu_seconds() + 0.5;
+    pulse_quiet_apply();
+}
+
 // the list on the screen stepped a row: down, and the rows come up from below
 static void slide_start(bool down)
 {
     g_slide_dir = down ? 1 : -1;
     g_slide = (float)g_slide_dir;
     g_slide_from = menu_seconds();
+    pulse_quiet_start();
 }
 
 // each frame of the frontend: the rows of the screen that is up to where the slide has them, and its arrows' pulse
 static void grid_typed_frame();
 static void list_frame()
 {
+    pulse_quiet_apply();                    // (after the screens' Tick: their pulse has been laid out for this frame)
     // the tOptionsScreen that is live (gp-16888) is a page's or the Options screen's own; its first word is its screen's hash
     const u32 live = LW(gp() - 16888), hash = live ? LW(live) : 0;
     PcPage *pg = hash ? page_by_hash(hash) : nullptr;
     u32 project = find_project(FRONTB_PROJECT), s = project && (pg || hash == OPTIONS_SCREEN) ? find_screen(project, hash) : 0;
     static u32 sliding;                     // the screen whose rows are away from home
     if (sliding && sliding != s) {          // it went while they were: home, for when it comes back
-        for (int k = 1; k <= 7; k++)
+        for (int k = 1; k <= 7; k++) {
             for (u32 o : {find_object(sliding, menuitem_hash(k), 1), value_object(sliding, k)})
                 if (o) pc_call_f(fn::SetY, o, row_home(o));
+            if (u32 label = find_object(sliding, menuitem_hash(k), 1)) pc_call(fn::SetAlpha, label, 128);    // (the one coming in, whole)
+        }
         sliding = 0;
         g_slide = 0;
     }
@@ -662,7 +715,7 @@ static void list_frame()
         return;
     }
     const double now = menu_seconds();
-    const int alpha = 32 + (int)(96.0 * (1.0 + sin(now * 10.0)) * 0.5);
+    const int alpha = (int)(64.0 * (1.0 + sin(now * 10.0)));         // 0..128, as tfeSineWave(0, 128, 10)
     for (u32 h : {SCROLL_UP_ARROW, SCROLL_DOWN_ARROW})
         if (u32 a = find_object(s, h, 2)) pc_call(fn::SetAlpha, a, (u32)alpha);
     // and the two beside the highlighted row's value (the user, 2026-11-23: "arrows that blink, as on the game's screens")
@@ -673,7 +726,7 @@ static void list_frame()
     if (g_slide == 0) return;
     float t = (float)((now - g_slide_from) / kSlideSeconds);
     if (t >= 1) t = 1;
-    const float left = (1 - t) * (1 - t) * (1 - t);     // fast, then easing in: the cubic of the game's own
+    const float left = 1 - t * t * (3 - 2 * t);         // the way still to go: the game's smoothstep
     g_slide = t >= 1 ? 0 : left * (float)g_slide_dir;
     sliding = g_slide != 0 ? s : 0;
     const int entering = g_slide_dir > 0 ? 7 : 1;
@@ -683,10 +736,15 @@ static void list_frame()
             if (!o) continue;
             pc_call_f(fn::SetY, o, row_home(o) + g_slide * kRowStep);   // not the field alone: the text is laid out again only when told
         }
-        if (k == entering && objs[1]) {
+        // The row that comes in is not seen before it is in: Audio's list clips its rows to its window (ClipPoly), so the row it
+        // scrolls to comes out from under the window's edge. Here it is the slot's text that comes from a row away, outside the
+        // list, already highlighted: it showed below (above) the list before the list had moved, "the next row highlighted before
+        // the list has scrolled" (the user, 2026-11-28). Its label and its value come up with the slide, as the clip lets it in.
+        if (k == entering) {
             const PcRow *r = pg && pg->top + k - 1 < (int)pg->rows.size() ? &pg->rows[(size_t)(pg->top + k - 1)] : nullptr;
             const int full = r && r->disabled && r->disabled() ? 40 : 128;
-            pc_call(fn::SetAlpha, objs[1], (u32)(full * (1 - left)));
+            if (objs[1]) pc_call(fn::SetAlpha, objs[1], (u32)(full * (1 - left)));
+            if (objs[0]) pc_call(fn::SetAlpha, objs[0], (u32)(128 * (1 - left)));
         }
     }
 }
@@ -746,7 +804,55 @@ static u32 screen_name_kept(const std::string &name)
     return p;
 }
 
-void pc_open_page(const char *name) { pc_call(fn::ChangeToScreen, screen_name_kept(name), 1); }
+// Leaving a list screen by its row slides its rows out first, as the game's list screens do (OptionsScreenBase: a
+// tExitScreenAnimation in its +92, which takes every message of the screen while it lasts, slides the rows' groups out to x 650,
+// row i in 0.05 (i + 1) s, with the bar under the highlighted row, MI_UNDERSCORE's group, leaving with the last; then it changes
+// the screen itself: 0x2490d8, its HandleMessages 0x249128). So from the Options screen and from the port's pages (tOptionsScreen
+// objects, the live one at gp-16888) a page opens by that slide; elsewhere at once, as before. (The user, 2026-11-28: the game's
+// screens have their rows slide out and come back to the last row; the port's had only the slide in.)
+static void exit_slide_group(u32 e, u32 group, u32 master, float from, float to, float seconds)
+{
+    Ctx &c = *g_pc_ctx;
+    Ctx saved = c;
+    c.r[4].d[0] = sx32(e);
+    c.r[5].d[0] = sx32(group);
+    c.r[6].d[0] = sx32(master);
+    c.f[12].f = from;
+    c.f[13].f = to;
+    c.f[14].f = seconds;
+    c.r[29].d[0] -= 0x200;
+    ps2_call(c, 0x248c60);                  // tSlideAnimation::AddGroup
+    c = saved;
+}
+static float object_left(u32 screen, u32 object)
+{
+    Ctx &c = *g_pc_ctx;
+    Ctx saved = c;
+    c.r[4].d[0] = sx32(screen);
+    c.r[5].d[0] = sx32(object);
+    c.r[29].d[0] -= 0x200;
+    ps2_call(c, 0x144140);                  // FlailerGetTopLeftX
+    const float x = c.f[0].f;
+    c = saved;
+    return x;
+}
+
+void pc_open_page(const char *name)
+{
+    const u32 live = g_pc_ctx ? LW(gp() - 16888) : 0, hash = live ? LW(live) : 0;
+    // (the live object only while its screen is the one up: gp-16888 may still hold one that has gone)
+    if (live && hash == pc_screen_hash() && (hash == OPTIONS_SCREEN || page_by_hash(hash)) && !LW(live + 92)) {
+        if (const u32 e = pc_call(fn::bMalloc, 28, NAME_STRING, 0, 16)) {     // freed with the screen, as the game's own
+            pc_call(0x2490d8, e, hash, screen_name_kept(name), 1);
+            float total;
+            memcpy(&total, host(e + 16), 4);
+            exit_slide_group(e, 0x97bf4b25, 0x32c91dae, object_left(hash, 0x32c91dae), 650.0f, total);    // MI_UNDERSCORE
+            SW(live + 92, e);
+            return;
+        }
+    }
+    pc_call(fn::ChangeToScreen, screen_name_kept(name), 1);
+}
 
 // The game's own way of starting several screens deep (LaunchFrontendMenus, 0x16f950): the names of the screens on the way are
 // pushed onto the list's stack of screens to go back to (FlailerScreenList, gp-21324: 12 names of 32 bytes from +0, their count at
@@ -1286,8 +1392,12 @@ static bool page_event(PcPage &pg, u32 self, u32 msg, u32 data)
         page_refresh(pg);
         return true;
     case 8: case 9: {                       // up and down: past the seventh slot the rows move under it. Param 1 keeps the selection where it is
-        if (total <= 7 || !known) return true;
+        if (!known) return true;
         const bool down = msg == 9;
+        if (total <= 7) {                   // a short page: no round at its ends either, as Audio (the user, 2026-11-28: "on the short ones the
+            if (down ? slot == total : slot == 1) SW(data + 8, 1);         //  frame flies round to the top")
+            return true;
+        }
         if (down ? slot == 7 && row < total : slot == 1 && pg.top > 0) {
             pg.top += down ? 1 : -1;
             {   // a row that cannot be chosen (a divider) does not stop under the highlight: one more, if there is one
@@ -1301,7 +1411,7 @@ static bool page_event(PcPage &pg, u32 self, u32 msg, u32 data)
             page_gray(pg, false);
             slide_start(down);
         } else if (down ? slot == 7 : slot == 1) {
-            pg.top = down ? 0 : total - 7;      // round: the game's menu goes to the other end
+            SW(data + 8, 1);                    // the list's end: the move refused, as the game's own long lists do (no round)
         }
         return true;
     }
@@ -1534,6 +1644,33 @@ static void master_show()
     pc_call(fn::SetTopLeftX, AUDIO_SCREEN, master_marker_hash(), (u32)x);
 }
 
+// The Audio list's mask (the slot's highlight: the list's +20, slot 0..6, MI_1..7_MASK). The game's list puts it once, at the
+// first highlight after the screen is made (tScrollingMenuList::Highlight, 0x24a248: MENUITEM_k -> slot k - 1, only while it is
+// -1 and only for rows 1..7), and from then on moves it itself with Up and Down (MoveMaskUp / Down, 0x24a3c0 / 0x24a388). The
+// rows scroll (the list moves MENUITEM_1..11 and the bars: the table at 0x2b9c30); the masks stand still. With the port's
+// master row above row 1 the game's k - 1 is one slot off, and the port's first fix (slot 0 at the screen's making) left the
+// mask on the top slot whenever the screen came up on another row (back from the Jukebox). So here, at the first highlight
+// only, the slot is measured: the still mask whose height the row highlighted stands at (MI_1_MASK and MI_2_MASK give the first
+// slot's height and the step), kept within the 7 (a row below the window: the last, as the list then scrolls just so far).
+// Then the game moves it, as on the PS2. It is put BEFORE the game handles the highlight: in that same call the screen asks
+// the list for its mask (GetCurrentMenuMask, 0x24a368) and sets the highlight's animation on it. (The user's pictures,
+// 2026-11-28: "no mask when the menu opens", "mask and highlight on different rows after coming back", and, from a try that put
+// every highlight by a model of 8 rows, "past Audio Mode the mask flies down": the screen has 11 rows and the port's.)
+static void audio_mask(u32 self, u32 item)
+{
+    const u32 list = self + AUDIO_SCROLL;
+    if ((s32)LW(list + 20) != -1) return;
+    const u32 project = find_project(FRONTB_PROJECT), s = project ? find_screen(project, AUDIO_SCREEN) : 0;
+    const u32 row = s ? find_object(s, item, 1) : 0;
+    const u32 m1 = s ? find_object(s, pc_hash("MI_1_MASK"), 2) : 0, m2 = s ? find_object(s, pc_hash("MI_2_MASK"), 2) : 0;
+    if (!row || !m1 || !m2) return;
+    const float step = fl(m2 + 52) - fl(m1 + 52);
+    if (step < 1.0f) return;
+    int slot = (int)std::lround((fl(row + 52) - fl(m1 + 52)) / step);
+    slot = slot < 0 ? 0 : slot > 6 ? 6 : slot;
+    SW(list + 20, (u32)slot);
+}
+
 void HOOK___18AudioOptionsScreeni(Ctx &c, void (*orig)(Ctx &))
 {
     g_pc_ctx = &c;
@@ -1544,16 +1681,33 @@ void HOOK___18AudioOptionsScreeni(Ctx &c, void (*orig)(Ctx &))
     pc_call(fn::ScrollAddObject, list, menuitem_hash(0));
     pc_call(fn::ScrollAddObject, list, master_bar_hash());
     pc_call(fn::ScrollAddObject, list, master_marker_hash());
-    SW(list + 20, 0);                       // the mask starts on the first row: the list only knows MENUITEM_1 on
     master_show();
     c.r[2].d[0] = sx32(ret);
 }
 
+// A game's list (Audio's, Display's: tScrollingMenuList) scrolls on Up or Down when its mask is at the edge of its 7 slots and the
+// move goes on: the mask stays where it was and the rows slide (0.5 s). Then no pulse for the slide (pulse_quiet_start); and on the
+// highlight that follows, the game's own restart of the pulse put out in the same call.
+static void game_list_event(u32 list, u32 msg, u32 data, Ctx &c, void (*orig)(Ctx &), void (*handle)(Ctx &, void (*)(Ctx &)))
+{
+    const s32 before = (s32)LW(list + 20);
+    handle(c, orig);
+    if ((msg == 8 || msg == 9) && LW(data + 8) != 1 && before != -1 && (s32)LW(list + 20) == before) pulse_quiet_start();
+    if (msg == 4) pulse_quiet_apply();
+}
+
+static void audio_event(Ctx &c, void (*orig)(Ctx &));
 void HOOK_HandleEvent__18AudioOptionsScreeniP18ScreenCallbackData(Ctx &c, void (*orig)(Ctx &))
 {
     g_pc_ctx = &c;
+    game_list_event(c.r[4].w[0] + AUDIO_SCROLL, c.r[5].w[0], c.r[6].w[0], c, orig, audio_event);
+}
+
+static void audio_event(Ctx &c, void (*orig)(Ctx &))
+{
     u32 self = c.r[4].w[0], msg = c.r[5].w[0], data = c.r[6].w[0];
     u32 item = msg <= 10 ? LW(data) : 0;
+    if (msg == 4) audio_mask(self, item);   // (the first highlight: before the game's own handling, above)
     if (item != menuitem_hash(0)) {
         orig(c);
         if (msg == 8 && item == menuitem_hash(1)) SW(data + 8, 0);     // the game's list stopped here
@@ -1808,9 +1962,24 @@ static void hud_anchors(u32 project)
     fprintf(stderr, "hud: %d of the %d objects of the HUD's screens have their parts of a wide picture (the rest go by the lines)\n", given, objects);
 }
 
+// The jukebox's song window (the chyron: GLOBALB's screen 0x54987eb2, RECORD_LABEL, ARTIST_NAME, SONG_TITLE, RECORD_TITLE and its
+// bars CHYRON_BG_1..5) on a wide picture in the menus: part 9, by the left edge (native.cpp, unstretch_2d).
+// GLOBALB stays loaded; the parts are cleared with the front end's (free_pages), so they are given again whenever a project loads.
+static void chyron_parts()
+{
+    const u32 list = gp() - 22424;
+    int n = 0;
+    for (u32 p = LW(list); p && p != list; p = LW(p))
+        if (const u32 s = find_screen(p, 0x54987eb2))
+            for (u32 ol = s + 32, o = LW(ol); o && o != ol; o = LW(o)) native_menu_part(o, 9.0f), n++;
+    static int told;
+    if (n && told < 4) told++, fprintf(stderr, "menus: the song window, %d objects by the left edge\n", n);
+}
+
 static void on_project_loaded(u32 tail)
 {
     port_edits(tail);
+    chyron_parts();
     hud_anchors(tail);
     if (const char *path = getenv("HP2_FLDUMP"))
         if (FILE *f = fopen(path, "a")) {
@@ -2598,6 +2767,216 @@ void HOOK_CopyFlailerText(Ctx &c, void (*orig)(Ctx &))
     SW(to + 84, room);
 }
 
+// The car select screen on a wide picture (the pilot of wide menus, native.cpp g_carsel_now; the user, 2026-11-27: "to the
+// edges"): the hints at the bottom left (Help, Back) by the left edge; the colours' column by the right edge; everything else
+// (the car's name, the cars' strip and its arrows, the specs, the counts, the locked panel) in the middle, all of it
+// together. The sheets across the whole screen and the grid are not these (unstretch_2d).
+// The same for the two players' car select (SELECT_CAR_2P, 0x18dc8e52: a half of the screen each, one above the other, each with its
+// showroom, strip, specs and colours; the lower half is 0x18dc8e53, player 2's): the user, 2026-11-27, "as on
+// one player".
+static void carsel_parts(u32 project)
+{
+    // (the car's name, CAR_LOGO, was by the left edge till the user's picture of 2026-11-27: "let the cars' names stay as on 4:3";
+    // its picture is 832 texels across, the name, a red line and the NFS mark: in the middle with the rest now)
+    const u32 right[] = {pc_hash("SWATCH_FRAME"), pc_hash("UP_ARROW"), pc_hash("DOWN_ARROW")};
+    int counts[3] = {};
+    for (u32 hash : {0xb5074ab4u, 0x18dc8e52u, 0x18dc8e53u}) {
+    const u32 s = find_screen(project, hash);
+    if (!s) continue;
+    for (u32 ol = s + 32, o = LW(ol); o && o != ol; o = LW(o)) {
+        const u32 name = LW(o + 8);
+        const std::string nm = pc_str(o + 16);
+        float k = 0.5f;
+        for (u32 h : right) k = name == h ? 1.0f : k;
+        if (nm.rfind("SWATCH_", 0) == 0) k = 1.0f;
+        if (fl(o + 48) < 200.0f && fl(o + 52) > 400.0f && fl(o + 52) < 480.0f) k = 0.0f;      // the hints at the bottom left
+        // The two players' car select, his "variant 2" (2026-11-27, on his picture: "move the text, the selector and the cars
+        // more organically"): each half's specs and car name (with its class and line) by the left edge; the cars in the middle
+        // (native.cpp, NativeFrame::view_shift). The halves are two screens: 0x18dc8e52 the upper (player 1), 0x18dc8e53 the lower
+        // (player 2: FADEOVERLAYP2, y 240..480). The strip of cars stays in the middle as 4:3 has it (his next picture: "leave
+        // player 1's selector where player 2's is now", that is, in the middle; it had gone to the right edge).
+        if (hash == 0x18dc8e52u || hash == 0x18dc8e53u)
+            if (nm.rfind("SPEC", 0) == 0 || nm == "CAR_LOGO" || nm == "CAR_LOGO_NFS" || nm == "CLASS" || nm == "CLASS_NAME" || nm == "ORANGELINE")
+                k = 0.0f;
+        native_menu_part(o, k);
+        counts[k == 0.0f ? 0 : k == 1.0f ? 2 : 1]++;
+    }
+    }
+    fprintf(stderr, "menus: the car select screens on a wide picture: %d objects by the left edge, %d in the middle, %d by the right\n", counts[0],
+            counts[1], counts[2]);
+    // Its windows (the transmission's choice, SELECT_CAR_DIALOG, and the two of the same look, 0x6344da01 and 02: the handling's):
+    // their bands (the title's bar, the red line, the sheet of the choices, the white line under it, at 86 of 640) part 2, as the
+    // game has them (the same fractions of the wide screen as of 4:3); the title (POPUP_LINE_1) part 3 and the choices (POPUP_1..3)
+    // part 4: their left ends at the game's fraction, their letters at the 4:3 size; the flash part 5, by its row (native.cpp,
+    // unstretch_2d; the user's pictures, 2026-11-27). Not the dark sheet over the whole screen (at 0 or
+    // -1: across as it is), nor a band the window keeps off the screen (876..).
+    int bands = 0, texts = 0;
+    const u32 title = pc_hash("POPUP_LINE_1"), choices[] = {pc_hash("POPUP_1"), pc_hash("POPUP_2"), pc_hash("POPUP_3")};
+    for (u32 hash : {0x41c2fdc3u, 0x6344da01u, 0x6344da02u})
+        if (const u32 d = find_screen(project, hash))
+            for (u32 ol = d + 32, o = LW(ol); o && o != ol; o = LW(o)) {
+                const u32 name = LW(o + 8);
+                if ((s8)LB(o + 40) != 1) {
+                    if (fl(o + 48) > 50.0f && fl(o + 48) < 100.0f) native_menu_part(o, 2.0f), bands++;
+                } else if (name == title) {
+                    native_menu_part(o, 3.0f), texts++;
+                } else if (name == choices[0] || name == choices[1] || name == choices[2]) {
+                    native_menu_part(o, 4.0f), texts++;
+                } else if (name == kHighlightText) {
+                    // the selection's flash, the copy of the chosen row the game blows up from its middle (roomy_highlight_texts'
+                    // copy by now): placed by its row (the user, 2026-11-27: "now the selection's animation slid off")
+                    native_menu_part(o, 5.0f), texts++;
+                }
+            }
+    fprintf(stderr, "menus: the car select's windows: %d bands as 4:3 has them, %d texts in them\n", bands, texts);
+}
+
+// The wide menus (native.cpp, g_wide_menu_now): the main menu first (2026-11-27), then every screen with its background (the user,
+// the same day: "can you make all the other screens the same?", by groups: first these). The screens of FRONTB with the main
+// menu's background, the grid, the blueprints, the fade, the top bar (and most the video panel): the modes, Challenge and its
+// event tree, Race Setup, Options and its screens, the gamepad's, the profiles', the jukebox, the credits. And the port's own pages
+// (copies of Options' screens).
+static const u32 kWideMenus[] = {
+    MAIN_MENU_SCREEN, 0x5b35f533 /* COPS_ON_MODE_SELECT */, 0x033e7771 /* COPS_OFF_MODE_SELECT */, 0xe55f1297 /* CHALLENGE_BE_A_COP */,
+    0x2d62cfe2 /* CHALLENGE */, 0xd1eadbca /* RACE_SETUP */, 0xb6657464 /* JOYSTICK_CONFIG */, OPTIONS_SCREEN, 0x28891a22 /* CUSTOMIZE_HUD */,
+    DISPLAY_SCREEN, 0xa4031ef6 /* JOYSTICK_CALIBRATION */, 0xe116761c /* AUDIO_OPTIONS */, 0x617a4e0a /* USERNAME_OPTIONS */,
+    0x8bd5060b /* JOYSTICK_PRECONFIG */, 0x95b2b627 /* JUKEBOX */, 0x147f8a59 /* the event tree */, 0x39c4c62c /* the credits */,
+    // the third group (the user, 2026-11-27, "do the other screens"): the Challenge event's window over the event tree (its video,
+    // bars and texts), an event's blurb and its reward over the tree, the language's window in Options, the language's flags
+    // at the first start, the credits' text page. Not the EA legal page (0xdd4197c9, a picture of text: 4:3), nor the calibrate
+    // screens (the port hides their row; the other is unreachable in retail: his word, not to be touched).
+    0x492e86e9 /* the event's window */, 0xfd297fd4 /* an event's blurb */, 0xf1eed4cd /* its reward */, 0x632b068e /* LANGUAGE_OPTIONS */,
+    0xadb8e59e /* the flags at the first start */, 0xbec7cd92 /* the credits' text */,
+};
+bool pc_wide_menu(u32 hash)
+{
+    if (!hash) return false;
+    for (u32 h : kWideMenus)
+        if (h == hash) return true;
+    for (PcPage *pg : pages())
+        if (page_hash(*pg) == hash) return true;
+    return false;
+}
+// The windows over a screen, each a screen of its own (the question with two answers, with one, the list of a few rows, the memory
+// card's message): over a wide menu the screen under them stays wide and they stand in the middle, their dark sheet across (the
+// user, 2026-11-27: "the window in the middle").
+bool pc_popup_screen(u32 hash)
+{
+    return hash == 0x037f3133 || hash == 0x74d2dfa2 || hash == 0xfd8a3b6d || hash == 0x9829bfab || hash == 0x0ce3f7ce;
+}
+
+// A wide menu's parts: its button hints at the bottom left (Help, Back, the port's Edit) by the screen's left edge, and the game's
+// logo at the bottom right (the main menu's) by its right edge (the user, 2026-11-27: "the buttons' widgets at the screen's edge",
+// "leave the logo at the right edge"; for all screens: "the hints at the bottom left by the left edge, the logo by the right where
+// it is shown"). The rest stays in the 4:3 block, cut at its edges; what is not here is not by an edge. A hint is a text at the
+// hints' height (the game's at 427 and 431, x 24 and 54; the port's 88 and 176 further on), not a row of the menu (the audio
+// screen's last rows are at 403 and 439) and, on the credits, not a line of the credits running up (at 101).
+static void wide_menu_parts(u32 project)
+{
+    const u32 logo = pc_hash("TITLE_SCREEN_TITLE");
+    int hints = 0, screens = 0;
+    for (u32 hash : kWideMenus)
+        if (const u32 s = find_screen(project, hash)) {
+            screens++;
+            for (u32 ol = s + 32, o = LW(ol); o && o != ol; o = LW(o)) {
+                if (LW(o + 8) == logo) { native_menu_part(o, 1.0f); continue; }
+                const float x = fl(o + 48), y = fl(o + 52);
+                if (hash == 0xbec7cd92) continue;       // (the credits' text page: no hints, its lines run up past them)
+                // (on the credits only what is left of 100, as its lines run up past the hints' row: and the port's Back by its name,
+                // which stands at 113 / 142, else it stayed in the middle, far from Help: the user, 2026-11-28)
+                const bool port_back = LW(o + 8) == pc_hash("PC_BACK_ICON") || LW(o + 8) == back_text_hash();
+                if ((s8)LB(o + 40) != 1 || y < 400.0f || y > 445.0f || x >= (hash == 0x39c4c62c && !port_back ? 100.0f : 260.0f)) continue;
+                if (pc_str(o + 16).rfind("MENUITEM", 0) == 0) continue;
+                native_menu_part(o, 0.0f);
+                hints++;
+            }
+        }
+    for (PcPage *pg : pages())
+        if (const u32 s = find_screen(project, page_hash(*pg))) {
+            screens++;
+            for (u32 ol = s + 32, o = LW(ol); o && o != ol; o = LW(o)) {
+                const float x = fl(o + 48), y = fl(o + 52);
+                if ((s8)LB(o + 40) != 1 || y < 415.0f || y > 445.0f || x >= 260.0f || pc_str(o + 16).rfind("MENUITEM", 0) == 0) continue;
+                native_menu_part(o, 0.0f);
+                hints++;
+            }
+        }
+    fprintf(stderr, "menus: %d wide menu screens, %d hints by the left edge\n", screens, hints);
+}
+
+// The track select screen on a wide picture (native.cpp, g_tracksel_now; the user, 2026-11-27: the track's picture "as on 4:3 in
+// the middle", the figures and the rows "by the edges"). By the left edge (0): the track's figures and their labels (length,
+// elevation, difficulty, the best times, the track's logo and its lines) and the hints. By the right edge (1): the time of day's
+// column (its pictures, its frame, its arrows), the rows Laps / Time of Day. The selection's flash (5) as the text it copies. The track's picture (6) in
+// the middle at its 4:3 size. The lap window and the "locked" window slide in as the car select's windows (2: their bands as the
+// game has them, the same fractions as on 4:3; 3: their texts, arrows and lock at 4:3 size about their left ends). The sheets
+// across the whole screen (the grid, its shadows, the mask over the picture's top, the locked mask) have no part; the rest (the
+// thumbnails' film, its frame and arrows, the thumbnails) in the middle (0.5).
+static void tracksel_parts(u32 project)
+{
+    const u32 s = find_screen(project, 0x15417b53);
+    if (!s) return;
+    static const char *const right[] = {"TOD_3PM", "TOD_NIGHT", "TOD_OVERCAST", "TOD_SUNSET", "TOD_FRAME", "MENUITEM_1", "MENUITEM_2",
+                                        "UP_ARROW", "DOWN_ARROW"};
+    static const char *const left[] = {"TRACK_LENGTH", "TRACK_ELEVATION", "TRACK_DIFFICULTY", "BEST_TOTAL_TIME", "BEST_LAP_TIME",
+                                       "BEST_TOTAL_TIME_STATS", "BEST_LAP_TIME_STATS", "TRACK_LOGO", "DIVERBAR", "DIVIDER"};
+    static const char *const bands[] = {"SELECTLAP_TOP", "SELECTLAP_BG", "SELECTLAP_TOPBAR", "SELECTLAP_LOWERBAR", "LOCKED_BG1",
+                                        "BLURB_BOX", "BOOGLE",
+                                        "LOCKED_BG2", "LOCKED_BOTTOMLINE", "LOCKED_MIDLINE", "LOCKED_TEXTPOLY", "LOCKEDHEAD_BGBLUE"};
+    static const char *const window[] = {"POPUP_LINE_1", "LAP_COUNT", "LAP_LEFT_ARROW", "LAP_RIGHT_ARROW", "LOCKED", "LOCKED_HEADING",
+                                         "LOCKED_TEXTTEST"};
+    static const char *const across[] = {"MASK_THE_PICTURE", "GRID_SHADOW", "GRID", "LOCKED_MASK"};
+    static const char *const picture[] = {"TRACK_IMAGE_BOO", "TRACK_IMAGE_XFADE"};
+    auto in = [](const std::string &nm, const auto &list) {
+        for (const char *x : list)
+            if (nm == x) return true;
+        return false;
+    };
+    int counts[5] = {};
+    for (u32 ol = s + 32, o = LW(ol); o && o != ol; o = LW(o)) {
+        const std::string nm = pc_str(o + 16);
+        const float x = fl(o + 48), y = fl(o + 52);
+        const bool text = (s8)LB(o + 40) == 1;
+        float k = 0.5f;
+        if (in(nm, across)) continue;
+        if (in(nm, picture)) k = 6.0f;
+        else if (in(nm, bands)) k = 2.0f;
+        else if (in(nm, window)) k = 3.0f;
+        else if (LW(o + 8) == kHighlightText) k = 5.0f;         // the flash: as the text it copies (the lap count too)
+        else if (in(nm, right)) k = 1.0f;
+        else if (in(nm, left) || (text && x < 100.0f && y < 400.0f)) k = 0.0f;
+        else if (text && x < 260.0f && y >= 415.0f && y <= 445.0f) k = 0.0f;        // the hints at the bottom left
+        native_menu_part(o, k);
+        counts[k == 0.0f ? 0 : k == 1.0f ? 2 : k == 0.5f ? 1 : k == 6.0f ? 4 : 3]++;
+    }
+    fprintf(stderr, "menus: the track select screen on a wide picture: %d by the left edge, %d in the middle, %d by the right, %d in its "
+            "windows, %d the picture\n", counts[0], counts[1], counts[2], counts[3], counts[4]);
+    // The track's blurb (0xa744ba7b, a box at 140..640 with its texts over the track select): as its lap window, sliding in by the
+    // same fractions (the box and its edge 2, the texts 3). native.cpp keeps the track select's frame while it is up.
+    if (const u32 b = find_screen(project, 0xa744ba7b))
+        for (u32 ol = b + 32, o = LW(ol); o && o != ol; o = LW(o))
+            native_menu_part(o, (s8)LB(o + 40) == 1 ? 3.0f : 2.0f);
+}
+
+// The windows over the car select and the track select (the question, its one-answer kind, the short list, the memory card's
+// message): as the car select's own windows, sliding in by the same fractions (the user's choice for the windows, 2026-11-27):
+// their bands (the sheet, the title's bar, the lines, from 50..200 of 640) 2, their texts 3, the flash 5; the dark sheet over the
+// whole screen (at 0) has no part and runs across. Only the car / track select read these (native.cpp: there the window keeps the
+// screen's frame); over the main menu's screens they keep its rules, which leave a part above 1 alone.
+static void window_parts(u32 project)
+{
+    int n = 0;
+    for (u32 hash : {0x037f3133u, 0x74d2dfa2u, 0xfd8a3b6du, 0x9829bfabu, 0x0ce3f7ceu})
+        if (const u32 w = find_screen(project, hash))
+            for (u32 ol = w + 32, o = LW(ol); o && o != ol; o = LW(o)) {
+                const float x = fl(o + 48);
+                if (LW(o + 8) == kHighlightText) native_menu_part(o, 5.0f), n++;
+                else if ((s8)LB(o + 40) == 1) native_menu_part(o, 3.0f), n++;
+                else if (x > 50.0f && x < 200.0f) native_menu_part(o, 2.0f), n++;
+            }
+    fprintf(stderr, "menus: the windows over the car and track select: %d objects\n", n);
+}
+
 static void port_edits(u32 tail)
 {
     if (LW(tail + 8) != FRONTB_PROJECT) return;
@@ -2628,6 +3007,10 @@ static void port_edits(u32 tail)
     g_project_gen++;
     add_options_arrows(tail);
     roomy_highlight_texts(tail);
+    carsel_parts(tail);
+    tracksel_parts(tail);
+    window_parts(tail);
+    wide_menu_parts(tail);
     g_page_alloc = false;
 }
 
@@ -2701,7 +3084,9 @@ void HOOK___14tOptionsScreeni(Ctx &c, void (*orig)(Ctx &))
         if (pg->on_open) {
             pg->on_open(*pg);
             if (pg->rows.size() >= 7) pc_call(fn::GrayMenuItem, menuitem_hash(7), 1, hash);     // (by the rows it has now, not those of before)
-            pg->top = 0;
+            // (its scroll kept: the game puts the highlight back on the slot it had, as on its own screens, so the rows stay as
+            // they were and the highlight comes back to the last row used; page_refresh keeps it within the rows there are now.
+            // It was set back to the top here, and the highlight came back on another row: the user, 2026-11-28)
             page_shape(*pg);
         }
         g_current_page = pg;
@@ -2741,6 +3126,24 @@ void HOOK___21tDisplayOptionsScreeni(Ctx &c, void (*orig)(Ctx &))
     u32 ret = c.r[2].w[0];
     pc_call(fn::GrayMenuItem, menuitem_hash(9), 2, hash);
     c.r[2].d[0] = sx32(ret);
+}
+
+// Display's list ends at its row 9 for the game: HandleEvent (0x1f3a28) refuses Down only there (Param 1) and Up on row 1. With
+// row 9 hidden (above), Down on row 8 went on to the menu's next row shown, row 1: the highlight went round to the top and the
+// list slid back up, while the list's mask stayed on the bottom slot (it moves by Up and Down within the 7, it has no round).
+// The user, 2026-11-28: "the selection frame sticks and the text highlight goes on, though we removed the round" on HUD. Now
+// row 8 is the end, as row 9 was: Down refused there, as the game does at its own last row.
+static void display_event(Ctx &c, void (*orig)(Ctx &))
+{
+    const u32 msg = c.r[5].w[0], data = c.r[6].w[0];
+    orig(c);
+    if (msg == 9 && LW(data) == menuitem_hash(8)) SW(data + 8, 1);
+}
+static const int DISPLAY_SCROLL = 108;      // tDisplayOptionsScreen's tScrollingMenuList (mMenuScroller)
+void HOOK_HandleEvent__21tDisplayOptionsScreeniP18ScreenCallbackData(Ctx &c, void (*orig)(Ctx &))
+{
+    g_pc_ctx = &c;
+    game_list_event(c.r[4].w[0] + DISPLAY_SCROLL, c.r[5].w[0], c.r[6].w[0], c, orig, display_event);
 }
 
 // "<button> Edit" at the bottom of the layouts' screen (add_edit_hint): shown with a layout of the player's own only
@@ -3807,6 +4210,51 @@ void HOOK_DisplayYesNoMessage__15MemcardPrompteriiiii(Ctx &c, void (*orig)(Ctx &
     orig(c);
 }
 
+// ---- the game's Autosave, silent ----------------------------------------------------------------------
+// Wherever the game saves by its "Autosave" screen (leaving Audio, Display, the Controller's screens, the names, the
+// calibration: PushScreenOntoStack("Autosave"), so going back passes through it; and the screens after a race:
+// ChangeToScreen("Autosave") and then SetAutosaveCompletionCallback), the screen is an empty one (0xfa2ac5c6) shown while the
+// save is written: a black moment between the screens (the user, 2026-11-28: "a black screen for a split second between the
+// screens; the save is a rudiment with our settings; everywhere it is used I want only a silent save"). Its Autosaver
+// (0x247b48..0x247d98) writes Fred and, on the first tick after, calls its completion callback if one was set, else
+// MoveBackScreen(1). Here the screen is not entered: the port writes the profile's save (pcsettings.cpp, the same image as the
+// game's, to the profile's save.dat) and a frame later does what the Autosaver would have done. A completion callback set meanwhile
+// (no Autosaver is up for it to go into) is kept for that frame. Without a profile in Fred the game's own way is left.
+static bool g_autosave_done;                // the save written in place of the screen: the Autosaver's end, next frame
+static u32 g_autosave_callback;
+
+void HOOK_ChangeToScreen__17FlailerScreenListPCci(Ctx &c, void (*orig)(Ctx &))
+{
+    g_pc_ctx = &c;
+    const u32 name = c.r[5].w[0];
+    if (name && pc_str(name) == "Autosave" && pc_profile_save_ready()) {
+        pc_save_profile_now();
+        g_autosave_done = true;
+        g_autosave_callback = 0;
+        return;
+    }
+    orig(c);
+}
+
+void HOOK_SetAutosaveCompletionCallback__FPFv_v(Ctx &c, void (*orig)(Ctx &))
+{
+    if (g_autosave_done && !LW(gp() - 15080)) {     // no Autosaver: the screen was not entered
+        g_autosave_callback = c.r[4].w[0];
+        return;
+    }
+    orig(c);
+}
+
+static void autosave_frame()
+{
+    if (!g_autosave_done) return;
+    g_autosave_done = false;
+    const u32 cb = g_autosave_callback;
+    g_autosave_callback = 0;
+    if (cb) pc_call(cb);
+    else pc_call(0x170320, 1);              // MoveBackScreen(1)
+}
+
 // once per frame in the frontend: the test hook HP2_PCGOTO=<screen name>[,<tick>]
 void HOOK_Tick__17FlailerScreenList(Ctx &c, void (*orig)(Ctx &))
 {
@@ -3822,6 +4270,7 @@ void HOOK_Tick__17FlailerScreenList(Ctx &c, void (*orig)(Ctx &))
     page_back_frame();
     debug_menu_esc_frame();
     ask_frame();
+    autosave_frame();
     for (auto &f : g_frame_fns) f();
     if (screen_name() != "Joystick PreConfig") g_controller_away++;         // (HOOK_JoystickPreConfigHandleEvent: the screen is new)
     if (g_calibration_watch && --g_calibration_watch == 0)

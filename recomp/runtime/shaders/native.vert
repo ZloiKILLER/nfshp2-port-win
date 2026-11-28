@@ -45,6 +45,8 @@ layout(location = 3) out float v_far;
 layout(location = 4) out vec4 v_soft;
 layout(location = 5) flat out vec4 v_cam;
 layout(location = 6) flat out vec2 v_cam2;
+// a glyph's own rectangle of the texture, s0 t0 s1 t1 (native.cpp, rect_quads): native.frag samples inside it; z <= x: none
+layout(location = 7) flat out vec4 v_rect;
 invariant gl_Position;
 
 const int COLOUR = 0, DIR = 4, EYE = 12, ENV = 14, MAT = 18, QUADS = 22;
@@ -69,6 +71,8 @@ float fast_pow(float x, float p, float b)
 // as AcidEffectSystem::RenderEffects (0x128da0) makes it, with nothing cut to the GS's grid.
 const int PARTICLE = 0x10000;        // above the 16 bits of vi07
 const int SOFT_FRONT = 0x20000;      // the renderer's: this draw is made with native.frag's SOFT (native_vk.cpp, draw_target)
+const int RECT = 0x80000;           // a draw of glyphs (native.cpp, kRectFlag): a vertex's normal bytes have its quad's rectangle's
+                                     // place in L + 1, 7 bits of each, x lowest; 0 none
 const int SOFT_2D = 0x40000;         // a draw of the port's sprites of the game's own particles (native.cpp, kSoft2dFlag): a_nrm.xy is
                                      // the sprite's corner, -1 or 1 each way, a_w its radius in metres, and L at its light has the view's
 
@@ -92,6 +96,7 @@ void particle(mat4 clip, int b)
     v_soft = vec4(0.0);
     v_cam = vec4(0.0);
     v_cam2 = vec2(0.0);
+    v_rect = vec4(0.0);
 #ifdef CLIP_FAR
     gl_ClipDistance[0] = 0.0;
 #endif
@@ -222,6 +227,12 @@ void main()
     v_soft = vec4(0.0);
     v_cam = vec4(0.0);
     v_cam2 = vec2(0.0);
+    v_rect = vec4(0.0);
+    if ((u.flags & RECT) != 0) {
+        ivec3 b = ivec3(round(a_nrm.xyz * 127.0));
+        int at = b.x + (b.y << 7) + (b.z << 14);
+        if (at > 0) v_rect = L[at - 1];
+    }
     bool soft2d = (u.flags & SOFT_2D) != 0 && light >= 0;
     gl_Position = clip * vec4(place, 1.0) * (soft2d ? 1.0 : a_w);
     // The game's own particle as a ball of smoke: how far its middle is comes out of the sprite's own depth, by the view's numbers

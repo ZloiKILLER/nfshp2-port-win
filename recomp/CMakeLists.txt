@@ -26,7 +26,7 @@ endif()
 set(SHADER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/runtime/shaders)
 set(SHADER_OUT ${CMAKE_CURRENT_BINARY_DIR}/shaders)
 set(SHADER_HEADERS)
-foreach(s native.vert native.frag native_fold.vert native_fold.frag native_post.vert native_post.frag native_restore.frag native_grade.frag native_opaque.frag native_extra.frag native_shadow.frag native_ao.frag native_ao_apply.frag
+foreach(s native.vert native.frag native_fold.vert native_fold.frag native_post.vert native_post.frag native_restore.frag native_grade.frag native_opaque.frag native_shadow.frag native_ao.frag native_ao_apply.frag
         native_smaa_edge.vert native_smaa_edge.frag native_smaa_weight.vert native_smaa_weight.frag native_smaa_blend.vert native_smaa_blend.frag)
     add_custom_command(OUTPUT ${SHADER_OUT}/${s}.spv.h
         COMMAND ${CMAKE_COMMAND} -E make_directory ${SHADER_OUT}

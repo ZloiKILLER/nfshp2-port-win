@@ -183,3 +183,12 @@ A check without a person: `HP2_MOUSESCRIPT=<file>`, lines `<frame> <x> <y> [1 pr
 
 `center_pause_menu`: on the screen `605d2bf1` everything but the darkening is moved by -90 in X, and the logo is centred over the panel.
 `HP2_NATIVEEXACT=1` turns it off. The other screens inside the pause are unchanged.
+
+## The event tree's background (issue 39)
+
+The menus' background animation (`tGlobalBackgroundAnimation`, FlailerScreenList +456) takes a random texture of its list at every
+screen change and every 50 s; the list is GRID_BLUEPRINT1/2. On the event tree (Championship / Ultimate Racer) the game's
+`tCarLogoAnimation::SetEvent` (0x1f8e18) also adds the event's CARLOGO_ textures, and `ChangeToScreen` activates the screen before
+it resets the background, so a car logo could slide through the left grid instead of a blueprint (one time in three with a one-car
+event; on the PS2 too). `HOOK_SetEvent__17tCarLogoAnimationP9EventInfo` (`pcmenu.cpp`) puts the list back to the two blueprints
+after the call; the logo over the map is untouched.

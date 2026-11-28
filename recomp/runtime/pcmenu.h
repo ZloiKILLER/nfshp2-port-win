@@ -47,6 +47,9 @@ bool pc_debug_menu();           // the developers' Debug menu is up (Extras' DEB
 bool pc_popup_up();             // a question is over the screen (a tPopupMenu: restart, quit and the like)
 bool pc_pause_subpage();        // the race is paused and a page under the pause menu is up (its options, the objective, the Debug menu)
 u32 pc_screen_hash();           // the screen whose menu is up, 0 with none
+bool pc_title_waiting();        // the title screen waits for a button (not playing its logos and films)
+bool pc_wide_menu(u32 hash);    // a menu screen drawn wide by the main menu's rules (native.cpp, g_wide_menu_now)
+bool pc_popup_screen(u32 hash); // a window over a screen (a question, a short list, the memory card's message)
 bool pc_cursor_wanted();
 bool pc_delete_pressed();       // Delete, Square / X on a gamepad, or the pointer on a page's "Delete" hint: once a press
 int pc_mouse_buttons();         // PcButton bits the mouse holds down in the menus now
@@ -133,6 +136,8 @@ void pc_open_page_under(const std::vector<std::string> &under, const char *name)
 bool pc_tap(int button);        // one press of a pad button (PCB_*) for the menus, as the pointer makes them; false: one is still going
 void pc_profile_loaded();       // the main menu is up: the profile's save is in the game's memory
 void pc_save_on_exit();         // the window's thread: the profile's save, as the game is left from its menus
+bool pc_profile_save_ready();   // the profile's save is in Fred (the main menu has been up)
+bool pc_save_profile_now();     // the profile's save written now (in place of the game's Autosave screen)
 // pcplatform.cpp: the button icons for the bindings and the device in use; once per menu frame
 void pc_paint_buttons();
 std::string pc_text_cursor(u32 font_hash);      // the blinking cursor of a text being typed, in that font

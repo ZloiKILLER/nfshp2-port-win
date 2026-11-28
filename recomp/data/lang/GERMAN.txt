@@ -98,7 +98,7 @@ The PS2's was 30. Above 60 the game still runs at 60, with pictures drawn in bet
 Draw Distance	Sichtweite
 How far away scenery still shows. Original: as on the PS2. Advanced: twice as far. High: four times. Maximum: six times.	Wie weit die Umgebung sichtbar bleibt. Original: wie auf der PS2. Erweitert: doppelt so weit. Hoch: viermal. Maximal: sechsmal.
 Level of Detail	Detailstufe
-Maximum: scenery and cars always at their most detailed models. Original: as on the PS2.	Maximal: Umgebung und Autos immer mit ihren detailliertesten Modellen. Original: wie auf der PS2.
+Maximum: scenery and cars always at their most detailed models, textures sharpen smoothly as you come closer. Original: as on the PS2.	Maximal: Umgebung und Autos immer mit ihren detailliertesten Modellen, Texturen werden beim Näherkommen fließend schärfer. Original: wie auf der PS2.
 Reflections	Spiegelungen
 Shadows	Schatten
 The cars' shadows. High: the body's own outline, lying on whatever is under it. Very High: finer, and the tunnels' lamps cast them too.	Die Schatten der Autos. Hoch: der Umriss der Karosserie selbst, auf allem, was darunter liegt. Sehr hoch: feiner, und auch die Tunnellampen werfen sie.
@@ -168,6 +168,8 @@ Disable Catchup	Keine Aufholjagd
 No catch-up boost for the opponents in Quick Race and the career.	Keine Aufholjagd für die Gegner im Schnellen Rennen und in der Karriere.
 Cinematic Replays	Kino-Wiederholungen
 Hiding the replay's controls hides the black bars too.	Blendet man die Steuerung der Wiederholung aus, verschwinden auch die schwarzen Balken.
+Cockpit View	Cockpit-Ansicht
+The view from the driver's seat, left unused in the game: Ferrari F50, 360 Spider and 550 Barchetta, and the F50 and 550 Barchetta Hot Pursuit editions. The fourth camera; for races started after the switch.	Die Sicht vom Fahrersitz, im Spiel ungenutzt: Ferrari F50, 360 Spider und 550 Barchetta, dazu F50 und 550 Barchetta in der Hot-Pursuit-Version. Die vierte Kamera; für Rennen nach dem Umschalten.
 The slow motion key works. On a gamepad: both sticks pressed together.	Die Zeitlupen-Taste funktioniert. Am Gamepad: beide Sticks zusammen gedrückt.
 Put player 2's keys back as they were.	Die Tasten von Spieler 2 zurücksetzen.
 Gamepad	Gamepad

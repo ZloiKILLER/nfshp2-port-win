@@ -16,6 +16,15 @@
 static bool g_windowed;                 // nobody sees stderr: the player gets a message box
 static bool g_log_to_file;              // and speed.log has what was written
 
+bool host_resource(const char *name, const uint8_t *&p, size_t &n)
+{
+    HRSRC r = FindResourceA(nullptr, name, (LPCSTR)RT_RCDATA);
+    HGLOBAL g = r ? LoadResource(nullptr, r) : nullptr;
+    p = g ? (const uint8_t *)LockResource(g) : nullptr;
+    n = p ? SizeofResource(nullptr, r) : 0;
+    return p != nullptr;
+}
+
 std::string host_exe_dir()
 {
 #ifdef _WIN32

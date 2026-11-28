@@ -678,6 +678,15 @@ int main()
     // is read for player 2's screen it is player 2's (0x3d: pcmenu.cpp, HOOK_GetJoystickConfigs).
     SB(0x2de594 + 4 + 8, 0x3e);
     SB(0x2de594 + 4 + 9, 0x3c);
+    // The main menu's moving blueprint 5% faster (the user, 2026-11-27): its cycle, 50 s, is one float of the program's
+    // (gp-14996, 0x331e5c), read only by tGlobalBackgroundAnimation: its constructor (0x2495f0, the splines' length),
+    // Reset (0x249888) and Tick (0x249ae8: the seek's end, the fade-out window). Written only if it is still the 50 it was.
+    if (LW(0x331e5c) == 0x42480000u) {
+        const float blueprint_seconds = 50.0f / 1.05f;
+        u32 w;
+        memcpy(&w, &blueprint_seconds, 4);
+        SW(0x331e5c, w);
+    }
     fprintf(g_log, "entry %08x\n", entry);
     profile_start();
     stall_watch_start();
